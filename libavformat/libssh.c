@@ -22,6 +22,7 @@
 #define LIBSSH_STATIC
 #include <libssh/sftp.h>
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/attributes.h"
 #include "libavformat/avio.h"
@@ -39,7 +40,44 @@ typedef struct {
     int rw_timeout;
     int trunc;
     char *priv_key;
+    int verify;
 } LIBSSHContext;
+
+#if LIBSSH_VERSION_INT < SSH_VERSION_INT(0, 8, 0)
+#define ssh_session_is_known_server ssh_is_server_known
+#define SSH_KNOWN_HOSTS_OK          SSH_SERVER_KNOWN_OK
+#define SSH_KNOWN_HOSTS_CHANGED     SSH_SERVER_KNOWN_CHANGED
+#define SSH_KNOWN_HOSTS_OTHER       SSH_SERVER_FOUND_OTHER
+#define SSH_KNOWN_HOSTS_UNKNOWN     SSH_SERVER_NOT_KNOWN
+#define SSH_KNOWN_HOSTS_NOT_FOUND   SSH_SERVER_FILE_NOT_FOUND
+#endif
+
+static av_cold int libssh_verify_hostkey(LIBSSHContext *libssh)
+{
+    int strict = 1;
+
+    ssh_options_set(libssh->session, SSH_OPTIONS_STRICTHOSTKEYCHECK, &strict);
+    switch (ssh_session_is_known_server(libssh->session)) {
+    case SSH_KNOWN_HOSTS_OK:
+        return 0;
+    case SSH_KNOWN_HOSTS_CHANGED:
+        av_log(libssh, AV_LOG_ERROR, "Host key for server has changed; "
+               "possible man-in-the-middle attack, refusing to connect.\n");
+        return AVERROR(EACCES);
+    case SSH_KNOWN_HOSTS_OTHER:
+        av_log(libssh, AV_LOG_ERROR, "Host key of a type different from the one "
+               "in the known_hosts file; refusing to connect.\n");
+        return AVERROR(EACCES);
+    case SSH_KNOWN_HOSTS_UNKNOWN:
+    case SSH_KNOWN_HOSTS_NOT_FOUND:
+        av_log(libssh, AV_LOG_ERROR, "Server is not a known host; refusing to connect.\n");
+        return AVERROR(EACCES);
+    default:
+        av_log(libssh, AV_LOG_ERROR, "Failed to check the server host key: %s\n",
+               ssh_get_error(libssh->session));
+        return AVERROR(EIO);
+    }
+}
 
 static av_cold int libssh_create_ssh_session(LIBSSHContext *libssh, const char* hostname, unsigned int port)
 {
@@ -66,6 +104,12 @@ static av_cold int libssh_create_ssh_session(LIBSSHContext *libssh, const char* 
         return AVERROR(EIO);
     }
 
+    if (libssh->verify) {
+        int ret = libssh_verify_hostkey(libssh);
+        if (ret < 0)
+            return ret;
+    }
+
     return 0;
 }
 
@@ -84,12 +128,9 @@ static av_cold int libssh_authentication(LIBSSHContext *libssh, const char *user
 
     if (auth_methods & SSH_AUTH_METHOD_PUBLICKEY) {
         if (libssh->priv_key) {
-            ssh_string pub_key;
-            ssh_private_key priv_key;
-            int type;
-            if (!ssh_try_publickey_from_file(libssh->session, libssh->priv_key, &pub_key, &type)) {
-                priv_key = privatekey_from_file(libssh->session, libssh->priv_key, type, password);
-                if (ssh_userauth_pubkey(libssh->session, NULL, pub_key, priv_key) == SSH_AUTH_SUCCESS) {
+            ssh_key priv_key;
+            if (ssh_pki_import_privkey_file(libssh->priv_key, password, NULL, NULL, &priv_key) == SSH_OK) {
+                if (ssh_userauth_publickey(libssh->session, NULL, priv_key) == SSH_AUTH_SUCCESS) {
                     av_log(libssh, AV_LOG_DEBUG, "Authentication successful with selected private key.\n");
                     authorized = 1;
                 }
@@ -97,7 +138,7 @@ static av_cold int libssh_authentication(LIBSSHContext *libssh, const char *user
                 av_log(libssh, AV_LOG_DEBUG, "Invalid key is provided.\n");
                 return AVERROR(EACCES);
             }
-        } else if (ssh_userauth_autopubkey(libssh->session, password) == SSH_AUTH_SUCCESS) {
+        } else if (ssh_userauth_publickey_auto(libssh->session, NULL, password) == SSH_AUTH_SUCCESS) {
             av_log(libssh, AV_LOG_DEBUG, "Authentication successful with auto selected key.\n");
             authorized = 1;
         }
@@ -192,13 +233,13 @@ static av_cold int libssh_close(URLContext *h)
 static av_cold int libssh_connect(URLContext *h, const char *url, char *path, size_t path_size)
 {
     LIBSSHContext *libssh = h->priv_data;
-    char proto[10], hostname[1024], credencials[1024];
+    char proto[10], hostname[1024], credentials[1024];
     int port = 22, ret;
     const char *user = NULL, *pass = NULL;
     char *end = NULL;
 
     av_url_split(proto, sizeof(proto),
-                 credencials, sizeof(credencials),
+                 credentials, sizeof(credentials),
                  hostname, sizeof(hostname),
                  &port,
                  path, path_size,
@@ -214,7 +255,7 @@ static av_cold int libssh_connect(URLContext *h, const char *url, char *path, si
     if ((ret = libssh_create_ssh_session(libssh, hostname, port)) < 0)
         return ret;
 
-    user = av_strtok(credencials, ":", &end);
+    user = av_strtok(credentials, ":", &end);
     pass = av_strtok(end, ":", &end);
 
     if ((ret = libssh_authentication(libssh, user, pass)) < 0)
@@ -274,7 +315,7 @@ static int64_t libssh_seek(URLContext *h, int64_t pos, int whence)
     }
 
     if (newpos < 0) {
-        av_log(h, AV_LOG_ERROR, "Seeking to nagative position.\n");
+        av_log(h, AV_LOG_ERROR, "Seeking to negative position.\n");
         return AVERROR(EINVAL);
     }
 
@@ -479,6 +520,7 @@ static const AVOption options[] = {
     {"timeout", "set timeout of socket I/O operations", OFFSET(rw_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, D|E },
     {"truncate", "Truncate existing files on write", OFFSET(trunc), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, E },
     {"private_key", "set path to private key", OFFSET(priv_key), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D|E },
+    {"verify", "verify the server host key against the known_hosts file", OFFSET(verify), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, D|E },
     {NULL}
 };
 

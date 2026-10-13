@@ -23,7 +23,7 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "opencl.h"
 #include "opencl_source.h"
 #include "video.h"
@@ -59,7 +59,7 @@ typedef struct UnsharpOpenCLContext {
         cl_int   size_y;
         cl_float amount;
         cl_float threshold;
-    } plane[4];
+    } plane[AV_VIDEO_MAX_PLANES];
 } UnsharpOpenCLContext;
 
 
@@ -69,7 +69,7 @@ static int unsharp_opencl_init(AVFilterContext *avctx)
     cl_int cle;
     int err;
 
-    err = ff_opencl_filter_load_program(avctx, &ff_opencl_source_unsharp, 1);
+    err = ff_opencl_filter_load_program(avctx, &ff_source_unsharp_cl, 1);
     if (err < 0)
         goto fail;
 
@@ -269,8 +269,7 @@ static int unsharp_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
         local_work[0]  = 16;
         local_work[1]  = 16;
 
-        av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d "
-               "(%"SIZE_SPECIFIER"x%"SIZE_SPECIFIER").\n",
+        av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d (%zux%zu).\n",
                p, global_work[0], global_work[1]);
 
         cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
@@ -386,7 +385,6 @@ static const AVFilterPad unsharp_opencl_inputs[] = {
         .filter_frame = &unsharp_opencl_filter_frame,
         .config_props = &ff_opencl_filter_config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad unsharp_opencl_outputs[] = {
@@ -395,18 +393,18 @@ static const AVFilterPad unsharp_opencl_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = &ff_opencl_filter_config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_unsharp_opencl = {
-    .name           = "unsharp_opencl",
-    .description    = NULL_IF_CONFIG_SMALL("Apply unsharp mask to input video"),
+const FFFilter ff_vf_unsharp_opencl = {
+    .p.name         = "unsharp_opencl",
+    .p.description  = NULL_IF_CONFIG_SMALL("Apply unsharp mask to input video"),
+    .p.priv_class   = &unsharp_opencl_class,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
     .priv_size      = sizeof(UnsharpOpenCLContext),
-    .priv_class     = &unsharp_opencl_class,
     .init           = &ff_opencl_filter_init,
     .uninit         = &unsharp_opencl_uninit,
-    .query_formats  = &ff_opencl_filter_query_formats,
-    .inputs         = unsharp_opencl_inputs,
-    .outputs        = unsharp_opencl_outputs,
+    FILTER_INPUTS(unsharp_opencl_inputs),
+    FILTER_OUTPUTS(unsharp_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

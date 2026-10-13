@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Vladimir Panteleev
+ * Copyright (c) 2019, 2020, 2022, 2026 Vladimir Panteleev
  *
  * This file is part of FFmpeg.
  *
@@ -20,13 +20,10 @@
 
 #include <float.h>
 
-#include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
-#include "libavutil/pixdesc.h"
 #include "avfilter.h"
 
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define MAX_FRAMES 240
@@ -42,14 +39,14 @@ typedef struct PhotosensitivityContext {
 
     int nb_frames;
     int skip;
-    float threshold_multiplier;
+    float threshold_multiplier, blend_factor;
     int bypass;
 
     int badness_threshold;
 
     /* Circular buffer */
     int history[MAX_FRAMES];
-    int history_pos;
+    int history_pos, history_size;
 
     PhotosensitivityFrame last_frame_e;
     AVFrame *last_frame_av;
@@ -65,23 +62,11 @@ static const AVOption photosensitivity_options[] = {
     { "t",         "set detection threshold factor (lower is stricter)",  OFFSET(threshold_multiplier), AV_OPT_TYPE_FLOAT, {.dbl=1},  0.1, FLT_MAX,  FLAGS },
     { "skip",      "set pixels to skip when sampling frames",             OFFSET(skip),                 AV_OPT_TYPE_INT,   {.i64=1},  1, 1024,       FLAGS },
     { "bypass",    "leave frames unchanged",                              OFFSET(bypass),               AV_OPT_TYPE_BOOL,  {.i64=0},  0, 1,          FLAGS },
+    { "blend",     "set blending factor (0 always duplicates frames)",    OFFSET(blend_factor),         AV_OPT_TYPE_FLOAT, {.dbl=1},  0, 1,          FLAGS },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(photosensitivity);
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pixel_fmts[] = {
-        AV_PIX_FMT_RGB24,
-        AV_PIX_FMT_BGR24,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *formats = ff_make_format_list(pixel_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, formats);
-}
 
 typedef struct ThreadData_convert_frame
 {
@@ -100,8 +85,8 @@ static int convert_frame_partial(AVFilterContext *ctx, void *arg, int jobnr, int
 
     ThreadData_convert_frame *td = arg;
 
-    const int slice_start = (NUM_CELLS * jobnr) / nb_jobs;
-    const int slice_end = (NUM_CELLS * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(NUM_CELLS, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(NUM_CELLS, jobnr + 1, nb_jobs);
 
     int width = td->in->width, height = td->in->height, linesize = td->in->linesize[0], skip = td->skip;
     const uint8_t *data = td->in->data[0];
@@ -146,7 +131,8 @@ static void convert_frame(AVFilterContext *ctx, AVFrame *in, PhotosensitivityFra
     td.in = in;
     td.out = out;
     td.skip = skip;
-    ctx->internal->execute(ctx, convert_frame_partial, &td, NULL, FFMIN(NUM_CELLS, ff_filter_get_nb_threads(ctx)));
+    ff_filter_execute(ctx, convert_frame_partial, &td, NULL,
+                      FFMIN(NUM_CELLS, ff_filter_get_nb_threads(ctx)));
 }
 
 typedef struct ThreadData_blend_frame
@@ -164,8 +150,8 @@ static int blend_frame_partial(AVFilterContext *ctx, void *arg, int jobnr, int n
     ThreadData_blend_frame *td = arg;
     const uint16_t s_mul = td->s_mul;
     const uint16_t t_mul = 0x100 - s_mul;
-    const int slice_start = (td->target->height * jobnr) / nb_jobs;
-    const int slice_end = (td->target->height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(td->target->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(td->target->height, jobnr + 1, nb_jobs);
     const int linesize = td->target->linesize[0];
 
     for (y = slice_start; y < slice_end; y++) {
@@ -185,7 +171,8 @@ static void blend_frame(AVFilterContext *ctx, AVFrame *target, AVFrame *source, 
     td.target = target;
     td.source = source;
     td.s_mul = (uint16_t)(factor * 0x100);
-    ctx->internal->execute(ctx, blend_frame_partial, &td, NULL, FFMIN(ctx->outputs[0]->h, ff_filter_get_nb_threads(ctx)));
+    ff_filter_execute(ctx, blend_frame_partial, &td, NULL,
+                      FFMIN(ctx->outputs[0]->h, ff_filter_get_nb_threads(ctx)));
 }
 
 static int get_badness(PhotosensitivityFrame *a, PhotosensitivityFrame *b)
@@ -210,14 +197,14 @@ static int config_input(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->dst;
     PhotosensitivityContext *s = ctx->priv;
 
-    s->badness_threshold = (int)(GRID_SIZE * GRID_SIZE * 4 * 256 * s->nb_frames * s->threshold_multiplier / 128);
+    s->badness_threshold = (int)(GRID_SIZE * GRID_SIZE * 4 * 256 * s->threshold_multiplier / 128);
 
     return 0;
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
-    int this_badness, current_badness, fixed_badness, new_badness, i, res;
+    int this_badness, current_badness, fixed_badness, new_badness, badness_threshold, i, res, start;
     PhotosensitivityFrame ef;
     AVFrame *src, *out;
     int free_in = 0;
@@ -230,31 +217,37 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     /* weighted moving average */
     current_badness = 0;
-    for (i = 1; i < s->nb_frames; i++)
-        current_badness += i * s->history[(s->history_pos + i) % s->nb_frames];
-    current_badness /= s->nb_frames;
+    if (s->history_size) {
+        start = s->nb_frames + s->history_pos - s->history_size;
+        for (i = 1; i < s->history_size; i++)
+            current_badness += i * s->history[(start + i) % s->nb_frames];
+        current_badness /= s->history_size;
+        badness_threshold = s->badness_threshold * s->history_size;
+    } else {
+        badness_threshold = INT_MAX;
+    }
 
     convert_frame(ctx, in, &ef, s->skip);
     this_badness = get_badness(&ef, &s->last_frame_e);
     new_badness = current_badness + this_badness;
-    av_log(s, AV_LOG_VERBOSE, "badness: %6d -> %6d / %6d (%3d%% - %s)\n",
-        current_badness, new_badness, s->badness_threshold,
-        100 * new_badness / s->badness_threshold, new_badness < s->badness_threshold ? "OK" : "EXCEEDED");
+    av_log(ctx, AV_LOG_VERBOSE, "badness: %6d -> %6d / %6d (%3d%% - %s)\n",
+        current_badness, new_badness, badness_threshold,
+        100 * new_badness / badness_threshold, new_badness < badness_threshold ? "OK" : "EXCEEDED");
 
-    fixed_badness = new_badness;
-    if (new_badness < s->badness_threshold || !s->last_frame_av || s->bypass) {
+    if (new_badness < badness_threshold || !s->last_frame_av || s->bypass) {
         factor = 1; /* for metadata */
         av_frame_free(&s->last_frame_av);
         s->last_frame_av = src = in;
         s->last_frame_e = ef;
-        s->history[s->history_pos] = this_badness;
+        fixed_badness = new_badness;
     } else {
-        factor = (float)(s->badness_threshold - current_badness) / (new_badness - current_badness);
+        factor = (float)(badness_threshold - current_badness) / (new_badness - current_badness) * s->blend_factor;
         if (factor <= 0) {
             /* just duplicate the frame */
-            s->history[s->history_pos] = 0; /* frame was duplicated, thus, delta is zero */
+            this_badness = 0; /* frame was duplicated, thus, delta is zero */
+            fixed_badness = current_badness;
         } else {
-            res = av_frame_make_writable(s->last_frame_av);
+            res = ff_inlink_make_frame_writable(inlink, &s->last_frame_av);
             if (res) {
                 av_frame_free(&in);
                 return res;
@@ -264,16 +257,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             convert_frame(ctx, s->last_frame_av, &ef, s->skip);
             this_badness = get_badness(&ef, &s->last_frame_e);
             fixed_badness = current_badness + this_badness;
-            av_log(s, AV_LOG_VERBOSE, "  fixed: %6d -> %6d / %6d (%3d%%) factor=%5.3f\n",
-                current_badness, fixed_badness, s->badness_threshold,
-                100 * new_badness / s->badness_threshold, factor);
+            av_log(ctx, AV_LOG_VERBOSE, "  fixed: %6d -> %6d / %6d (%3d%%) factor=%5.3f\n",
+                current_badness, fixed_badness, badness_threshold,
+                100 * new_badness / badness_threshold, factor);
             s->last_frame_e = ef;
-            s->history[s->history_pos] = this_badness;
         }
         src = s->last_frame_av;
         free_in = 1;
     }
+    s->history[s->history_pos] = this_badness;
     s->history_pos = (s->history_pos + 1) % s->nb_frames;
+    if (s->history_size < s->nb_frames)
+        s->history_size++;
 
     out = ff_get_video_buffer(outlink, in->width, in->height);
     if (!out) {
@@ -286,13 +281,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (metadata) {
         char value[128];
 
-        snprintf(value, sizeof(value), "%f", (float)new_badness / s->badness_threshold);
+        snprintf(value, sizeof(value), "%f", (float)new_badness / badness_threshold);
         av_dict_set(metadata, "lavfi.photosensitivity.badness", value, 0);
 
-        snprintf(value, sizeof(value), "%f", (float)fixed_badness / s->badness_threshold);
+        snprintf(value, sizeof(value), "%f", (float)fixed_badness / badness_threshold);
         av_dict_set(metadata, "lavfi.photosensitivity.fixed-badness", value, 0);
 
-        snprintf(value, sizeof(value), "%f", (float)this_badness / s->badness_threshold);
+        snprintf(value, sizeof(value), "%f", (float)this_badness / badness_threshold);
         av_dict_set(metadata, "lavfi.photosensitivity.frame-badness", value, 0);
 
         snprintf(value, sizeof(value), "%f", factor);
@@ -318,24 +313,15 @@ static const AVFilterPad inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_photosensitivity = {
-    .name          = "photosensitivity",
-    .description   = NULL_IF_CONFIG_SMALL("Filter out photosensitive epilepsy seizure-inducing flashes."),
+const FFFilter ff_vf_photosensitivity = {
+    .p.name        = "photosensitivity",
+    .p.description = NULL_IF_CONFIG_SMALL("Filter out photosensitive epilepsy seizure-inducing flashes."),
+    .p.priv_class  = &photosensitivity_class,
     .priv_size     = sizeof(PhotosensitivityContext),
-    .priv_class    = &photosensitivity_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = inputs,
-    .outputs       = outputs,
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS(AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24),
 };

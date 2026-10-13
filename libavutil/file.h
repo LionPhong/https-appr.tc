@@ -19,9 +19,10 @@
 #ifndef AVUTIL_FILE_H
 #define AVUTIL_FILE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-#include "avutil.h"
+#include "attributes.h"
 
 /**
  * @file
@@ -37,6 +38,9 @@
  * case *bufptr will be set to NULL and *size will be set to 0.
  * The returned buffer must be released with av_file_unmap().
  *
+ * @param filename path to the file
+ * @param[out] bufptr pointee is set to the mapped or allocated buffer
+ * @param[out] size pointee is set to the size in bytes of the buffer
  * @param log_offset loglevel offset used for logging
  * @param log_ctx context used for logging
  * @return a non negative number in case of success, a negative value
@@ -49,23 +53,39 @@ int av_file_map(const char *filename, uint8_t **bufptr, size_t *size,
 /**
  * Unmap or free the buffer bufptr created by av_file_map().
  *
+ * @param bufptr the buffer previously created with av_file_map()
  * @param size size in bytes of bufptr, must be the same as returned
  * by av_file_map()
  */
 void av_file_unmap(uint8_t *bufptr, size_t size);
 
 /**
- * Wrapper to work around the lack of mkstemp() on mingw.
- * Also, tries to create file in /tmp first, if possible.
- * *prefix can be a character constant; *filename will be allocated internally.
- * @return file descriptor of opened file (or negative value corresponding to an
- * AVERROR code on error)
- * and opened file name in **filename.
- * @note On very old libcs it is necessary to set a secure umask before
- *       calling this, av_tempfile() can't call umask itself as it is used in
- *       libraries and could interfere with the calling application.
- * @deprecated as fd numbers cannot be passed saftely between libs on some platforms
+ * Map the beginning of an open file into memory for shared read and write
+ * access.
+ *
+ * Unlike av_file_map() the mapping is not a private copy of the file, every
+ * store to the returned memory is written to the file and is visible to
+ * every other mapping of it, in this process and in other processes. The
+ * file is extended to size bytes if it is shorter, it is never shortened.
+ * The mapping must be released with av_file_unmap_shared().
+ *
+ * @param fd file descriptor of a file opened for reading and writing
+ * @param size number of bytes to map, must not be zero
+ * @param[out] bufptr pointee is set to the mapped memory
+ * @return 0 in case of success, a negative value corresponding to an
+ * AVERROR error code in case of failure, AVERROR(ENOSYS) when the platform
+ * has no shared file mappings
  */
-int av_tempfile(const char *prefix, char **filename, int log_offset, void *log_ctx);
+av_warn_unused_result
+int av_file_map_shared(int fd, size_t size, void **bufptr);
+
+/**
+ * Unmap the memory mapped by av_file_map_shared().
+ *
+ * @param bufptr the memory previously mapped by av_file_map_shared()
+ * @param size size in bytes of the mapping, must be the same as passed
+ * to av_file_map_shared()
+ */
+void av_file_unmap_shared(void *bufptr, size_t size);
 
 #endif /* AVUTIL_FILE_H */

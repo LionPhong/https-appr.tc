@@ -24,7 +24,8 @@
 #include "libavutil/pixfmt.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
 #include "video.h"
 
 typedef struct ShufflePlanesContext {
@@ -40,10 +41,12 @@ typedef struct ShufflePlanesContext {
     int copy;
 } ShufflePlanesContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     AVFilterFormats *formats = NULL;
-    ShufflePlanesContext *s = ctx->priv;
+    const ShufflePlanesContext *s = ctx->priv;
     int fmt, ret, i;
 
     for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
@@ -64,13 +67,12 @@ static int query_formats(AVFilterContext *ctx)
             if (i != 4)
                 continue;
             if ((ret = ff_add_format(&formats, fmt)) < 0) {
-                ff_formats_unref(&formats);
                 return ret;
             }
         }
     }
 
-    return ff_set_common_formats(ctx, formats);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
 static av_cold int shuffleplanes_config_input(AVFilterLink *inlink)
@@ -152,24 +154,16 @@ static const AVFilterPad shuffleplanes_inputs[] = {
         .config_props     = shuffleplanes_config_input,
         .filter_frame     = shuffleplanes_filter_frame,
     },
-    { NULL },
 };
 
-static const AVFilterPad shuffleplanes_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL },
-};
-
-AVFilter ff_vf_shuffleplanes = {
-    .name         = "shuffleplanes",
-    .description  = NULL_IF_CONFIG_SMALL("Shuffle video planes."),
+const FFFilter ff_vf_shuffleplanes = {
+    .p.name        = "shuffleplanes",
+    .p.description = NULL_IF_CONFIG_SMALL("Shuffle video planes."),
+    .p.priv_class  = &shuffleplanes_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size    = sizeof(ShufflePlanesContext),
-    .priv_class   = &shuffleplanes_class,
-    .query_formats = query_formats,
-    .inputs       = shuffleplanes_inputs,
-    .outputs      = shuffleplanes_outputs,
-    .flags        = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(shuffleplanes_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 };

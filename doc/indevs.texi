@@ -58,8 +58,10 @@ For more information see:
 @item sample_rate
 Set the sample rate in Hz. Default is 48000.
 
-@item channels
-Set the number of channels. Default is 2.
+@item ch_layout
+Set the channel layout. When unset, the layout defaults to stereo, or to the
+minimum channel count supported by the device, and is filled in from the ALSA
+channel map on a best-effort basis.
 
 @end table
 
@@ -148,14 +150,26 @@ AVFoundation supports the following options:
 @table @option
 
 @item -list_devices <TRUE|FALSE>
-If set to true, a list of all available input devices is given showing all
-device names and indices.
+If set to true, a list of all available input devices is given showing their
+index, name, unique ID, and USB serial number (when available).
 
 @item -video_device_index <INDEX>
 Specify the video device by its index. Overrides anything given in the input filename.
 
 @item -audio_device_index <INDEX>
 Specify the audio device by its index. Overrides anything given in the input filename.
+
+@item -video_device_id <ID>
+Specify the video device by a prefixed identifier, as shown by
+@option{-list_devices}: @code{uid:<UID>} selects by AVFoundation unique ID,
+@code{serial:<SERIAL>} by USB serial number. The unique ID of a UVC device
+may not be stable across reboots. Only UVC devices expose a serial number.
+Overrides anything given in the input filename.
+
+@item -audio_device_id <ID>
+Specify the audio device by a prefixed identifier. See
+@option{-video_device_id}; for audio, the serial is only available for
+class-compliant USB devices.
 
 @item -pixel_format <FORMAT>
 Request the video device to use a specific pixel format.
@@ -220,48 +234,15 @@ $ ffmpeg -f avfoundation -capture_raw_data true -i "zr100:none" out.dv
 
 @end itemize
 
-@section bktr
-
-BSD video input device.
-
-@subsection Options
-
-@table @option
-
-@item framerate
-Set the frame rate.
-
-@item video_size
-Set the video frame size. Default is @code{vga}.
-
-@item standard
-
-Available values are:
-@table @samp
-@item pal
-
-@item ntsc
-
-@item secam
-
-@item paln
-
-@item palm
-
-@item ntscj
-
-@end table
-
-@end table
-
 @section decklink
 
 The decklink input device provides capture capabilities for Blackmagic
 DeckLink devices.
 
 To enable this input device, you need the Blackmagic DeckLink SDK and you
-need to configure with the appropriate @code{--extra-cflags}
-and @code{--extra-ldflags}.
+need to configure with the appropriate @code{--extra-cflags},
+@code{--extra-cxxflags} and @code{--extra-ldflags}. The SDK include directory
+must be available to both the C and C++ compilers.
 On Windows, you need to run the IDL files through @command{widl}.
 
 DeckLink is very picky about the formats it supports. Pixel format of the
@@ -296,15 +277,30 @@ supports it.
 Set the pixel format of the captured video.
 Available values are:
 @table @samp
+@item auto
+
+This is the default which means 8-bit YUV 422 or 8-bit ARGB if format
+autodetection is used, 8-bit YUV 422 otherwise.
+
 @item uyvy422
+
+8-bit YUV 422.
 
 @item yuv422p10
 
+10-bit YUV 422.
+
 @item argb
+
+8-bit RGB.
 
 @item bgra
 
+8-bit RGB.
+
 @item rgb10
+
+10-bit RGB.
 
 @end table
 
@@ -329,14 +325,33 @@ Defines number of audio channels to capture. Must be @samp{2}, @samp{8} or @samp
 Defaults to @samp{2}.
 
 @item duplex_mode
-Sets the decklink device duplex mode. Must be @samp{unset}, @samp{half} or @samp{full}.
+Sets the decklink device duplex/profile mode. Must be @samp{unset}, @samp{half}, @samp{full},
+@samp{one_sub_device_full}, @samp{one_sub_device_half}, @samp{two_sub_device_full},
+@samp{four_sub_device_half}
 Defaults to @samp{unset}.
+
+Note: DeckLink SDK 11.0 have replaced the duplex property by a profile property.
+For the DeckLink Duo 2 and DeckLink Quad 2, a profile is shared between any 2
+sub-devices that utilize the same connectors. For the DeckLink 8K Pro, a profile
+is shared between all 4 sub-devices. So DeckLink 8K Pro support four profiles.
+
+Valid profile modes for DeckLink 8K Pro(with DeckLink SDK >= 11.0):
+@samp{one_sub_device_full}, @samp{one_sub_device_half}, @samp{two_sub_device_full},
+@samp{four_sub_device_half}
+
+Valid profile modes for DeckLink Quad 2 and DeckLink Duo 2:
+@samp{half}, @samp{full}
 
 @item timecode_format
 Timecode type to include in the frame and video stream metadata. Must be
 @samp{none}, @samp{rp188vitc}, @samp{rp188vitc2}, @samp{rp188ltc},
-@samp{rp188any}, @samp{vitc}, @samp{vitc2}, or @samp{serial}. Defaults to
-@samp{none} (not included).
+@samp{rp188hfr}, @samp{rp188any}, @samp{vitc}, @samp{vitc2}, or @samp{serial}.
+Defaults to @samp{none} (not included).
+
+In order to properly support 50/60 fps timecodes, the ordering of the queried
+timecode types for @samp{rp188any} is HFR, VITC1, VITC2 and LTC for >30 fps
+content. Note that this is slightly different to the ordering used by the
+DeckLink API, which is HFR, VITC1, LTC, VITC2.
 
 @item video_input
 Sets the video input source. Must be @samp{unset}, @samp{sdi}, @samp{hdmi},
@@ -361,6 +376,22 @@ Defaults to @samp{audio}.
 @item draw_bars
 If set to @samp{true}, color bars are drawn in the event of a signal loss.
 Defaults to @samp{true}.
+This option is deprecated, please use the @code{signal_loss_action} option.
+
+@item signal_loss_action
+Sets the action to take in the event of a signal loss. Accepts one of the
+following values:
+
+@table @option
+@item 1, none
+Do nothing on signal loss. This usually results in black frames.
+@item 2, bars
+Draw color bars on signal loss. Only supported for 8-bit input signals.
+@item 3, repeat
+Repeat the last video frame on signal loss.
+@end table
+
+Defaults to @samp{bars}.
 
 @item queue_size
 Sets maximum input buffer size in bytes. If the buffering reaches this value,
@@ -396,6 +427,12 @@ isn't received with the first input frame. If that happens, the stored stream
 timecode will be inaccurate. If this option is set to @option{true}, input frames
 are dropped till a frame with timecode is received.
 Option @var{timecode_format} must be specified.
+Defaults to @option{false}.
+
+@item enable_klv(@emph{bool})
+If set to @option{true}, extracts KLV data from VANC and outputs KLV packets.
+KLV VANC packets are joined based on MID and PSC fields and aggregated into
+one KLV packet.
 Defaults to @option{false}.
 
 @end table
@@ -585,6 +622,12 @@ Save the currently used video capture filter device and its
 parameters (if the filter supports it) to a file.
 If a file with the same name exists it will be overwritten.
 
+@item use_video_device_timestamps
+If set to @option{false}, the timestamp for video frames will be
+derived from the wallclock instead of the timestamp provided by
+the capture device. This allows working around devices that
+provide unreliable timestamps.
+
 @end table
 
 @subsection Examples
@@ -676,7 +719,7 @@ Win32 GDI-based screen capture device.
 
 This device allows you to capture a region of the display on Windows.
 
-There are two options for the input filename:
+Amongst options for the input filenames are such elements as:
 @example
 desktop
 @end example
@@ -684,9 +727,13 @@ or
 @example
 title=@var{window_title}
 @end example
+or
+@example
+hwnd=@var{window_hwnd}
+@end example
 
 The first option will capture the entire desktop, or a fixed region of the
-desktop. The second option will instead capture the contents of a single
+desktop. The second and third options will instead capture the contents of a single
 window, regardless of its position on the screen.
 
 For example, to grab the entire desktop using @command{ffmpeg}:
@@ -883,11 +930,15 @@ If you don't understand what all of that means, you probably don't want this.  L
 DRM device to capture on.  Defaults to @option{/dev/dri/card0}.
 
 @item format
-Pixel format of the framebuffer.  Defaults to @option{bgr0}.
+Pixel format of the framebuffer.  This can be autodetected if you are running Linux 5.7
+or later, but needs to be provided for earlier versions.  Defaults to @option{bgr0},
+which is the most common format used by the Linux console and Xorg X server.
 
 @item format_modifier
 Format modifier to signal on output frames.  This is necessary to import correctly into
-some APIs, but can't be autodetected.  See the libdrm documentation for possible values.
+some APIs.  It can be autodetected if you are running Linux 5.7 or later, but will need
+to be provided explicitly when needed in earlier versions.  See the libdrm documentation
+for possible values.
 
 @item crtc_id
 KMS CRTC ID to define the capture source.  The first active plane on the given CRTC
@@ -941,9 +992,8 @@ This input device reads data from the open output pads of a libavfilter
 filtergraph.
 
 For each filtergraph open output, the input device will create a
-corresponding stream which is mapped to the generated output. Currently
-only video data is supported. The filtergraph is specified through the
-option @option{graph}.
+corresponding stream which is mapped to the generated output.
+The filtergraph is specified through the option @option{graph}.
 
 @subsection Options
 
@@ -1015,9 +1065,9 @@ ffplay -f lavfi "movie=test.avi[out0];amovie=test.wav[out1]"
 @end example
 
 @item
-Dump decoded frames to images and closed captions to a file (experimental):
+Dump decoded frames to images and Closed Captions to an RCWT backup:
 @example
-ffmpeg -f lavfi -i "movie=test.ts[out0+subcc]" -map v frame%08d.png -map s -c copy -f rawvideo subcc.bin
+ffmpeg -f lavfi -i "movie=test.ts[out0+subcc]" -map v frame%08d.png -map s -c copy -f rcwt subcc.bin
 @end example
 
 @end itemize
@@ -1239,11 +1289,11 @@ Specify the samplerate in Hz, by default 48kHz is used.
 Specify the channels in use, by default 2 (stereo) is set.
 
 @item frame_size
-Specify the number of bytes per frame, by default it is set to 1024.
+This option does nothing and is deprecated.
 
 @item fragment_size
-Specify the minimal buffering fragment in PulseAudio, it will affect the
-audio latency. By default it is unset.
+Specify the size in bytes of the minimal buffering fragment in PulseAudio, it
+will affect the audio latency. By default it is set to 50 ms amount of data.
 
 @item wallclock
 Set the initial PTS using the current time. Default is 1.
@@ -1478,6 +1528,14 @@ ffmpeg -f x11grab -framerate 25 -video_size cif -i :0.0+10,20 out.mpg
 @subsection Options
 
 @table @option
+@item select_region
+Specify whether to select the grabbing area graphically using the pointer.
+A value of @code{1} prompts the user to select the grabbing area graphically
+by clicking and dragging. A single click with no dragging will select the
+whole screen. A region with zero width or height will also select the whole
+screen. This option overwrites the @var{video_size}, @var{grab_x}, and
+@var{grab_y} options. Default value is @code{0}.
+
 @item draw_mouse
 Specify whether to draw the mouse pointer. A value of @code{0} specifies
 not to draw the pointer. Default value is @code{1}.
@@ -1526,8 +1584,21 @@ With @var{follow_mouse}:
 ffmpeg -f x11grab -follow_mouse centered -show_region 1 -framerate 25 -video_size cif -i :0.0 out.mpg
 @end example
 
+@item window_id
+Grab this window, instead of the whole screen. Default value is 0, which maps to
+the whole screen (root window).
+
+The id of a window can be found using the @command{xwininfo} program, possibly with options -tree and
+-root.
+
+If the window is later enlarged, the new area is not recorded. Video ends when
+the window is closed, unmapped (i.e., iconified) or shrunk beyond the video
+size (which defaults to the initial window size).
+
+This option disables options @option{follow_mouse} and @option{select_region}.
+
 @item video_size
-Set the video frame size. Default is the full desktop.
+Set the video frame size. Default is the full desktop or window.
 
 @item grab_x
 @item grab_y

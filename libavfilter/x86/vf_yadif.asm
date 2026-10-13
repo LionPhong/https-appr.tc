@@ -39,7 +39,7 @@ SECTION .text
     pavgb     m5, m3
     pand      m4, [pb_1]
     psubusb   m5, m4
-    RSHIFT    m5, 1
+    psrldq    m5, 1
     punpcklbw m5, m7
     mova      m4, m2
     psubusb   m2, m3
@@ -47,8 +47,8 @@ SECTION .text
     pmaxub    m2, m3
     mova      m3, m2
     mova      m4, m2
-    RSHIFT    m3, 1
-    RSHIFT    m4, 2
+    psrldq    m3, 1
+    psrldq    m4, 2
     punpcklbw m2, m7
     punpcklbw m3, m7
     punpcklbw m4, m7
@@ -133,12 +133,8 @@ SECTION .text
     psubusb      m2, m3
     psubusb      m3, m4
     pmaxub       m2, m3
-%if mmsize == 16
     mova         m3, m2
     psrldq       m3, 2
-%else
-    pshufw       m3, m2, q0021
-%endif
     punpcklbw    m2, m7
     punpcklbw    m3, m7
     paddw        m0, m2
@@ -237,7 +233,3 @@ INIT_XMM ssse3
 YADIF
 INIT_XMM sse2
 YADIF
-%if ARCH_X86_32
-INIT_MMX mmxext
-YADIF
-%endif

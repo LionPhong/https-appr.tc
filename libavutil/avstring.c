@@ -19,17 +19,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "config.h"
-#include "common.h"
 #include "mem.h"
 #include "avassert.h"
 #include "avstring.h"
 #include "bprint.h"
+#include "error.h"
+#include "macros.h"
 
 int av_strstart(const char *str, const char *pfx, const char **ptr)
 {
@@ -136,19 +138,11 @@ end:
     return p;
 }
 
-char *av_d2str(double d)
-{
-    char *str = av_malloc(16);
-    if (str)
-        snprintf(str, 16, "%f", d);
-    return str;
-}
-
 #define WHITESPACES " \n\t\r"
 
 char *av_get_token(const char **buf, const char *term)
 {
-    char *out     = av_malloc(strlen(*buf) + 1);
+    char *out     = av_realloc(NULL, strlen(*buf) + 1);
     char *ret     = out, *end = out;
     const char *p = *buf;
     if (!out)
@@ -178,7 +172,8 @@ char *av_get_token(const char **buf, const char *term)
 
     *buf = p;
 
-    return ret;
+    char *small_ret = av_realloc(ret, out - ret + 2);
+    return small_ret ? small_ret : ret;
 }
 
 char *av_strtok(char *s, const char *delim, char **saveptr)
@@ -239,6 +234,9 @@ char *av_strireplace(const char *str, const char *from, const char *to)
     size_t tolen = strlen(to), fromlen = strlen(from);
     AVBPrint pbuf;
 
+    if (!fromlen)
+        return av_strdup(str);
+
     av_bprint_init(&pbuf, 1, AV_BPRINT_SIZE_UNLIMITED);
     while ((pstr2 = av_stristr(pstr, from))) {
         av_bprint_append_data(&pbuf, pstr, pstr2 - pstr);
@@ -257,18 +255,13 @@ char *av_strireplace(const char *str, const char *from, const char *to)
 
 const char *av_basename(const char *path)
 {
-    char *p;
-#if HAVE_DOS_PATHS
-    char *q, *d;
-#endif
-
     if (!path || *path == '\0')
         return ".";
 
-    p = strrchr(path, '/');
+    const char *p = strrchr(path, '/');
 #if HAVE_DOS_PATHS
-    q = strrchr(path, '\\');
-    d = strchr(path, ':');
+    const char *q = strrchr(path, '\\');
+    const char *d = strchr(path, ':');
     p = FFMAX3(p, q, d);
 #endif
 
@@ -334,23 +327,24 @@ int av_escape(char **dst, const char *src, const char *special_chars,
               enum AVEscapeMode mode, int flags)
 {
     AVBPrint dstbuf;
+    int ret;
 
-    av_bprint_init(&dstbuf, 1, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprint_init(&dstbuf, 1, INT_MAX); /* (int)dstbuf.len must be >= 0 */
     av_bprint_escape(&dstbuf, src, special_chars, mode, flags);
 
     if (!av_bprint_is_complete(&dstbuf)) {
         av_bprint_finalize(&dstbuf, NULL);
         return AVERROR(ENOMEM);
-    } else {
-        av_bprint_finalize(&dstbuf, dst);
-        return dstbuf.len;
     }
+    if ((ret = av_bprint_finalize(&dstbuf, dst)) < 0)
+        return ret;
+    return dstbuf.len;
 }
 
 int av_match_name(const char *name, const char *names)
 {
     const char *p;
-    int len, namelen;
+    size_t len, namelen;
 
     if (!name || !names)
         return 0;
@@ -457,10 +451,12 @@ int av_match_list(const char *name, const char *list, char separator)
                 if (k && (!p[k] || p[k] == separator))
                     return 1;
             q = strchr(q, separator);
-            q += !!q;
+            if(q)
+                q++;
         }
         p = strchr(p, separator);
-        p += !!p;
+        if (p)
+            p++;
     }
 
     return 0;

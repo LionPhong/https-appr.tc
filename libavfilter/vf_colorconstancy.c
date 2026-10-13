@@ -28,13 +28,12 @@
  * J. van de Weijer, Th. Gevers, A. Gijsenij "Edge-Based Color Constancy".
  */
 
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #include <math.h>
@@ -116,7 +115,7 @@ static int set_gauss(AVFilterContext *ctx)
     int i;
 
     for (i = 0; i <= difford; ++i) {
-        s->gauss[i] = av_mallocz_array(filtersize, sizeof(*s->gauss[i]));
+        s->gauss[i] = av_calloc(filtersize, sizeof(*s->gauss[i]));
         if (!s->gauss[i]) {
             for (; i >= 0; --i) {
                 av_freep(&s->gauss[i]);
@@ -177,7 +176,7 @@ static int set_gauss(AVFilterContext *ctx)
 
 /**
  * Frees up buffers used by grey edge for storing derivatives final
- * and intermidiate results. Number of buffers and number of planes
+ * and intermediate results. Number of buffers and number of planes
  * for last buffer are given so it can be safely called at allocation
  * failure instances.
  *
@@ -202,7 +201,7 @@ static void cleanup_derivative_buffers(ThreadData *td, int nb_buff, int nb_plane
 
 /**
  * Allocates buffers used by grey edge for storing derivatives final
- * and intermidiate results.
+ * and intermediate results.
  *
  * @param ctx the filter context.
  * @param td holds the buffers.
@@ -219,9 +218,10 @@ static int setup_derivative_buffers(AVFilterContext* ctx, ThreadData *td)
     av_log(ctx, AV_LOG_TRACE, "Allocating %d buffer(s) for grey edge.\n", nb_buff);
     for (b = 0; b <= nb_buff; ++b) { // We need difford + 1 buffers
         for (p = 0; p < NUM_PLANES; ++p) {
-            td->data[b][p] = av_mallocz_array(s->planeheight[p] * s->planewidth[p], sizeof(*td->data[b][p]));
+            td->data[b][p] = av_calloc(s->planeheight[p] * s->planewidth[p],
+                                       sizeof(*td->data[b][p]));
             if (!td->data[b][p]) {
-                cleanup_derivative_buffers(td, b + 1, p);
+                cleanup_derivative_buffers(td, b, p);
                 return AVERROR(ENOMEM);
             }
         }
@@ -236,12 +236,12 @@ static int setup_derivative_buffers(AVFilterContext* ctx, ThreadData *td)
 /**
  * Slice calculation of gaussian derivatives. Applies 1-D gaussian derivative filter
  * either horizontally or vertically according to meta data given in thread data.
- * When convoluting horizontally source is always the in frame withing thread data
+ * When convoluting horizontally source is always the in frame within thread data
  * while when convoluting vertically source is a buffer.
  *
  * @param ctx the filter context.
  * @param arg data to be passed between threads.
- * @param jobnr current job nubmer.
+ * @param jobnr current job number.
  * @param nb_jobs total number of jobs.
  *
  * @return 0.
@@ -270,8 +270,8 @@ static int slice_get_derivative(AVFilterContext* ctx, void* arg, int jobnr, int 
         if (dir == DIR_X) {
             /** Applying gauss horizontally along each row */
             const uint8_t *src = in->data[plane];
-            slice_start = (height * jobnr      ) / nb_jobs;
-            slice_end   = (height * (jobnr + 1)) / nb_jobs;
+            slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+            slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
 
             for (r = slice_start; r < slice_end; ++r) {
                 for (c = 0; c < width; ++c) {
@@ -285,8 +285,8 @@ static int slice_get_derivative(AVFilterContext* ctx, void* arg, int jobnr, int 
         } else {
             /** Applying gauss vertically along each column */
             const double *src = td->data[src_index][plane];
-            slice_start = (width * jobnr      ) / nb_jobs;
-            slice_end   = (width * (jobnr + 1)) / nb_jobs;
+            slice_start = ff_slice_pos(width, jobnr, nb_jobs);
+            slice_end   = ff_slice_pos(width, jobnr + 1, nb_jobs);
 
             for (c = slice_start; c < slice_end; ++c) {
                 for (r = 0; r < height; ++r) {
@@ -309,7 +309,7 @@ static int slice_get_derivative(AVFilterContext* ctx, void* arg, int jobnr, int 
  *
  * @param ctx the filter context.
  * @param arg data to be passed between threads.
- * @param jobnr current job nubmer.
+ * @param jobnr current job number.
  * @param nb_jobs total number of jobs.
  *
  * @return 0.
@@ -366,7 +366,8 @@ get_deriv(AVFilterContext *ctx, ThreadData *td, int ord, int dir,
     td->meta_data[INDEX_DIR] = dir;
     td->meta_data[INDEX_SRC] = src;
     td->meta_data[INDEX_DST] = dst;
-    ctx->internal->execute(ctx, slice_get_derivative, td, NULL, FFMIN(dim, nb_threads));
+    ff_filter_execute(ctx, slice_get_derivative, td,
+                      NULL, FFMIN(dim, nb_threads));
 }
 
 /**
@@ -429,7 +430,7 @@ static int get_derivative(AVFilterContext *ctx, ThreadData *td)
  *
  * @param ctx the filter context.
  * @param arg data to be passed between threads.
- * @param jobnr current job nubmer.
+ * @param jobnr current job number.
  * @param nb_jobs total number of jobs.
  *
  * @return 0.
@@ -447,8 +448,8 @@ static int filter_slice_grey_edge(AVFilterContext* ctx, void* arg, int jobnr, in
         const int height        = s->planeheight[plane];
         const int width         = s->planewidth[plane];
         const int in_linesize   = in->linesize[plane];
-        const int slice_start   = (height * jobnr) / nb_jobs;
-        const int slice_end     = (height * (jobnr+1)) / nb_jobs;
+        const int slice_start   = ff_slice_pos(height, jobnr, nb_jobs);
+        const int slice_end     = ff_slice_pos(height, jobnr + 1, nb_jobs);
         const uint8_t *img_data = in->data[plane];
         const double *src       = td->data[INDEX_NORM][plane];
         double *dst             = td->data[INDEX_DST][plane];
@@ -478,7 +479,7 @@ static int filter_slice_grey_edge(AVFilterContext* ctx, void* arg, int jobnr, in
  * Main control function for grey edge algorithm.
  *
  * @param ctx the filter context.
- * @param in frame to perfrom grey edge on.
+ * @param in frame to perform grey edge on.
  *
  * @return 0 in case of success, a negative value corresponding to an
  * AVERROR code in case of failure.
@@ -500,10 +501,10 @@ static int filter_grey_edge(AVFilterContext *ctx, AVFrame *in)
     }
     get_derivative(ctx, &td);
     if (difford > 0) {
-        ctx->internal->execute(ctx, slice_normalize, &td, NULL, nb_jobs);
+        ff_filter_execute(ctx, slice_normalize, &td, NULL, nb_jobs);
     }
 
-    ctx->internal->execute(ctx, filter_slice_grey_edge, &td, NULL, nb_jobs);
+    ff_filter_execute(ctx, filter_slice_grey_edge, &td, NULL, nb_jobs);
     if (!minknorm) {
         for (plane = 0; plane < NUM_PLANES; ++plane) {
             white[plane] = 0; // All values are absolute
@@ -557,7 +558,7 @@ static void normalize_light(double *light)
  * after estimation.
  *
  * @param ctx the filter context.
- * @param in frame to perfrom estimation on.
+ * @param in frame to perform estimation on.
  *
  * @return 0 in case of success, a negative value corresponding to an
  * AVERROR code in case of failure.
@@ -583,7 +584,7 @@ static int illumination_estimation(AVFilterContext *ctx, AVFrame *in)
  *
  * @param ctx the filter context.
  * @param arg data to be passed between threads.
- * @param jobnr current job nubmer.
+ * @param jobnr current job number.
  * @param nb_jobs total number of jobs.
  *
  * @return 0.
@@ -631,19 +632,7 @@ static void chromatic_adaptation(AVFilterContext *ctx, AVFrame *in, AVFrame *out
 
     td.in  = in;
     td.out = out;
-    ctx->internal->execute(ctx, diagonal_transformation, &td, NULL, nb_jobs);
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        // TODO: support more formats
-        // FIXME: error when saving to .jpg
-        AV_PIX_FMT_GBRP,
-        AV_PIX_FMT_NONE
-    };
-
-    return ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
+    ff_filter_execute(ctx, diagonal_transformation, &td, NULL, nb_jobs);
 }
 
 static int config_props(AVFilterLink *inlink)
@@ -725,18 +714,7 @@ static const AVFilterPad colorconstancy_inputs[] = {
         .config_props = config_props,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
-
-static const AVFilterPad colorconstancy_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-#if CONFIG_GREYEDGE_FILTER
 
 static const AVOption greyedge_options[] = {
     { "difford",  "set differentiation order", OFFSET(difford),  AV_OPT_TYPE_INT,    {.i64=1}, 0,   2,      FLAGS },
@@ -747,16 +725,16 @@ static const AVOption greyedge_options[] = {
 
 AVFILTER_DEFINE_CLASS(greyedge);
 
-AVFilter ff_vf_greyedge = {
-    .name          = GREY_EDGE,
-    .description   = NULL_IF_CONFIG_SMALL("Estimates scene illumination by grey edge assumption."),
+const FFFilter ff_vf_greyedge = {
+    .p.name        = GREY_EDGE,
+    .p.description = NULL_IF_CONFIG_SMALL("Estimates scene illumination by grey edge assumption."),
+    .p.priv_class  = &greyedge_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ColorConstancyContext),
-    .priv_class    = &greyedge_class,
-    .query_formats = query_formats,
     .uninit        = uninit,
-    .inputs        = colorconstancy_inputs,
-    .outputs       = colorconstancy_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(colorconstancy_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    // TODO: support more formats
+    // FIXME: error when saving to .jpg
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_GBRP),
 };
-
-#endif /* CONFIG_GREY_EDGE_FILTER */

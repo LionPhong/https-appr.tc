@@ -20,6 +20,8 @@
  */
 
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "mpeg.h"
 
@@ -61,7 +63,7 @@ static int pva_read_header(AVFormatContext *s) {
         return AVERROR(ENOMEM);
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id   = AV_CODEC_ID_MPEG2VIDEO;
-    st->need_parsing      = AVSTREAM_PARSE_FULL;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
     avpriv_set_pts_info(st, 32, 1, 90000);
     av_add_index_entry(st, 0, 0, 0, 0, AVINDEX_KEYFRAME);
 
@@ -69,7 +71,7 @@ static int pva_read_header(AVFormatContext *s) {
         return AVERROR(ENOMEM);
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id   = AV_CODEC_ID_MP2;
-    st->need_parsing      = AVSTREAM_PARSE_FULL;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
     avpriv_set_pts_info(st, 33, 1, 90000);
     av_add_index_entry(st, 0, 0, 0, 0, AVINDEX_KEYFRAME);
 
@@ -101,18 +103,18 @@ recover:
 
     if (syncword != PVA_MAGIC) {
         pva_log(s, AV_LOG_ERROR, "invalid syncword\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
     if (streamid != PVA_VIDEO_PAYLOAD && streamid != PVA_AUDIO_PAYLOAD) {
         pva_log(s, AV_LOG_ERROR, "invalid streamid\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
     if (reserved != 0x55) {
         pva_log(s, AV_LOG_WARNING, "expected reserved byte to be 0x55\n");
     }
     if (length > PVA_MAX_PAYLOAD_LENGTH) {
         pva_log(s, AV_LOG_ERROR, "invalid payload length %u\n", length);
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     if (streamid == PVA_VIDEO_PAYLOAD && pts_flag) {
@@ -143,13 +145,13 @@ recover:
                                           "trying to recover\n");
                 avio_skip(pb, length - 9);
                 if (!read_packet)
-                    return AVERROR(EIO);
+                    return AVERROR_INVALIDDATA;
                 goto recover;
             }
 
-            ret = avio_read(pb, pes_header_data, pes_header_data_length);
-            if (ret != pes_header_data_length)
-                return ret < 0 ? ret : AVERROR_INVALIDDATA;
+            ret = ffio_read_size(pb, pes_header_data, pes_header_data_length);
+            if (ret < 0)
+                return ret;
             length -= 9 + pes_header_data_length;
 
             pes_packet_length -= 3 + pes_header_data_length;
@@ -190,7 +192,7 @@ static int pva_read_packet(AVFormatContext *s, AVPacket *pkt) {
 
     if (read_part_of_packet(s, &pva_pts, &length, &streamid, 1) < 0 ||
        (ret = av_get_packet(pb, pkt, length)) <= 0)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     pkt->stream_index = streamid - 1;
     pkt->pts = pva_pts;
@@ -227,9 +229,9 @@ static int64_t pva_read_timestamp(struct AVFormatContext *s, int stream_index,
     return res;
 }
 
-AVInputFormat ff_pva_demuxer = {
-    .name           = "pva",
-    .long_name      = NULL_IF_CONFIG_SMALL("TechnoTrend PVA"),
+const FFInputFormat ff_pva_demuxer = {
+    .p.name         = "pva",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("TechnoTrend PVA"),
     .priv_data_size = sizeof(PVAContext),
     .read_probe     = pva_probe,
     .read_header    = pva_read_header,

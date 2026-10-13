@@ -25,12 +25,12 @@
 
 #include <float.h> /* DBL_MAX */
 
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/timestamp.h"
 #include "audio.h"
-#include "formats.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct SilenceDetectContext {
     const AVClass *class;
@@ -45,7 +45,7 @@ typedef struct SilenceDetectContext {
     int last_sample_rate;       ///< last sample rate to check for sample rate changes
     AVRational time_base;       ///< time_base
 
-    void (*silencedetect)(struct SilenceDetectContext *s, AVFrame *insamples,
+    void (*silencedetect)(AVFilterContext *ctx, AVFrame *insamples,
                           int nb_samples, int64_t nb_samples_notify,
                           AVRational time_base);
 } SilenceDetectContext;
@@ -75,10 +75,11 @@ static void set_meta(AVFrame *insamples, int channel, const char *key, char *val
         snprintf(key2, sizeof(key2), "lavfi.%s", key);
     av_dict_set(&insamples->metadata, key2, value, 0);
 }
-static av_always_inline void update(SilenceDetectContext *s, AVFrame *insamples,
+static av_always_inline void update(AVFilterContext *ctx, AVFrame *insamples,
                                     int is_silence, int current_sample, int64_t nb_samples_notify,
                                     AVRational time_base)
 {
+    SilenceDetectContext *s = ctx->priv;
     int channel = current_sample % s->independent_channels;
     if (is_silence) {
         if (s->start[channel] == INT64_MIN) {
@@ -89,8 +90,8 @@ static av_always_inline void update(SilenceDetectContext *s, AVFrame *insamples,
                 set_meta(insamples, s->mono ? channel + 1 : 0, "silence_start",
                         av_ts2timestr(s->start[channel], &time_base));
                 if (s->mono)
-                    av_log(s, AV_LOG_INFO, "channel: %d | ", channel);
-                av_log(s, AV_LOG_INFO, "silence_start: %s\n",
+                    av_log(ctx, AV_LOG_INFO, "channel: %d | ", channel);
+                av_log(ctx, AV_LOG_INFO, "silence_start: %s\n",
                         av_ts2timestr(s->start[channel], &time_base));
             }
         }
@@ -107,8 +108,8 @@ static av_always_inline void update(SilenceDetectContext *s, AVFrame *insamples,
                         av_ts2timestr(duration_ts, &time_base));
             }
             if (s->mono)
-                av_log(s, AV_LOG_INFO, "channel: %d | ", channel);
-            av_log(s, AV_LOG_INFO, "silence_end: %s | silence_duration: %s\n",
+                av_log(ctx, AV_LOG_INFO, "channel: %d | ", channel);
+            av_log(ctx, AV_LOG_INFO, "silence_end: %s | silence_duration: %s\n",
                     av_ts2timestr(end_pts, &time_base),
                     av_ts2timestr(duration_ts, &time_base));
         }
@@ -118,17 +119,38 @@ static av_always_inline void update(SilenceDetectContext *s, AVFrame *insamples,
 }
 
 #define SILENCE_DETECT(name, type)                                               \
-static void silencedetect_##name(SilenceDetectContext *s, AVFrame *insamples,    \
+static void silencedetect_##name(AVFilterContext *ctx, AVFrame *insamples,       \
                                  int nb_samples, int64_t nb_samples_notify,      \
                                  AVRational time_base)                           \
 {                                                                                \
+    SilenceDetectContext *s         = ctx->priv;                                 \
     const type *p = (const type *)insamples->data[0];                            \
     const type noise = s->noise;                                                 \
     int i;                                                                       \
                                                                                  \
     for (i = 0; i < nb_samples; i++, p++)                                        \
-        update(s, insamples, *p < noise && *p > -noise, i,                       \
+        update(ctx, insamples, *p < noise && *p > -noise, i,                     \
                nb_samples_notify, time_base);                                    \
+}
+
+#define SILENCE_DETECT_PLANAR(name, type)                                        \
+static void silencedetect_##name(AVFilterContext *ctx, AVFrame *insamples,       \
+                                 int nb_samples, int64_t nb_samples_notify,      \
+                                 AVRational time_base)                           \
+{                                                                                \
+    SilenceDetectContext *s         = ctx->priv;                                 \
+    const int channels = insamples->ch_layout.nb_channels;                       \
+    const type noise = s->noise;                                                 \
+                                                                                 \
+    nb_samples /= channels;                                                      \
+    for (int i = 0; i < nb_samples; i++) {                                       \
+        for (int ch = 0; ch < insamples->ch_layout.nb_channels; ch++) {          \
+            const type *p = (const type *)insamples->extended_data[ch];          \
+            update(ctx, insamples, p[i] < noise && p[i] > -noise,                \
+                   channels * i + ch,                                            \
+                   nb_samples_notify, time_base);                                \
+        }                                                                        \
+    }                                                                            \
 }
 
 SILENCE_DETECT(dbl, double)
@@ -136,19 +158,25 @@ SILENCE_DETECT(flt, float)
 SILENCE_DETECT(s32, int32_t)
 SILENCE_DETECT(s16, int16_t)
 
+SILENCE_DETECT_PLANAR(dblp, double)
+SILENCE_DETECT_PLANAR(fltp, float)
+SILENCE_DETECT_PLANAR(s32p, int32_t)
+SILENCE_DETECT_PLANAR(s16p, int16_t)
+
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
     SilenceDetectContext *s = ctx->priv;
     int c;
 
-    s->channels = inlink->channels;
+    s->channels = inlink->ch_layout.nb_channels;
     s->duration = av_rescale(s->duration, inlink->sample_rate, AV_TIME_BASE);
     s->independent_channels = s->mono ? s->channels : 1;
-    s->nb_null_samples = av_mallocz_array(sizeof(*s->nb_null_samples), s->independent_channels);
+    s->nb_null_samples = av_calloc(s->independent_channels,
+                                   sizeof(*s->nb_null_samples));
     if (!s->nb_null_samples)
         return AVERROR(ENOMEM);
-    s->start = av_malloc_array(sizeof(*s->start), s->independent_channels);
+    s->start = av_malloc_array(s->independent_channels, sizeof(*s->start));
     if (!s->start)
         return AVERROR(ENOMEM);
     for (c = 0; c < s->independent_channels; c++)
@@ -165,6 +193,18 @@ static int config_input(AVFilterLink *inlink)
         s->noise *= INT16_MAX;
         s->silencedetect = silencedetect_s16;
         break;
+    case AV_SAMPLE_FMT_DBLP: s->silencedetect = silencedetect_dblp; break;
+    case AV_SAMPLE_FMT_FLTP: s->silencedetect = silencedetect_fltp; break;
+    case AV_SAMPLE_FMT_S32P:
+        s->noise *= INT32_MAX;
+        s->silencedetect = silencedetect_s32p;
+        break;
+    case AV_SAMPLE_FMT_S16P:
+        s->noise *= INT16_MAX;
+        s->silencedetect = silencedetect_s16p;
+        break;
+    default:
+        return AVERROR_BUG;
     }
 
     return 0;
@@ -172,8 +212,9 @@ static int config_input(AVFilterLink *inlink)
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 {
-    SilenceDetectContext *s         = inlink->dst->priv;
-    const int nb_channels           = inlink->channels;
+    AVFilterContext *ctx            = inlink->dst;
+    SilenceDetectContext *s         = ctx->priv;
+    const int nb_channels           = inlink->ch_layout.nb_channels;
     const int srate                 = inlink->sample_rate;
     const int nb_samples            = insamples->nb_samples     * nb_channels;
     const int64_t nb_samples_notify = s->duration * (s->mono ? 1 : nb_channels);
@@ -189,43 +230,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     s->frame_end = insamples->pts + av_rescale_q(insamples->nb_samples,
             (AVRational){ 1, s->last_sample_rate }, inlink->time_base);
 
-    s->silencedetect(s, insamples, nb_samples, nb_samples_notify,
+    s->silencedetect(ctx, insamples, nb_samples, nb_samples_notify,
                      inlink->time_base);
 
     return ff_filter_frame(inlink->dst->outputs[0], insamples);
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    AVFilterFormats *formats = NULL;
-    AVFilterChannelLayouts *layouts = NULL;
-    static const enum AVSampleFormat sample_fmts[] = {
-        AV_SAMPLE_FMT_DBL,
-        AV_SAMPLE_FMT_FLT,
-        AV_SAMPLE_FMT_S32,
-        AV_SAMPLE_FMT_S16,
-        AV_SAMPLE_FMT_NONE
-    };
-    int ret;
-
-    layouts = ff_all_channel_layouts();
-    if (!layouts)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_channel_layouts(ctx, layouts);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_formats(ctx, formats);
-    if (ret < 0)
-        return ret;
-
-    formats = ff_all_samplerates();
-    if (!formats)
-        return AVERROR(ENOMEM);
-    return ff_set_common_samplerates(ctx, formats);
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -235,7 +243,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     for (c = 0; c < s->independent_channels; c++)
         if (s->start[c] > INT64_MIN)
-            update(s, NULL, 0, c, 0, s->time_base);
+            update(ctx, NULL, 0, c, 0, s->time_base);
     av_freep(&s->nb_null_samples);
     av_freep(&s->start);
 }
@@ -247,24 +255,19 @@ static const AVFilterPad silencedetect_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad silencedetect_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_silencedetect = {
-    .name          = "silencedetect",
-    .description   = NULL_IF_CONFIG_SMALL("Detect silence."),
+const FFFilter ff_af_silencedetect = {
+    .p.name        = "silencedetect",
+    .p.description = NULL_IF_CONFIG_SMALL("Detect silence."),
+    .p.priv_class  = &silencedetect_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(SilenceDetectContext),
-    .query_formats = query_formats,
     .uninit        = uninit,
-    .inputs        = silencedetect_inputs,
-    .outputs       = silencedetect_outputs,
-    .priv_class    = &silencedetect_class,
+    FILTER_INPUTS(silencedetect_inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
+    FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_DBL, AV_SAMPLE_FMT_DBLP,
+                      AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
+                      AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_S32P,
+                      AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P),
 };

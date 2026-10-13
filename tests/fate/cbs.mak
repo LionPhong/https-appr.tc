@@ -1,16 +1,41 @@
-# Read/write tests: this uses the codec metadata filter - with no
+# Read/write tests: By default, this uses the codec metadata filters - with no
 # arguments, it decomposes the stream fully and then recomposes it
 # without making any changes.
 
-fate-cbs: fate-cbs-av1 fate-cbs-h264 fate-cbs-hevc fate-cbs-mpeg2 fate-cbs-vp9
+fate-cbs: fate-cbs-apv fate-cbs-av1 fate-cbs-h264 fate-cbs-hevc fate-cbs-mpeg2 fate-cbs-vp9 fate-cbs-vvc
 
 FATE_CBS_DEPS = $(call ALLYES, $(1)_DEMUXER $(2)_PARSER $(3)_METADATA_BSF $(4)_DECODER $(5)_MUXER)
+FATE_CBS_NO_DEC_DEPS = $(call ALLYES, $(1)_DEMUXER $(1)_PARSER $(1)_METADATA_BSF $(1)_MUXER)
 
 define FATE_CBS_TEST
 # (codec, test_name, sample_file, output_format)
 FATE_CBS_$(1) += fate-cbs-$(1)-$(2)
+fate-cbs-$(1)-$(2): CMD = md5 -c:v $(3) -i $(TARGET_SAMPLES)/$(4) -c:v copy -y -bsf:v $(1)_metadata -f $(5)
+endef
+
+define FATE_CBS_NO_DEC_TEST
+# (codec, test_name, sample_file, output_format)
+FATE_CBS_$(1) += fate-cbs-$(1)-$(2)
 fate-cbs-$(1)-$(2): CMD = md5 -i $(TARGET_SAMPLES)/$(3) -c:v copy -y -bsf:v $(1)_metadata -f $(4)
 endef
+
+define FATE_CBS_DISCARD_TEST
+# (codec, discard_type, sample_file, output_format)
+FATE_CBS_$(1)_DISCARD += fate-cbs-$(1)-discard-$(2)
+fate-cbs-$(1)-discard-$(2): CMD = md5 -i $(TARGET_SAMPLES)/$(3) -c:v copy -y -bsf:v filter_units=discard=$(2) -f $(4)
+endef
+
+# APV read/write
+
+FATE_CBS_APV_SAMPLES =             \
+    profile_400-10.apv             \
+    profile_422-10.apv
+
+$(foreach N,$(FATE_CBS_APV_SAMPLES),$(eval $(call FATE_CBS_TEST,apv,$(basename $(N)),apv,apv/$(N),apv)))
+
+FATE_CBS_APV-$(call FATE_CBS_DEPS, APV, APV, APV, APV, APV) = $(FATE_CBS_apv)
+FATE_SAMPLES_AVCONV += $(FATE_CBS_APV-yes)
+fate-cbs-apv: $(FATE_CBS_APV-yes)
 
 # AV1 read/write
 
@@ -34,10 +59,10 @@ FATE_CBS_AV1_SAMPLES =              \
     seq_hdr_op_param_info.ivf       \
     switch_frame.ivf
 
-$(foreach N,$(FATE_CBS_AV1_CONFORMANCE_SAMPLES),$(eval $(call FATE_CBS_TEST,av1,$(basename $(N)),av1-test-vectors/$(N),rawvideo)))
-$(foreach N,$(FATE_CBS_AV1_SAMPLES),$(eval $(call FATE_CBS_TEST,av1,$(basename $(N)),av1/$(N),rawvideo)))
+$(foreach N,$(FATE_CBS_AV1_CONFORMANCE_SAMPLES),$(eval $(call FATE_CBS_TEST,av1,$(basename $(N)),av1,av1-test-vectors/$(N),rawvideo)))
+$(foreach N,$(FATE_CBS_AV1_SAMPLES),$(eval $(call FATE_CBS_TEST,av1,$(basename $(N)),av1,av1/$(N),rawvideo)))
 
-FATE_CBS_AV1-$(call ALLYES, IVF_DEMUXER AV1_PARSER AV1_METADATA_BSF RAWVIDEO_MUXER) = $(FATE_CBS_av1)
+FATE_CBS_AV1-$(call FATE_CBS_DEPS, IVF, AV1, AV1, AV1, RAWVIDEO) = $(FATE_CBS_av1)
 FATE_SAMPLES_AVCONV += $(FATE_CBS_AV1-yes)
 fate-cbs-av1: $(FATE_CBS_AV1-yes)
 
@@ -62,11 +87,22 @@ FATE_CBS_H264_CONFORMANCE_SAMPLES = \
 FATE_CBS_H264_SAMPLES = \
     sei-1.h264
 
-$(foreach N,$(FATE_CBS_H264_CONFORMANCE_SAMPLES),$(eval $(call FATE_CBS_TEST,h264,$(basename $(N)),h264-conformance/$(N),h264)))
-$(foreach N,$(FATE_CBS_H264_SAMPLES),$(eval $(call FATE_CBS_TEST,h264,$(basename $(N)),h264/$(N),h264)))
+$(foreach N,$(FATE_CBS_H264_CONFORMANCE_SAMPLES),$(eval $(call FATE_CBS_TEST,h264,$(basename $(N)),h264,h264-conformance/$(N),h264)))
+$(foreach N,$(FATE_CBS_H264_SAMPLES),$(eval $(call FATE_CBS_TEST,h264,$(basename $(N)),h264,h264/$(N),h264)))
 
 FATE_CBS_H264-$(call FATE_CBS_DEPS, H264, H264, H264, H264, H264) = $(FATE_CBS_h264)
-FATE_SAMPLES_AVCONV += $(FATE_CBS_H264-yes)
+
+FATE_CBS_DISCARD_TYPES = \
+    nonref   \
+    bidir    \
+    nonintra \
+    nonkey
+
+$(foreach N,$(FATE_CBS_DISCARD_TYPES),$(eval $(call FATE_CBS_DISCARD_TEST,h264,$(N),h264/interlaced_crop.mp4,h264)))
+
+FATE_CBS_H264-$(call ALLYES, MOV_DEMUXER H264_MUXER H264_PARSER FILTER_UNITS_BSF H264_METADATA_BSF) += $(FATE_CBS_h264_DISCARD)
+
+FATE_SAMPLES_FFMPEG += $(FATE_CBS_H264-yes)
 fate-cbs-h264: $(FATE_CBS_H264-yes)
 
 # H.265 read/write
@@ -93,11 +129,59 @@ FATE_CBS_HEVC_SAMPLES =       \
     HRD_A_Fujitsu_2.bit       \
     SLPPLP_A_VIDYO_2.bit
 
-$(foreach N,$(FATE_CBS_HEVC_SAMPLES),$(eval $(call FATE_CBS_TEST,hevc,$(basename $(N)),hevc-conformance/$(N),hevc)))
+$(foreach N,$(FATE_CBS_HEVC_SAMPLES),$(eval $(call FATE_CBS_TEST,hevc,$(basename $(N)),hevc,hevc-conformance/$(N),hevc)))
 
 FATE_CBS_HEVC-$(call FATE_CBS_DEPS, HEVC, HEVC, HEVC, HEVC, HEVC) = $(FATE_CBS_hevc)
+
+$(foreach N,$(FATE_CBS_DISCARD_TYPES),$(eval $(call FATE_CBS_DISCARD_TEST,hevc,$(N),hevc-conformance/WPP_A_ericsson_MAIN10_2.bit,hevc)))
+
+FATE_CBS_HEVC-$(call ALLYES, HEVC_DEMUXER HEVC_MUXER HEVC_PARSER FILTER_UNITS_BSF HEVC_METADATA_BSF) += $(FATE_CBS_hevc_DISCARD)
+
+fate-cbs-hevc-metadata-set-color: CMD = md5 -i $(TARGET_SAMPLES)/hevc-conformance/AMP_A_Samsung_4.bit -c:v copy -bsf:v hevc_metadata=colour_primaries=0:transfer_characteristics=0:matrix_coefficients=3 -f hevc
+fate-cbs-hevc-metadata-set-color: CMP = oneline
+fate-cbs-hevc-metadata-set-color: REF = d073124fca9e30a46c173292f948967c
+FATE_CBS_HEVC-$(call ALLYES, HEVC_DEMUXER HEVC_METADATA_BSF HEVC_MUXER) += fate-cbs-hevc-metadata-set-color
+
 FATE_SAMPLES_AVCONV += $(FATE_CBS_HEVC-yes)
 fate-cbs-hevc: $(FATE_CBS_HEVC-yes)
+
+# H.266 read/write
+
+FATE_CBS_VVC_SAMPLES =        \
+    APSALF_A_2.bit            \
+    APSLMCS_D_1.bit           \
+    APSMULT_A_4.bit           \
+    AUD_A_3.bit               \
+    BOUNDARY_A_3.bit          \
+    BUMP_A_2.bit              \
+    CodingToolsSets_A_2.bit   \
+    CROP_B_4.bit              \
+    DCI_A_3.bit               \
+    HRD_A_3.bit               \
+    OPI_B_3.bit               \
+    PHSH_B_1.bit              \
+    POC_A_1.bit               \
+    PPS_B_1.bit               \
+    RAP_A_1.bit               \
+    SAO_A_3.bit               \
+    SCALING_A_1.bit           \
+    SLICES_A_3.bit            \
+    SPS_B_1.bit               \
+    STILL_B_1.bit             \
+    SUBPIC_A_3.bit            \
+    TILE_A_2.bit              \
+    VPS_A_3.bit               \
+    WP_A_3.bit                \
+    WPP_A_3.bit               \
+    WRAP_A_4.bit              \
+
+
+$(foreach N,$(FATE_CBS_VVC_SAMPLES),$(eval $(call FATE_CBS_NO_DEC_TEST,vvc,$(basename $(N)),vvc-conformance/$(N),vvc)))
+
+FATE_CBS_VVC-$(call FATE_CBS_NO_DEC_DEPS, VVC) = $(FATE_CBS_vvc)
+
+FATE_SAMPLES_AVCONV += $(FATE_CBS_VVC-yes)
+fate-cbs-vvc: $(FATE_CBS_VVC-yes)
 
 # MPEG-2 read/write
 
@@ -106,7 +190,7 @@ FATE_CBS_MPEG2_SAMPLES =     \
     sony-ct3.bs              \
     tcela-6.bits
 
-$(foreach N,$(FATE_CBS_MPEG2_SAMPLES),$(eval $(call FATE_CBS_TEST,mpeg2,$(basename $(N)),mpeg2/$(N),mpeg2video)))
+$(foreach N,$(FATE_CBS_MPEG2_SAMPLES),$(eval $(call FATE_CBS_TEST,mpeg2,$(basename $(N)),mpeg2video,mpeg2/$(N),mpeg2video)))
 
 FATE_CBS_MPEG2-$(call FATE_CBS_DEPS, MPEGVIDEO, MPEGVIDEO, MPEG2, MPEG2VIDEO, MPEG2VIDEO) = $(FATE_CBS_mpeg2)
 FATE_SAMPLES_AVCONV += $(FATE_CBS_MPEG2-yes)
@@ -130,7 +214,7 @@ FATE_CBS_VP9_SAMPLES =                  \
     vp93-2-20-10bit-yuv422.webm         \
     vp93-2-20-12bit-yuv444.webm
 
-$(foreach N,$(FATE_CBS_VP9_SAMPLES),$(eval $(call FATE_CBS_TEST,vp9,$(basename $(N)),vp9-test-vectors/$(N),ivf)))
+$(foreach N,$(FATE_CBS_VP9_SAMPLES),$(eval $(call FATE_CBS_TEST,vp9,$(basename $(N)),vp9,vp9-test-vectors/$(N),ivf)))
 
 FATE_CBS_VP9-$(call FATE_CBS_DEPS, IVF, VP9, VP9, VP9, IVF) = $(FATE_CBS_vp9)
 FATE_SAMPLES_AVCONV += $(FATE_CBS_VP9-yes)

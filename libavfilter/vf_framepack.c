@@ -34,8 +34,6 @@
 
 #include "avfilter.h"
 #include "filters.h"
-#include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 #define LEFT  0
@@ -44,28 +42,41 @@
 typedef struct FramepackContext {
     const AVClass *class;
 
+    int depth;
     const AVPixFmtDescriptor *pix_desc; ///< agreed pixel format
 
-    enum AVStereo3DType format;         ///< frame pack type output
+    /* enum AVStereo3DType */
+    int format;                         ///< frame pack type output
 
     AVFrame *input_views[2];            ///< input frames
 } FramepackContext;
 
 static const enum AVPixelFormat formats_supported[] = {
-    AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV444P,
-    AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUVJ420P,
-    AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9,
+    AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14,
+    AV_PIX_FMT_GRAY16,
+    AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P,
+    AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ444P,
+    AV_PIX_FMT_YUVJ411P,
+    AV_PIX_FMT_YUV420P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV444P9,
+    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_YUV440P10,
+    AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV420P12,
+    AV_PIX_FMT_YUV440P12,
+    AV_PIX_FMT_YUV444P14, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV420P14,
+    AV_PIX_FMT_YUV420P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV444P16,
+    AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRP9, AV_PIX_FMT_GBRP10,
+    AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRP14, AV_PIX_FMT_GBRP16,
+    AV_PIX_FMT_YUVA420P,  AV_PIX_FMT_YUVA422P,   AV_PIX_FMT_YUVA444P,
+    AV_PIX_FMT_YUVA444P9, AV_PIX_FMT_YUVA444P10, AV_PIX_FMT_YUVA444P12, AV_PIX_FMT_YUVA444P16,
+    AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA422P12, AV_PIX_FMT_YUVA422P16,
+    AV_PIX_FMT_YUVA420P9, AV_PIX_FMT_YUVA420P10, AV_PIX_FMT_YUVA420P16,
+    AV_PIX_FMT_GBRAP,     AV_PIX_FMT_GBRAP10,    AV_PIX_FMT_GBRAP12,    AV_PIX_FMT_GBRAP16,
     AV_PIX_FMT_NONE
 };
-
-static int query_formats(AVFilterContext *ctx)
-{
-    // this will ensure that formats are the same on all pads
-    AVFilterFormats *fmts_list = ff_make_format_list(formats_supported);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
 
 static av_cold void framepack_uninit(AVFilterContext *ctx)
 {
@@ -80,11 +91,14 @@ static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx  = outlink->src;
     FramepackContext *s   = outlink->src->priv;
+    FilterLink     *leftl = ff_filter_link(ctx->inputs[LEFT]);
+    FilterLink    *rightl = ff_filter_link(ctx->inputs[RIGHT]);
+    FilterLink        *ol = ff_filter_link(outlink);
 
     int width             = ctx->inputs[LEFT]->w;
     int height            = ctx->inputs[LEFT]->h;
     AVRational time_base  = ctx->inputs[LEFT]->time_base;
-    AVRational frame_rate = ctx->inputs[LEFT]->frame_rate;
+    AVRational frame_rate = leftl->frame_rate;
 
     // check size and fps match on the other input
     if (width  != ctx->inputs[RIGHT]->w ||
@@ -101,18 +115,19 @@ static int config_output(AVFilterLink *outlink)
                ctx->inputs[RIGHT]->time_base.num,
                ctx->inputs[RIGHT]->time_base.den);
         return AVERROR_INVALIDDATA;
-    } else if (av_cmp_q(frame_rate, ctx->inputs[RIGHT]->frame_rate) != 0) {
+    } else if (av_cmp_q(frame_rate, rightl->frame_rate) != 0) {
         av_log(ctx, AV_LOG_ERROR,
                "Left and right framerates differ (%d/%d vs %d/%d).\n",
                frame_rate.num, frame_rate.den,
-               ctx->inputs[RIGHT]->frame_rate.num,
-               ctx->inputs[RIGHT]->frame_rate.den);
+               rightl->frame_rate.num,
+               rightl->frame_rate.den);
         return AVERROR_INVALIDDATA;
     }
 
     s->pix_desc = av_pix_fmt_desc_get(outlink->format);
     if (!s->pix_desc)
         return AVERROR_BUG;
+    s->depth = s->pix_desc->comp[0].depth;
 
     // modify output properties as needed
     switch (s->format) {
@@ -129,14 +144,14 @@ static int config_output(AVFilterLink *outlink)
         height *= 2;
         break;
     default:
-        av_log(ctx, AV_LOG_ERROR, "Unknown packing mode.");
+        av_log(ctx, AV_LOG_ERROR, "Unknown packing mode.\n");
         return AVERROR_INVALIDDATA;
     }
 
     outlink->w          = width;
     outlink->h          = height;
     outlink->time_base  = time_base;
-    outlink->frame_rate = frame_rate;
+    ol->frame_rate      = frame_rate;
 
     return 0;
 }
@@ -149,7 +164,7 @@ static void horizontal_frame_pack(AVFilterLink *outlink,
     FramepackContext *s = ctx->priv;
     int i, plane;
 
-    if (interleaved) {
+    if (interleaved && s->depth <= 8) {
         const uint8_t *leftp  = s->input_views[LEFT]->data[0];
         const uint8_t *rightp = s->input_views[RIGHT]->data[0];
         uint8_t *dstp         = out->data[0];
@@ -184,24 +199,57 @@ static void horizontal_frame_pack(AVFilterLink *outlink,
                 }
             }
         }
+    } else if (interleaved && s->depth > 8) {
+        const uint16_t *leftp  = (const uint16_t *)s->input_views[LEFT]->data[0];
+        const uint16_t *rightp = (const uint16_t *)s->input_views[RIGHT]->data[0];
+        uint16_t *dstp         = (uint16_t *)out->data[0];
+        int length = out->width / 2;
+        int lines  = out->height;
+
+        for (plane = 0; plane < s->pix_desc->nb_components; plane++) {
+            if (plane == 1 || plane == 2) {
+                length = AV_CEIL_RSHIFT(out->width / 2, s->pix_desc->log2_chroma_w);
+                lines  = AV_CEIL_RSHIFT(out->height,    s->pix_desc->log2_chroma_h);
+            }
+            for (i = 0; i < lines; i++) {
+                int j;
+                leftp  = (const uint16_t *)s->input_views[LEFT]->data[plane] +
+                         s->input_views[LEFT]->linesize[plane] * i / 2;
+                rightp = (const uint16_t *)s->input_views[RIGHT]->data[plane] +
+                         s->input_views[RIGHT]->linesize[plane] * i / 2;
+                dstp   = (uint16_t *)out->data[plane] + out->linesize[plane] * i / 2;
+                for (j = 0; j < length; j++) {
+                    // interpolate chroma as necessary
+                    if ((s->pix_desc->log2_chroma_w ||
+                         s->pix_desc->log2_chroma_h) &&
+                        (plane == 1 || plane == 2)) {
+                        *dstp++ = (*leftp + *rightp) / 2;
+                        *dstp++ = (*leftp + *rightp) / 2;
+                    } else {
+                        *dstp++ = *leftp;
+                        *dstp++ = *rightp;
+                    }
+                    leftp += 1;
+                    rightp += 1;
+                }
+            }
+        }
     } else {
         for (i = 0; i < 2; i++) {
-            const uint8_t *src[4];
+            const AVFrame *const input_view = s->input_views[i];
+            const int psize = 1 + (s->depth > 8);
             uint8_t *dst[4];
-            int sub_w = s->input_views[i]->width >> s->pix_desc->log2_chroma_w;
+            int sub_w = psize * input_view->width >> s->pix_desc->log2_chroma_w;
 
-            src[0] = s->input_views[i]->data[0];
-            src[1] = s->input_views[i]->data[1];
-            src[2] = s->input_views[i]->data[2];
-
-            dst[0] = out->data[0] + i * s->input_views[i]->width;
+            dst[0] = out->data[0] + i * input_view->width * psize;
             dst[1] = out->data[1] + i * sub_w;
             dst[2] = out->data[2] + i * sub_w;
 
-            av_image_copy(dst, out->linesize, src, s->input_views[i]->linesize,
-                          s->input_views[i]->format,
-                          s->input_views[i]->width,
-                          s->input_views[i]->height);
+            av_image_copy2(dst, out->linesize,
+                           input_view->data, input_view->linesize,
+                           input_view->format,
+                           input_view->width,
+                           input_view->height);
         }
     }
 }
@@ -215,17 +263,13 @@ static void vertical_frame_pack(AVFilterLink *outlink,
     int i;
 
     for (i = 0; i < 2; i++) {
-        const uint8_t *src[4];
+        const AVFrame *const input_view = s->input_views[i];
         uint8_t *dst[4];
         int linesizes[4];
-        int sub_h = s->input_views[i]->height >> s->pix_desc->log2_chroma_h;
-
-        src[0] = s->input_views[i]->data[0];
-        src[1] = s->input_views[i]->data[1];
-        src[2] = s->input_views[i]->data[2];
+        int sub_h = input_view->height >> s->pix_desc->log2_chroma_h;
 
         dst[0] = out->data[0] + i * out->linesize[0] *
-                 (interleaved + s->input_views[i]->height * (1 - interleaved));
+                 (interleaved + input_view->height * (1 - interleaved));
         dst[1] = out->data[1] + i * out->linesize[1] *
                  (interleaved + sub_h * (1 - interleaved));
         dst[2] = out->data[2] + i * out->linesize[2] *
@@ -238,10 +282,11 @@ static void vertical_frame_pack(AVFilterLink *outlink,
         linesizes[2] = out->linesize[2] +
                        interleaved * out->linesize[2];
 
-        av_image_copy(dst, linesizes, src, s->input_views[i]->linesize,
-                      s->input_views[i]->format,
-                      s->input_views[i]->width,
-                      s->input_views[i]->height);
+        av_image_copy2(dst, linesizes,
+                       input_view->data, input_view->linesize,
+                       input_view->format,
+                       input_view->width,
+                       input_view->height);
     }
 }
 
@@ -270,6 +315,7 @@ static int try_push_frame(AVFilterContext *ctx)
 {
     FramepackContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
+    FilterLink       *l = ff_filter_link(outlink);
     AVStereo3D *stereo;
     int ret, i;
 
@@ -280,8 +326,10 @@ static int try_push_frame(AVFilterContext *ctx)
 
         for (i = 0; i < 2; i++) {
             // set correct timestamps
-            if (pts != AV_NOPTS_VALUE)
-                s->input_views[i]->pts = i == 0 ? pts * 2 : pts * 2 + av_rescale_q(1, av_inv_q(outlink->frame_rate), outlink->time_base);
+            if (pts != AV_NOPTS_VALUE) {
+                s->input_views[i]->pts = i == 0 ? pts * 2 : pts * 2 + av_rescale_q(1, av_inv_q(l->frame_rate), outlink->time_base);
+                s->input_views[i]->duration = av_rescale_q(1, av_inv_q(l->frame_rate), outlink->time_base);
+            }
 
             // set stereo3d side data
             stereo = av_stereo3d_create_side_data(s->input_views[i]);
@@ -354,14 +402,12 @@ static int activate(AVFilterContext *ctx)
     FF_FILTER_FORWARD_STATUS(ctx->inputs[1], outlink);
 
     if (ff_outlink_frame_wanted(ctx->outputs[0]) &&
-        !ff_outlink_get_status(ctx->inputs[0]) &&
         !s->input_views[0]) {
         ff_inlink_request_frame(ctx->inputs[0]);
         return 0;
     }
 
     if (ff_outlink_frame_wanted(ctx->outputs[0]) &&
-        !ff_outlink_get_status(ctx->inputs[1]) &&
         !s->input_views[1]) {
         ff_inlink_request_frame(ctx->inputs[1]);
         return 0;
@@ -399,7 +445,6 @@ static const AVFilterPad framepack_inputs[] = {
         .name         = "right",
         .type         = AVMEDIA_TYPE_VIDEO,
     },
-    { NULL }
 };
 
 static const AVFilterPad framepack_outputs[] = {
@@ -408,17 +453,16 @@ static const AVFilterPad framepack_outputs[] = {
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_framepack = {
-    .name          = "framepack",
-    .description   = NULL_IF_CONFIG_SMALL("Generate a frame packed stereoscopic video."),
+const FFFilter ff_vf_framepack = {
+    .p.name        = "framepack",
+    .p.description = NULL_IF_CONFIG_SMALL("Generate a frame packed stereoscopic video."),
+    .p.priv_class  = &framepack_class,
     .priv_size     = sizeof(FramepackContext),
-    .priv_class    = &framepack_class,
-    .query_formats = query_formats,
-    .inputs        = framepack_inputs,
-    .outputs       = framepack_outputs,
+    FILTER_INPUTS(framepack_inputs),
+    FILTER_OUTPUTS(framepack_outputs),
+    FILTER_PIXFMTS_ARRAY(formats_supported),
     .activate      = activate,
     .uninit        = framepack_uninit,
 };

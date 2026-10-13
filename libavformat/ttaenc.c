@@ -22,14 +22,16 @@
 #include "libavutil/crc.h"
 #include "libavutil/intreadwrite.h"
 
+#include "packet_internal.h"
 #include "apetag.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "internal.h"
+#include "mux.h"
 
 typedef struct TTAMuxContext {
     AVIOContext *seek_table;
-    AVPacketList *queue, *queue_end;
+    PacketList queue;
     uint32_t nb_samples;
     int frame_size;
     int last_frame;
@@ -38,13 +40,7 @@ typedef struct TTAMuxContext {
 static int tta_init(AVFormatContext *s)
 {
     TTAMuxContext *tta = s->priv_data;
-    AVCodecParameters *par;
-
-    if (s->nb_streams != 1) {
-        av_log(s, AV_LOG_ERROR, "Only one stream is supported\n");
-        return AVERROR(EINVAL);
-    }
-    par = s->streams[0]->codecpar;
+    AVCodecParameters *par = s->streams[0]->codecpar;
 
     if (par->codec_id != AV_CODEC_ID_TTA) {
         av_log(s, AV_LOG_ERROR, "Unsupported codec\n");
@@ -75,13 +71,13 @@ static int tta_write_header(AVFormatContext *s)
     if ((ret = avio_open_dyn_buf(&tta->seek_table)) < 0)
         return ret;
 
-    /* Ignore most extradata information if present. It can be innacurate
+    /* Ignore most extradata information if present. It can be inaccurate
        if for example remuxing from Matroska */
     ffio_init_checksum(s->pb, ff_crcEDB88320_update, UINT32_MAX);
     ffio_init_checksum(tta->seek_table, ff_crcEDB88320_update, UINT32_MAX);
     avio_write(s->pb, "TTA1", 4);
     avio_wl16(s->pb, par->extradata ? AV_RL16(par->extradata + 4) : 1);
-    avio_wl16(s->pb, par->channels);
+    avio_wl16(s->pb, par->ch_layout.nb_channels);
     avio_wl16(s->pb, par->bits_per_raw_sample);
     avio_wl32(s->pb, par->sample_rate);
 
@@ -93,11 +89,11 @@ static int tta_write_packet(AVFormatContext *s, AVPacket *pkt)
     TTAMuxContext *tta = s->priv_data;
     int ret;
 
-    ret = ff_packet_list_put(&tta->queue, &tta->queue_end, pkt,
-                             FF_PACKETLIST_FLAG_REF_PACKET);
+    ret = ff_packet_list_put(&tta->queue, pkt, NULL, 0);
     if (ret < 0) {
         return ret;
     }
+    pkt = &tta->queue.tail->pkt;
 
     avio_wl32(tta->seek_table, pkt->size);
     tta->nb_samples += pkt->duration;
@@ -122,12 +118,12 @@ static int tta_write_packet(AVFormatContext *s, AVPacket *pkt)
 static void tta_queue_flush(AVFormatContext *s)
 {
     TTAMuxContext *tta = s->priv_data;
-    AVPacket pkt;
+    AVPacket *const pkt = ffformatcontext(s)->pkt;
 
-    while (tta->queue) {
-        ff_packet_list_get(&tta->queue, &tta->queue_end, &pkt);
-        avio_write(s->pb, pkt.data, pkt.size);
-        av_packet_unref(&pkt);
+    while (tta->queue.head) {
+        ff_packet_list_get(&tta->queue, pkt);
+        avio_write(s->pb, pkt->data, pkt->size);
+        av_packet_unref(pkt);
     }
 }
 
@@ -161,17 +157,20 @@ static void tta_deinit(AVFormatContext *s)
     TTAMuxContext *tta = s->priv_data;
 
     ffio_free_dyn_buf(&tta->seek_table);
-    ff_packet_list_free(&tta->queue, &tta->queue_end);
+    ff_packet_list_free(&tta->queue);
 }
 
-AVOutputFormat ff_tta_muxer = {
-    .name              = "tta",
-    .long_name         = NULL_IF_CONFIG_SMALL("TTA (True Audio)"),
-    .mime_type         = "audio/x-tta",
-    .extensions        = "tta",
+const FFOutputFormat ff_tta_muxer = {
+    .p.name            = "tta",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("TTA (True Audio)"),
+    .p.mime_type       = "audio/x-tta",
+    .p.extensions      = "tta",
     .priv_data_size    = sizeof(TTAMuxContext),
-    .audio_codec       = AV_CODEC_ID_TTA,
-    .video_codec       = AV_CODEC_ID_NONE,
+    .p.audio_codec     = AV_CODEC_ID_TTA,
+    .p.video_codec     = AV_CODEC_ID_NONE,
+    .p.subtitle_codec  = AV_CODEC_ID_NONE,
+    .flags_internal    = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                         FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
     .init              = tta_init,
     .deinit            = tta_deinit,
     .write_header      = tta_write_header,

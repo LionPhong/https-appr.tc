@@ -22,14 +22,18 @@
  */
 
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
+#include "libavutil/thread.h"
 #include "avcodec.h"
 #include "get_bits.h"
 #include "idctdsp.h"
-#include "msmpeg4data.h"
+#include "msmpeg4_vc1_data.h"
 #include "intrax8huf.h"
 #include "intrax8.h"
 #include "intrax8dsp.h"
 #include "mpegutils.h"
+
+#define VLC_BUFFER_SIZE 28150
 
 #define MAX_TABLE_DEPTH(table_bits, max_bits) \
     ((max_bits + table_bits - 1) / table_bits)
@@ -42,93 +46,50 @@
 #define AC_VLC_MTD MAX_TABLE_DEPTH(AC_VLC_BITS, MAX_AC_VLC_BITS)
 #define OR_VLC_MTD MAX_TABLE_DEPTH(OR_VLC_BITS, MAX_OR_VLC_BITS)
 
-static VLC j_ac_vlc[2][2][8];  // [quant < 13], [intra / inter], [select]
-static VLC j_dc_vlc[2][8];     // [quant], [select]
-static VLC j_orient_vlc[2][4]; // [quant], [select]
+static const VLCElem *j_ac_vlc[2][2][8];  // [quant < 13], [intra / inter], [select]
+static const VLCElem *j_dc_vlc[2][8];     // [quant], [select]
+static const VLCElem *j_orient_vlc[2][4]; // [quant], [select]
 
-static av_cold int x8_vlc_init(void)
+static av_cold const VLCElem *x8_init_vlc(VLCInitState *state, int nb_bits,
+                                          int nb_codes, const uint8_t table[][2])
 {
+    return ff_vlc_init_tables_from_lengths(state, nb_bits, nb_codes, &table[0][1], 2,
+                                           &table[0][0], 2, 1, 0, 0);
+}
+
+static av_cold void x8_vlc_init(void)
+{
+    static VLCElem vlc_buf[VLC_BUFFER_SIZE];
+    VLCInitState state = VLC_INIT_STATE(vlc_buf);
     int i;
-    int offset = 0;
-    int sizeidx = 0;
-    static const uint16_t sizes[8 * 4 + 8 * 2 + 2 + 4] = {
-        576, 548, 582, 618, 546, 616, 560, 642,
-        584, 582, 704, 664, 512, 544, 656, 640,
-        512, 648, 582, 566, 532, 614, 596, 648,
-        586, 552, 584, 590, 544, 578, 584, 624,
-
-        528, 528, 526, 528, 536, 528, 526, 544,
-        544, 512, 512, 528, 528, 544, 512, 544,
-
-        128, 128, 128, 128, 128, 128,
-    };
-
-    static VLC_TYPE table[28150][2];
 
 // set ac tables
-#define init_ac_vlc(dst, src)                                                 \
-    do {                                                                      \
-        dst.table           = &table[offset];                                 \
-        dst.table_allocated = sizes[sizeidx];                                 \
-        offset             += sizes[sizeidx++];                               \
-        init_vlc(&dst, AC_VLC_BITS, 77, &src[1], 4, 2, &src[0], 4, 2,         \
-                 INIT_VLC_USE_NEW_STATIC);                                    \
-    } while(0)
-
-    for (i = 0; i < 8; i++) {
-        init_ac_vlc(j_ac_vlc[0][0][i], x8_ac0_highquant_table[i][0]);
-        init_ac_vlc(j_ac_vlc[0][1][i], x8_ac1_highquant_table[i][0]);
-        init_ac_vlc(j_ac_vlc[1][0][i], x8_ac0_lowquant_table[i][0]);
-        init_ac_vlc(j_ac_vlc[1][1][i], x8_ac1_lowquant_table[i][0]);
-    }
-#undef init_ac_vlc
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            for (int k = 0; k < 8; k++)
+                j_ac_vlc[i][j][k] = x8_init_vlc(&state, AC_VLC_BITS, 77,
+                                                x8_ac_quant_table[i][j][k]);
 
 // set dc tables
-#define init_dc_vlc(dst, src)                                                 \
-    do {                                                                      \
-        dst.table           = &table[offset];                                 \
-        dst.table_allocated = sizes[sizeidx];                                 \
-        offset             += sizes[sizeidx++];                               \
-        init_vlc(&dst, DC_VLC_BITS, 34, &src[1], 4, 2, &src[0], 4, 2,         \
-                 INIT_VLC_USE_NEW_STATIC);                                    \
-    } while(0)
-
-    for (i = 0; i < 8; i++) {
-        init_dc_vlc(j_dc_vlc[0][i], x8_dc_highquant_table[i][0]);
-        init_dc_vlc(j_dc_vlc[1][i], x8_dc_lowquant_table[i][0]);
-    }
-#undef init_dc_vlc
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 8; j++)
+            j_dc_vlc[i][j] = x8_init_vlc(&state, DC_VLC_BITS, 34,
+                                         x8_dc_quant_table[i][j]);
 
 // set orient tables
-#define init_or_vlc(dst, src)                                                 \
-    do {                                                                      \
-        dst.table           = &table[offset];                                 \
-        dst.table_allocated = sizes[sizeidx];                                 \
-        offset             += sizes[sizeidx++];                               \
-        init_vlc(&dst, OR_VLC_BITS, 12, &src[1], 4, 2, &src[0], 4, 2,         \
-                 INIT_VLC_USE_NEW_STATIC);                                    \
-    } while(0)
-
     for (i = 0; i < 2; i++)
-        init_or_vlc(j_orient_vlc[0][i], x8_orient_highquant_table[i][0]);
+        j_orient_vlc[0][i] = x8_init_vlc(&state, OR_VLC_BITS, 12,
+                                         x8_orient_highquant_table[i]);
     for (i = 0; i < 4; i++)
-        init_or_vlc(j_orient_vlc[1][i], x8_orient_lowquant_table[i][0]);
-#undef init_or_vlc
-
-    if (offset != sizeof(table) / sizeof(VLC_TYPE) / 2) {
-        av_log(NULL, AV_LOG_ERROR, "table size %"SIZE_SPECIFIER" does not match needed %i\n",
-               sizeof(table) / sizeof(VLC_TYPE) / 2, offset);
-        return AVERROR_INVALIDDATA;
-    }
-
-    return 0;
+        j_orient_vlc[1][i] = x8_init_vlc(&state, OR_VLC_BITS, 12,
+                                         x8_orient_lowquant_table[i]);
 }
 
 static void x8_reset_vlc_tables(IntraX8Context *w)
 {
-    memset(w->j_dc_vlc, 0, sizeof(w->j_dc_vlc));
-    memset(w->j_ac_vlc, 0, sizeof(w->j_ac_vlc));
-    w->j_orient_vlc = NULL;
+    memset(w->j_dc_vlc_table, 0, sizeof(w->j_dc_vlc_table));
+    memset(w->j_ac_vlc_table, 0, sizeof(w->j_ac_vlc_table));
+    w->j_orient_vlc_table = NULL;
 }
 
 static inline void x8_select_ac_table(IntraX8Context *const w, int mode)
@@ -137,23 +98,23 @@ static inline void x8_select_ac_table(IntraX8Context *const w, int mode)
 
     av_assert2(mode < 4);
 
-    if (w->j_ac_vlc[mode])
+    if (w->j_ac_vlc_table[mode])
         return;
 
     table_index       = get_bits(w->gb, 3);
     // 2 modes use same tables
-    w->j_ac_vlc[mode] = &j_ac_vlc[w->quant < 13][mode >> 1][table_index];
-    av_assert2(w->j_ac_vlc[mode]);
+    w->j_ac_vlc_table[mode] = j_ac_vlc[w->quant < 13][mode >> 1][table_index];
+    av_assert2(w->j_ac_vlc_table[mode]);
 }
 
 static inline int x8_get_orient_vlc(IntraX8Context *w)
 {
-    if (!w->j_orient_vlc) {
+    if (!w->j_orient_vlc_table) {
         int table_index = get_bits(w->gb, 1 + (w->quant < 13));
-        w->j_orient_vlc = &j_orient_vlc[w->quant < 13][table_index];
+        w->j_orient_vlc_table = j_orient_vlc[w->quant < 13][table_index];
     }
 
-    return get_vlc2(w->gb, w->j_orient_vlc->table, OR_VLC_BITS, OR_VLC_MTD);
+    return get_vlc2(w->gb, w->j_orient_vlc_table, OR_VLC_BITS, OR_VLC_MTD);
 }
 
 #define extra_bits(eb)  (eb)        // 3 bits
@@ -209,7 +170,7 @@ static void x8_get_ac_rlf(IntraX8Context *const w, const int mode,
     int i, e;
 
 //    x8_select_ac_table(w, mode);
-    i = get_vlc2(w->gb, w->j_ac_vlc[mode]->table, AC_VLC_BITS, AC_VLC_MTD);
+    i = get_vlc2(w->gb, w->j_ac_vlc_table[mode], AC_VLC_BITS, AC_VLC_MTD);
 
     if (i < 46) { // [0-45]
         int t, l;
@@ -289,13 +250,13 @@ static int x8_get_dc_rlf(IntraX8Context *const w, const int mode,
     int i, e, c;
 
     av_assert2(mode < 3);
-    if (!w->j_dc_vlc[mode]) {
+    if (!w->j_dc_vlc_table[mode]) {
         int table_index = get_bits(w->gb, 3);
         // 4 modes, same table
-        w->j_dc_vlc[mode] = &j_dc_vlc[w->quant < 13][table_index];
+        w->j_dc_vlc_table[mode] = j_dc_vlc[w->quant < 13][table_index];
     }
 
-    i = get_vlc2(w->gb, w->j_dc_vlc[mode]->table, DC_VLC_BITS, DC_VLC_MTD);
+    i = get_vlc2(w->gb, w->j_dc_vlc_table[mode], DC_VLC_BITS, DC_VLC_MTD);
 
     /* (i >= 17) { i -= 17; final =1; } */
     c      = i > 16;
@@ -476,7 +437,7 @@ static void x8_ac_compensation(IntraX8Context *const w, const int direction,
                                const int dc_level)
 {
     int t;
-#define B(x,y)  w->block[0][w->idct_permutation[(x) + (y) * 8]]
+#define B(x,y)  w->block[w->idsp.idct_permutation[(x) + (y) * 8]]
 #define T(x)  ((x) * dc_level + 0x8000) >> 16;
     switch (direction) {
     case 0:
@@ -519,24 +480,18 @@ static void x8_ac_compensation(IntraX8Context *const w, const int direction,
 
         t        = T(1084); // g
         B(1, 1) += t;
-
-        w->block_last_index[0] = FFMAX(w->block_last_index[0], 7 * 8);
         break;
     case 1:
         B(0, 1) -= T(6269);
         B(0, 3) -= T(708);
         B(0, 5) -= T(172);
         B(0, 7) -= T(73);
-
-        w->block_last_index[0] = FFMAX(w->block_last_index[0], 7 * 8);
         break;
     case 2:
         B(1, 0) -= T(6269);
         B(3, 0) -= T(708);
         B(5, 0) -= T(172);
         B(7, 0) -= T(73);
-
-        w->block_last_index[0] = FFMAX(w->block_last_index[0], 7);
         break;
     }
 #undef B
@@ -575,7 +530,7 @@ static int x8_decode_intra_mb(IntraX8Context *const w, const int chroma)
     int sign;
 
     av_assert2(w->orient < 12);
-    w->bdsp.clear_block(w->block[0]);
+    w->bdsp.clear_block(w->block);
 
     if (chroma)
         dc_mode = 2;
@@ -611,7 +566,7 @@ static int x8_decode_intra_mb(IntraX8Context *const w, const int chroma)
         x8_select_ac_table(w, ac_mode);
         /* scantable_selector[12] = { 0, 2, 0, 1, 1, 1, 0, 2, 2, 0, 1, 2 }; <-
          * -> 10'01' 00'10' 10'00' 01'01' 01'00' 10'00 => 0x928548 */
-        scantable = w->scantable[(0x928548 >> (2 * w->orient)) & 3].permutated;
+        scantable = w->permutated_scantable[(0x928548 >> (2 * w->orient)) & 3];
         pos       = 0;
         do {
             n++;
@@ -636,12 +591,9 @@ static int x8_decode_intra_mb(IntraX8Context *const w, const int chroma)
             if (use_quant_matrix)
                 level = (level * quant_table[pos]) >> 8;
 
-            w->block[0][scantable[pos]] = level;
+            w->block[scantable[pos]] = level;
         } while (!final);
-
-        w->block_last_index[0] = pos;
     } else { // DC only
-        w->block_last_index[0] = 0;
         if (w->flat_dc && ((unsigned) (dc_level + 1)) < 3) { // [-1; 1]
             int32_t divide_quant = !chroma ? w->divide_quant_dc_luma
                                            : w->divide_quant_dc_chroma;
@@ -661,9 +613,9 @@ static int x8_decode_intra_mb(IntraX8Context *const w, const int chroma)
         zeros_only = dc_level == 0;
     }
     if (!chroma)
-        w->block[0][0] = dc_level * w->quant;
+        w->block[0] = dc_level * w->quant;
     else
-        w->block[0][0] = dc_level * w->quant_dc_chroma;
+        w->block[0] = dc_level * w->quant_dc_chroma;
 
     // there is !zero_only check in the original, but dc_level check is enough
     if ((unsigned int) (dc_level + 1) >= 3 && (w->edges & 3) != 3) {
@@ -672,8 +624,7 @@ static int x8_decode_intra_mb(IntraX8Context *const w, const int chroma)
          * -> 01'10' 10'10' 00'00' 00'01' 01'11' 11'00 => 0x6A017C */
         direction = (0x6A017C >> (w->orient * 2)) & 3;
         if (direction != 3) {
-            // modify block_last[]
-            x8_ac_compensation(w, direction, w->block[0][0]);
+            x8_ac_compensation(w, direction, w->block[0]);
         }
     }
 
@@ -686,9 +637,9 @@ static int x8_decode_intra_mb(IntraX8Context *const w, const int chroma)
                                                w->frame->linesize[!!chroma]);
     }
     if (!zeros_only)
-        w->wdsp.idct_add(w->dest[chroma],
+        w->idsp.idct_add(w->dest[chroma],
                          w->frame->linesize[!!chroma],
-                         w->block[0]);
+                         w->block);
 
 block_placed:
     if (!chroma)
@@ -726,41 +677,35 @@ static void x8_init_block_index(IntraX8Context *w, AVFrame *frame)
 }
 
 av_cold int ff_intrax8_common_init(AVCodecContext *avctx,
-                                   IntraX8Context *w, IDCTDSPContext *idsp,
-                                   int16_t (*block)[64],
-                                   int block_last_index[12],
+                                   IntraX8Context *w,
+                                   int16_t block[64],
                                    int mb_width, int mb_height)
 {
-    int ret = x8_vlc_init();
-    if (ret < 0)
-        return ret;
+    static AVOnce init_static_once = AV_ONCE_INIT;
 
     w->avctx = avctx;
-    w->idsp = *idsp;
     w->mb_width  = mb_width;
     w->mb_height = mb_height;
     w->block = block;
-    w->block_last_index = block_last_index;
 
     // two rows, 2 blocks per cannon mb
     w->prediction_table = av_mallocz(w->mb_width * 2 * 2);
     if (!w->prediction_table)
         return AVERROR(ENOMEM);
 
-    ff_wmv2dsp_init(&w->wdsp);
+    ff_wmv2dsp_init(&w->idsp);
 
-    ff_init_scantable_permutation(w->idct_permutation,
-                                  w->wdsp.idct_perm);
-
-    ff_init_scantable(w->idct_permutation, &w->scantable[0],
-                      ff_wmv1_scantable[0]);
-    ff_init_scantable(w->idct_permutation, &w->scantable[1],
-                      ff_wmv1_scantable[2]);
-    ff_init_scantable(w->idct_permutation, &w->scantable[2],
-                      ff_wmv1_scantable[3]);
+    ff_permute_scantable(w->permutated_scantable[0], ff_wmv1_scantable[0],
+                         w->idsp.idct_permutation);
+    ff_permute_scantable(w->permutated_scantable[1], ff_wmv1_scantable[2],
+                         w->idsp.idct_permutation);
+    ff_permute_scantable(w->permutated_scantable[2], ff_wmv1_scantable[3],
+                         w->idsp.idct_permutation);
 
     ff_intrax8dsp_init(&w->dsp);
-    ff_blockdsp_init(&w->bdsp, avctx);
+    ff_blockdsp_init(&w->bdsp);
+
+    ff_thread_once(&init_static_once, x8_vlc_init);
 
     return 0;
 }
@@ -770,7 +715,7 @@ av_cold void ff_intrax8_common_end(IntraX8Context *w)
     av_freep(&w->prediction_table);
 }
 
-int ff_intrax8_decode_picture(IntraX8Context *w, Picture *pict,
+int ff_intrax8_decode_picture(IntraX8Context *w, MPVPicture *pict,
                               GetBitContext *gb, int *mb_x, int *mb_y,
                               int dquant, int quant_offset,
                               int loopfilter, int lowdelay)

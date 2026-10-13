@@ -38,11 +38,14 @@
 #include "libavutil/common.h"
 #include "libavutil/float_dsp.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
+#include "libavutil/thread.h"
+#include "libavutil/tx.h"
 
 #include "audio_frame_queue.h"
 #include "avcodec.h"
-#include "fft.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
 #include "nellymoser.h"
 #include "sinewin.h"
 
@@ -57,7 +60,8 @@ typedef struct NellyMoserEncodeContext {
     AVCodecContext  *avctx;
     int             last_frame;
     AVFloatDSPContext *fdsp;
-    FFTContext      mdct_ctx;
+    AVTXContext    *mdct_ctx;
+    av_tx_fn        mdct_fn;
     AudioFrameQueue afq;
     DECLARE_ALIGNED(32, float, mdct_out)[NELLY_SAMPLES];
     DECLARE_ALIGNED(32, float, in_buff)[NELLY_SAMPLES];
@@ -124,38 +128,51 @@ static void apply_mdct(NellyMoserEncodeContext *s)
 
     s->fdsp->vector_fmul        (s->in_buff,                 in0, ff_sine_128, NELLY_BUF_LEN);
     s->fdsp->vector_fmul_reverse(s->in_buff + NELLY_BUF_LEN, in1, ff_sine_128, NELLY_BUF_LEN);
-    s->mdct_ctx.mdct_calc(&s->mdct_ctx, s->mdct_out, s->in_buff);
+    s->mdct_fn(s->mdct_ctx, s->mdct_out, s->in_buff, sizeof(float));
 
     s->fdsp->vector_fmul        (s->in_buff,                 in1, ff_sine_128, NELLY_BUF_LEN);
     s->fdsp->vector_fmul_reverse(s->in_buff + NELLY_BUF_LEN, in2, ff_sine_128, NELLY_BUF_LEN);
-    s->mdct_ctx.mdct_calc(&s->mdct_ctx, s->mdct_out + NELLY_BUF_LEN, s->in_buff);
+    s->mdct_fn(s->mdct_ctx, s->mdct_out + NELLY_BUF_LEN, s->in_buff, sizeof(float));
 }
 
 static av_cold int encode_end(AVCodecContext *avctx)
 {
     NellyMoserEncodeContext *s = avctx->priv_data;
 
-    ff_mdct_end(&s->mdct_ctx);
+    av_tx_uninit(&s->mdct_ctx);
 
-    if (s->avctx->trellis) {
-        av_freep(&s->opt);
-        av_freep(&s->path);
-    }
+    av_freep(&s->opt);
+    av_freep(&s->path);
     ff_af_queue_close(&s->afq);
     av_freep(&s->fdsp);
 
     return 0;
 }
 
+static av_cold void nellymoser_init_static(void)
+{
+    /* faster way of doing
+    for (int i = 0; i < POW_TABLE_SIZE; i++)
+       pow_table[i] = 2^(-i / 2048.0 - 3.0 + POW_TABLE_OFFSET); */
+    pow_table[0] = 1;
+    pow_table[1024] = M_SQRT1_2;
+    for (int i = 1; i < 513; i++) {
+        double tmp = exp2(-i / 2048.0);
+        pow_table[i] = tmp;
+        pow_table[1024-i] = M_SQRT1_2 / tmp;
+        pow_table[1024+i] = tmp * M_SQRT1_2;
+        pow_table[2048-i] = 0.5 / tmp;
+    }
+    /* Generate overlap window */
+    ff_init_ff_sine_windows(7);
+}
+
 static av_cold int encode_init(AVCodecContext *avctx)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     NellyMoserEncodeContext *s = avctx->priv_data;
-    int i, ret;
-
-    if (avctx->channels != 1) {
-        av_log(avctx, AV_LOG_ERROR, "Nellymoser supports only 1 channel\n");
-        return AVERROR(EINVAL);
-    }
+    float scale = 32768.0;
+    int ret;
 
     if (avctx->sample_rate != 8000 && avctx->sample_rate != 16000 &&
         avctx->sample_rate != 11025 &&
@@ -169,42 +186,22 @@ static av_cold int encode_init(AVCodecContext *avctx)
     avctx->initial_padding = NELLY_BUF_LEN;
     ff_af_queue_init(avctx, &s->afq);
     s->avctx = avctx;
-    if ((ret = ff_mdct_init(&s->mdct_ctx, 8, 0, 32768.0)) < 0)
-        goto error;
+    if ((ret = av_tx_init(&s->mdct_ctx, &s->mdct_fn, AV_TX_FLOAT_MDCT, 0, 128, &scale, 0)) < 0)
+        return ret;
     s->fdsp = avpriv_float_dsp_alloc(avctx->flags & AV_CODEC_FLAG_BITEXACT);
-    if (!s->fdsp) {
-        ret = AVERROR(ENOMEM);
-        goto error;
-    }
-
-    /* Generate overlap window */
-    ff_init_ff_sine_windows(7);
-    /* faster way of doing
-    for (i = 0; i < POW_TABLE_SIZE; i++)
-       pow_table[i] = 2^(-i / 2048.0 - 3.0 + POW_TABLE_OFFSET); */
-    pow_table[0] = 1;
-    pow_table[1024] = M_SQRT1_2;
-    for (i = 1; i < 513; i++) {
-        double tmp = exp2(-i / 2048.0);
-        pow_table[i] = tmp;
-        pow_table[1024-i] = M_SQRT1_2 / tmp;
-        pow_table[1024+i] = tmp * M_SQRT1_2;
-        pow_table[2048-i] = 0.5 / tmp;
-    }
+    if (!s->fdsp)
+        return AVERROR(ENOMEM);
 
     if (s->avctx->trellis) {
         s->opt  = av_malloc(NELLY_BANDS * OPT_SIZE * sizeof(float  ));
         s->path = av_malloc(NELLY_BANDS * OPT_SIZE * sizeof(uint8_t));
-        if (!s->opt || !s->path) {
-            ret = AVERROR(ENOMEM);
-            goto error;
-        }
+        if (!s->opt || !s->path)
+            return AVERROR(ENOMEM);
     }
 
+    ff_thread_once(&init_static_once, nellymoser_init_static);
+
     return 0;
-error:
-    encode_end(avctx);
-    return ret;
 }
 
 #define find_best(val, table, LUT, LUT_add, LUT_size) \
@@ -238,7 +235,7 @@ static inline float distance(float x, float y, int band)
     return tmp * tmp;
 }
 
-static void get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *idx_table)
+static int get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *idx_table)
 {
     int i, j, band, best_idx;
     float power_candidate, best_val;
@@ -246,9 +243,9 @@ static void get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *i
     float  (*opt )[OPT_SIZE] = s->opt ;
     uint8_t(*path)[OPT_SIZE] = s->path;
 
-    for (i = 0; i < NELLY_BANDS * OPT_SIZE; i++) {
-        opt[0][i] = INFINITY;
-    }
+    for (band = 0; band < NELLY_BANDS; band++)
+        for (i = 0; i < OPT_SIZE; i++)
+            opt[band][i] = INFINITY;
 
     for (i = 0; i < 64; i++) {
         opt[0][ff_nelly_init_table[i]] = distance(cand[0], ff_nelly_init_table[i], 0);
@@ -260,9 +257,9 @@ static void get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *i
         float tmp;
         int idx_min, idx_max, idx;
         power_candidate = cand[band];
-        for (q = 1000; !c && q < OPT_SIZE; q <<= 2) {
+        for (q = 1000; !c && q < 2 * OPT_SIZE; q <<= 2) {
             idx_min = FFMAX(0, cand[band] - q);
-            idx_max = FFMIN(OPT_SIZE, cand[band - 1] + q);
+            idx_max = FFMIN(OPT_SIZE - 1, cand[band - 1] + q);
             for (i = FFMAX(0, cand[band - 1] - q); i < FFMIN(OPT_SIZE, cand[band - 1] + q); i++) {
                 if ( isinf(opt[band - 1][i]) )
                     continue;
@@ -281,7 +278,6 @@ static void get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *i
                 }
             }
         }
-        av_assert1(c); //FIXME
     }
 
     best_val = INFINITY;
@@ -293,12 +289,15 @@ static void get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *i
             best_idx = i;
         }
     }
+    if (best_idx < 0)
+        return AVERROR(EINVAL);
     for (band = NELLY_BANDS - 1; band >= 0; band--) {
         idx_table[band] = path[band][best_idx];
         if (band) {
             best_idx -= ff_nelly_delta_table[path[band][best_idx]];
         }
     }
+    return 0;
 }
 
 /**
@@ -307,7 +306,7 @@ static void get_exponent_dynamic(NellyMoserEncodeContext *s, float *cand, int *i
  *  @param output          output buffer
  *  @param output_size     size of output buffer
  */
-static void encode_block(NellyMoserEncodeContext *s, unsigned char *output, int output_size)
+static int encode_block(NellyMoserEncodeContext *s, unsigned char *output, int output_size)
 {
     PutBitContext pb;
     int i, j, band, block, best_idx, power_idx = 0;
@@ -329,10 +328,16 @@ static void encode_block(NellyMoserEncodeContext *s, unsigned char *output, int 
         }
         cand[band] =
             log2(FFMAX(1.0, coeff_sum / (ff_nelly_band_sizes_table[band] << 7))) * 1024.0;
+        if (!isfinite(cand[band])) {
+            av_log(s->avctx, AV_LOG_ERROR, "Input contains NaN/+-Inf\n");
+            return AVERROR(EINVAL);
+        }
     }
 
     if (s->avctx->trellis) {
-        get_exponent_dynamic(s, cand, idx_table);
+        int ret = get_exponent_dynamic(s, cand, idx_table);
+        if (ret < 0)
+            return ret;
     } else {
         get_exponent_greedy(s, cand, idx_table);
     }
@@ -346,6 +351,8 @@ static void encode_block(NellyMoserEncodeContext *s, unsigned char *output, int 
             power_idx = ff_nelly_init_table[idx_table[0]];
             put_bits(&pb, 6, idx_table[0]);
         }
+        if (power_idx >= (31 - POW_TABLE_OFFSET) << 11)
+            return AVERROR(EINVAL);
         power_val = pow_table[power_idx & 0x7FF] / (1 << ((power_idx >> 11) + POW_TABLE_OFFSET));
         for (j = 0; j < ff_nelly_band_sizes_table[band]; i++, j++) {
             s->mdct_out[i] *= power_val;
@@ -379,6 +386,7 @@ static void encode_block(NellyMoserEncodeContext *s, unsigned char *output, int 
 
     flush_put_bits(&pb);
     memset(put_bits_ptr(&pb), 0, output + output_size - put_bits_ptr(&pb));
+    return 0;
 }
 
 static int encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
@@ -407,28 +415,32 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
         s->last_frame = 1;
     }
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, NELLY_BLOCK_LEN, 0)) < 0)
+    if ((ret = ff_get_encode_buffer(avctx, avpkt, NELLY_BLOCK_LEN, 0)) < 0)
         return ret;
-    encode_block(s, avpkt->data, avpkt->size);
+    if ((ret = encode_block(s, avpkt->data, avpkt->size)) < 0)
+        return ret;
 
     /* Get the next frame pts/duration */
-    ff_af_queue_remove(&s->afq, avctx->frame_size, &avpkt->pts,
-                       &avpkt->duration);
+    ret = ff_af_queue_remove(&s->afq, avctx->frame_size, avpkt);
+    if (ret < 0)
+        return ret;
 
     *got_packet_ptr = 1;
     return 0;
 }
 
-AVCodec ff_nellymoser_encoder = {
-    .name           = "nellymoser",
-    .long_name      = NULL_IF_CONFIG_SMALL("Nellymoser Asao"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_NELLYMOSER,
+const FFCodec ff_nellymoser_encoder = {
+    .p.name         = "nellymoser",
+    CODEC_LONG_NAME("Nellymoser Asao"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_NELLYMOSER,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_SMALL_LAST_FRAME,
     .priv_data_size = sizeof(NellyMoserEncodeContext),
     .init           = encode_init,
-    .encode2        = encode_frame,
+    FF_CODEC_ENCODE_CB(encode_frame),
     .close          = encode_end,
-    .capabilities   = AV_CODEC_CAP_SMALL_LAST_FRAME | AV_CODEC_CAP_DELAY,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_FLT,
-                                                     AV_SAMPLE_FMT_NONE },
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLT),
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO),
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

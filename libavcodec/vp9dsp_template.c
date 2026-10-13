@@ -30,7 +30,7 @@
 // FIXME see whether we can merge parts of this (perhaps at least 4x4 and 8x8)
 // back with h264pred.[ch]
 
-static void vert_4x4_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_4x4_c(uint8_t *restrict _dst, ptrdiff_t stride,
                        const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
@@ -44,49 +44,73 @@ static void vert_4x4_c(uint8_t *_dst, ptrdiff_t stride,
     AV_WN4PA(dst + stride * 3, p4);
 }
 
-static void vert_8x8_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_8x8_c(uint8_t *restrict _dst, ptrdiff_t stride,
                        const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *top = (const pixel *) _top;
+#if BIT_DEPTH == 8
+    uint64_t p8 = AV_RN64A(top);
+#else
     pixel4 p4a = AV_RN4PA(top + 0);
     pixel4 p4b = AV_RN4PA(top + 4);
+#endif
     int y;
 
     stride /= sizeof(pixel);
     for (y = 0; y < 8; y++) {
+#if BIT_DEPTH == 8
+        AV_WN64A(dst, p8);
+#else
         AV_WN4PA(dst + 0, p4a);
         AV_WN4PA(dst + 4, p4b);
+#endif
         dst += stride;
     }
 }
 
-static void vert_16x16_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_16x16_c(uint8_t *restrict _dst, ptrdiff_t stride,
                          const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *top = (const pixel *) _top;
+#if BIT_DEPTH == 8
+    uint64_t p8a = AV_RN64A(top);
+    uint64_t p8b = AV_RN64A(top + 8);
+#else
     pixel4 p4a = AV_RN4PA(top +  0);
     pixel4 p4b = AV_RN4PA(top +  4);
     pixel4 p4c = AV_RN4PA(top +  8);
     pixel4 p4d = AV_RN4PA(top + 12);
+#endif
     int y;
 
     stride /= sizeof(pixel);
     for (y = 0; y < 16; y++) {
+#if BIT_DEPTH == 8
+        AV_WN64A(dst +  0, p8a);
+        AV_WN64A(dst +  8, p8b);
+#else
         AV_WN4PA(dst +  0, p4a);
         AV_WN4PA(dst +  4, p4b);
         AV_WN4PA(dst +  8, p4c);
         AV_WN4PA(dst + 12, p4d);
+#endif
         dst += stride;
     }
 }
 
-static void vert_32x32_c(uint8_t *_dst, ptrdiff_t stride,
+static void vert_32x32_c(uint8_t *restrict _dst, ptrdiff_t stride,
                          const uint8_t *left, const uint8_t *_top)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *top = (const pixel *) _top;
+#if BIT_DEPTH == 8
+    uint64_t p8a = AV_RN64A(top);
+    uint64_t p8b = AV_RN64A(top + 8);
+    uint64_t p8c = AV_RN64A(top + 16);
+    uint64_t p8d = AV_RN64A(top + 24);
+#else
     pixel4 p4a = AV_RN4PA(top +  0);
     pixel4 p4b = AV_RN4PA(top +  4);
     pixel4 p4c = AV_RN4PA(top +  8);
@@ -95,10 +119,17 @@ static void vert_32x32_c(uint8_t *_dst, ptrdiff_t stride,
     pixel4 p4f = AV_RN4PA(top + 20);
     pixel4 p4g = AV_RN4PA(top + 24);
     pixel4 p4h = AV_RN4PA(top + 28);
+#endif
     int y;
 
     stride /= sizeof(pixel);
     for (y = 0; y < 32; y++) {
+#if BIT_DEPTH == 8
+        AV_WN64A(dst +  0, p8a);
+        AV_WN64A(dst +  8, p8b);
+        AV_WN64A(dst + 16, p8c);
+        AV_WN64A(dst + 24, p8d);
+#else
         AV_WN4PA(dst +  0, p4a);
         AV_WN4PA(dst +  4, p4b);
         AV_WN4PA(dst +  8, p4c);
@@ -107,6 +138,7 @@ static void vert_32x32_c(uint8_t *_dst, ptrdiff_t stride,
         AV_WN4PA(dst + 20, p4f);
         AV_WN4PA(dst + 24, p4g);
         AV_WN4PA(dst + 28, p4h);
+#endif
         dst += stride;
     }
 }
@@ -1138,7 +1170,7 @@ static void type_a##_##type_b##_##sz##x##sz##_add_c(uint8_t *_dst, \
             for (j = 0; j < sz; j++) \
                 dst[j * stride] = av_clip_pixel(dst[j * stride] + \
                                                 (bits ? \
-                                                 (t + (1 << (bits - 1))) >> bits : \
+                                                 (int)(t + (1U << (bits - 1))) >> bits : \
                                                  t)); \
             dst++; \
         } \
@@ -1153,7 +1185,7 @@ static void type_a##_##type_b##_##sz##x##sz##_add_c(uint8_t *_dst, \
         for (j = 0; j < sz; j++) \
             dst[j * stride] = av_clip_pixel(dst[j * stride] + \
                                             (bits ? \
-                                             (out[j] + (1 << (bits - 1))) >> bits : \
+                                             (int)(out[j] + (1U << (bits - 1))) >> bits : \
                                              out[j])); \
         dst++; \
     } \
@@ -1260,25 +1292,25 @@ static av_always_inline void iadst8_1d(const dctcoef *in, ptrdiff_t stride,
     t6 = (t2a - t6a + (1 << 13)) >> 14;
     t7 = (t3a - t7a + (1 << 13)) >> 14;
 
-    t4a = 15137 * t4 +  6270 * t5;
-    t5a =  6270 * t4 - 15137 * t5;
-    t6a = 15137 * t7 -  6270 * t6;
-    t7a =  6270 * t7 + 15137 * t6;
+    t4a = 15137U * t4 +  6270U * t5;
+    t5a =  6270U * t4 - 15137U * t5;
+    t6a = 15137U * t7 -  6270U * t6;
+    t7a =  6270U * t7 + 15137U * t6;
 
     out[0] =   t0 + t2;
     out[7] = -(t1 + t3);
     t2     =   t0 - t2;
     t3     =   t1 - t3;
 
-    out[1] = -((t4a + t6a + (1 << 13)) >> 14);
-    out[6] =   (t5a + t7a + (1 << 13)) >> 14;
-    t6     =   (t4a - t6a + (1 << 13)) >> 14;
-    t7     =   (t5a - t7a + (1 << 13)) >> 14;
+    out[1] = -((dctint)((1U << 13) + t4a + t6a) >> 14);
+    out[6] =   (dctint)((1U << 13) + t5a + t7a) >> 14;
+    t6     =   (dctint)((1U << 13) + t4a - t6a) >> 14;
+    t7     =   (dctint)((1U << 13) + t5a - t7a) >> 14;
 
-    out[3] = -(((t2 + t3) * 11585 + (1 << 13)) >> 14);
-    out[4] =   ((t2 - t3) * 11585 + (1 << 13)) >> 14;
-    out[2] =   ((t6 + t7) * 11585 + (1 << 13)) >> 14;
-    out[5] = -(((t6 - t7) * 11585 + (1 << 13)) >> 14);
+    out[3] = -((dctint)((t2 + t3) * 11585U + (1 << 13)) >> 14);
+    out[4] =   (dctint)((t2 - t3) * 11585U + (1 << 13)) >> 14;
+    out[2] =   (dctint)((t6 + t7) * 11585U + (1 << 13)) >> 14;
+    out[5] = -((dctint)((t6 - t7) * 11585U + (1 << 13)) >> 14);
 }
 
 itxfm_wrap(8, 5)
@@ -1290,22 +1322,22 @@ static av_always_inline void idct16_1d(const dctcoef *in, ptrdiff_t stride,
     dctint t0a, t1a, t2a, t3a, t4a, t5a, t6a, t7a;
     dctint t8a, t9a, t10a, t11a, t12a, t13a, t14a, t15a;
 
-    t0a  = ((IN(0) + IN(8)) * 11585 + (1 << 13)) >> 14;
-    t1a  = ((IN(0) - IN(8)) * 11585 + (1 << 13)) >> 14;
-    t2a  = (IN(4)  *  6270 - IN(12) * 15137 + (1 << 13)) >> 14;
-    t3a  = (IN(4)  * 15137 + IN(12) *  6270 + (1 << 13)) >> 14;
-    t4a  = (IN(2)  *  3196 - IN(14) * 16069 + (1 << 13)) >> 14;
-    t7a  = (IN(2)  * 16069 + IN(14) *  3196 + (1 << 13)) >> 14;
-    t5a  = (IN(10) * 13623 - IN(6)  *  9102 + (1 << 13)) >> 14;
-    t6a  = (IN(10) *  9102 + IN(6)  * 13623 + (1 << 13)) >> 14;
-    t8a  = (IN(1)  *  1606 - IN(15) * 16305 + (1 << 13)) >> 14;
-    t15a = (IN(1)  * 16305 + IN(15) *  1606 + (1 << 13)) >> 14;
-    t9a  = (IN(9)  * 12665 - IN(7)  * 10394 + (1 << 13)) >> 14;
-    t14a = (IN(9)  * 10394 + IN(7)  * 12665 + (1 << 13)) >> 14;
-    t10a = (IN(5)  *  7723 - IN(11) * 14449 + (1 << 13)) >> 14;
-    t13a = (IN(5)  * 14449 + IN(11) *  7723 + (1 << 13)) >> 14;
-    t11a = (IN(13) * 15679 - IN(3)  *  4756 + (1 << 13)) >> 14;
-    t12a = (IN(13) *  4756 + IN(3)  * 15679 + (1 << 13)) >> 14;
+    t0a  = (dctint)((IN(0) + IN(8)) * 11585U + (1 << 13)) >> 14;
+    t1a  = (dctint)((IN(0) - IN(8)) * 11585U + (1 << 13)) >> 14;
+    t2a  = (dctint)(IN(4)  *  6270U - IN(12) * 15137U + (1 << 13)) >> 14;
+    t3a  = (dctint)(IN(4)  * 15137U + IN(12) *  6270U + (1 << 13)) >> 14;
+    t4a  = (dctint)(IN(2)  *  3196U - IN(14) * 16069U + (1 << 13)) >> 14;
+    t7a  = (dctint)(IN(2)  * 16069U + IN(14) *  3196U + (1 << 13)) >> 14;
+    t5a  = (dctint)(IN(10) * 13623U - IN(6)  *  9102U + (1 << 13)) >> 14;
+    t6a  = (dctint)(IN(10) *  9102U + IN(6)  * 13623U + (1 << 13)) >> 14;
+    t8a  = (dctint)(IN(1)  *  1606U - IN(15) * 16305U + (1 << 13)) >> 14;
+    t15a = (dctint)(IN(1)  * 16305U + IN(15) *  1606U + (1 << 13)) >> 14;
+    t9a  = (dctint)(IN(9)  * 12665U - IN(7)  * 10394U + (1 << 13)) >> 14;
+    t14a = (dctint)(IN(9)  * 10394U + IN(7)  * 12665U + (1 << 13)) >> 14;
+    t10a = (dctint)(IN(5)  *  7723U - IN(11) * 14449U + (1 << 13)) >> 14;
+    t13a = (dctint)(IN(5)  * 14449U + IN(11) *  7723U + (1 << 13)) >> 14;
+    t11a = (dctint)(IN(13) * 15679U - IN(3)  *  4756U + (1 << 13)) >> 14;
+    t12a = (dctint)(IN(13) *  4756U + IN(3)  * 15679U + (1 << 13)) >> 14;
 
     t0  = t0a  + t3a;
     t1  = t1a  + t2a;
@@ -1324,12 +1356,12 @@ static av_always_inline void idct16_1d(const dctcoef *in, ptrdiff_t stride,
     t14 = t15a - t14a;
     t15 = t15a + t14a;
 
-    t5a  = ((t6 - t5) * 11585 + (1 << 13)) >> 14;
-    t6a  = ((t6 + t5) * 11585 + (1 << 13)) >> 14;
-    t9a  = (  t14 *  6270 - t9  * 15137  + (1 << 13)) >> 14;
-    t14a = (  t14 * 15137 + t9  *  6270  + (1 << 13)) >> 14;
-    t10a = (-(t13 * 15137 + t10 *  6270) + (1 << 13)) >> 14;
-    t13a = (  t13 *  6270 - t10 * 15137  + (1 << 13)) >> 14;
+    t5a  = (dctint)((t6 - t5) * 11585U + (1 << 13)) >> 14;
+    t6a  = (dctint)((t6 + t5) * 11585U + (1 << 13)) >> 14;
+    t9a  = (dctint)(  t14 *  6270U - t9  * 15137U  + (1 << 13)) >> 14;
+    t14a = (dctint)(  t14 * 15137U + t9  *  6270U  + (1 << 13)) >> 14;
+    t10a = (dctint)(-(t13 * 15137U + t10 *  6270U) + (1 << 13)) >> 14;
+    t13a = (dctint)(  t13 *  6270U - t10 * 15137U  + (1 << 13)) >> 14;
 
     t0a  = t0   + t7;
     t1a  = t1   + t6a;
@@ -1348,10 +1380,10 @@ static av_always_inline void idct16_1d(const dctcoef *in, ptrdiff_t stride,
     t14  = t14a + t13a;
     t15a = t15  + t12;
 
-    t10a = ((t13  - t10)  * 11585 + (1 << 13)) >> 14;
-    t13a = ((t13  + t10)  * 11585 + (1 << 13)) >> 14;
-    t11  = ((t12a - t11a) * 11585 + (1 << 13)) >> 14;
-    t12  = ((t12a + t11a) * 11585 + (1 << 13)) >> 14;
+    t10a = (dctint)((t13  - t10)  * 11585U + (1 << 13)) >> 14;
+    t13a = (dctint)((t13  + t10)  * 11585U + (1 << 13)) >> 14;
+    t11  = (dctint)((t12a - t11a) * 11585U + (1 << 13)) >> 14;
+    t12  = (dctint)((t12a + t11a) * 11585U + (1 << 13)) >> 14;
 
     out[ 0] = t0a + t15a;
     out[ 1] = t1a + t14;
@@ -1936,9 +1968,9 @@ static av_cold void vp9dsp_loopfilter_init(VP9DSPContext *dsp)
 
 #if BIT_DEPTH != 12
 
-static av_always_inline void copy_c(uint8_t *dst, ptrdiff_t dst_stride,
-                                    const uint8_t *src, ptrdiff_t src_stride,
-                                    int w, int h)
+static av_always_inline void copy_c(uint8_t *restrict dst, ptrdiff_t dst_stride,
+                                    const uint8_t *restrict src,
+                                    ptrdiff_t src_stride, int w, int h)
 {
     do {
         memcpy(dst, src, w * sizeof(pixel));
@@ -1948,9 +1980,9 @@ static av_always_inline void copy_c(uint8_t *dst, ptrdiff_t dst_stride,
     } while (--h);
 }
 
-static av_always_inline void avg_c(uint8_t *_dst, ptrdiff_t dst_stride,
-                                   const uint8_t *_src, ptrdiff_t src_stride,
-                                   int w, int h)
+static av_always_inline void avg_c(uint8_t *restrict _dst, ptrdiff_t dst_stride,
+                                   const uint8_t *restrict _src,
+                                   ptrdiff_t src_stride, int w, int h)
 {
     pixel *dst = (pixel *) _dst;
     const pixel *src = (const pixel *) _src;

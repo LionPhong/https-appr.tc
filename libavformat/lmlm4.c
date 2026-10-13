@@ -22,9 +22,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define LMLM4_I_FRAME   0x00
@@ -67,14 +69,14 @@ static int lmlm4_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id   = AV_CODEC_ID_MPEG4;
-    st->need_parsing      = AVSTREAM_PARSE_HEADERS;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_HEADERS;
     avpriv_set_pts_info(st, 64, 1001, 30000);
 
     if (!(st = avformat_new_stream(s, NULL)))
         return AVERROR(ENOMEM);
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id   = AV_CODEC_ID_MP2;
-    st->need_parsing      = AVSTREAM_PARSE_HEADERS;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_HEADERS;
 
     /* the parameters will be extracted from the compressed bitstream */
     return 0;
@@ -90,25 +92,26 @@ static int lmlm4_read_packet(AVFormatContext *s, AVPacket *pkt)
     frame_type  = avio_rb16(pb);
     packet_size = avio_rb32(pb);
     padding     = -packet_size & 511;
-    frame_size  = packet_size - 8;
 
     if (frame_type > LMLM4_MPEG1L2 || frame_type == LMLM4_INVALID) {
         av_log(s, AV_LOG_ERROR, "invalid or unsupported frame_type\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
     if (packet_size > LMLM4_MAX_PACKET_SIZE || packet_size<=8) {
         av_log(s, AV_LOG_ERROR, "packet size %d is invalid\n", packet_size);
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
+    frame_size  = packet_size - 8;
     if ((ret = av_get_packet(pb, pkt, frame_size)) <= 0)
-        return AVERROR(EIO);
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
 
     avio_skip(pb, padding);
 
     switch (frame_type) {
     case LMLM4_I_FRAME:
         pkt->flags = AV_PKT_FLAG_KEY;
+        av_fallthrough;
     case LMLM4_P_FRAME:
     case LMLM4_B_FRAME:
         pkt->stream_index = 0;
@@ -121,9 +124,9 @@ static int lmlm4_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_lmlm4_demuxer = {
-    .name           = "lmlm4",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw lmlm4"),
+const FFInputFormat ff_lmlm4_demuxer = {
+    .p.name         = "lmlm4",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw lmlm4"),
     .read_probe     = lmlm4_probe,
     .read_header    = lmlm4_read_header,
     .read_packet    = lmlm4_read_packet,

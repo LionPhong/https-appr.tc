@@ -24,9 +24,10 @@
  * MTV demuxer.
  */
 
-#include "libavutil/bswap.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define MTV_ASUBCHUNK_DATA_SIZE 500
@@ -104,6 +105,7 @@ static int mtv_read_header(AVFormatContext *s)
     AVIOContext   *pb  = s->pb;
     AVStream        *st;
     unsigned int    audio_subsegments;
+    int64_t ret64;
 
     avio_skip(pb, 3);
     mtv->file_size         = avio_rl32(pb);
@@ -154,7 +156,10 @@ static int mtv_read_header(AVFormatContext *s)
         mtv->img_segment_size;
     mtv->video_fps         = (mtv->audio_br / 4) / audio_subsegments;
 
-    // FIXME Add sanity check here
+    if (!mtv->video_fps) {
+        av_log(s, AV_LOG_ERROR, "Invalid video frame rate\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     // all systems go! init decoders
 
@@ -185,12 +190,12 @@ static int mtv_read_header(AVFormatContext *s)
     st->codecpar->codec_type      = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id        = AV_CODEC_ID_MP3;
     st->codecpar->bit_rate        = mtv->audio_br;
-    st->need_parsing              = AVSTREAM_PARSE_FULL;
+    ffstream(st)->need_parsing    = AVSTREAM_PARSE_FULL;
 
     // Jump over header
 
-    if(avio_seek(pb, MTV_HEADER_SIZE, SEEK_SET) != MTV_HEADER_SIZE)
-        return AVERROR(EIO);
+    if ((ret64 = avio_seek(pb, MTV_HEADER_SIZE, SEEK_SET)) < 0)
+        return (int)ret64;
 
     return 0;
 
@@ -202,7 +207,7 @@ static int mtv_read_packet(AVFormatContext *s, AVPacket *pkt)
     AVIOContext *pb = s->pb;
     int ret;
 
-    if((avio_tell(pb) - s->internal->data_offset + mtv->img_segment_size) % mtv->full_segment_size)
+    if((avio_tell(pb) - ffformatcontext(s)->data_offset + mtv->img_segment_size) % mtv->full_segment_size)
     {
         avio_skip(pb, MTV_AUDIO_PADDING_SIZE);
 
@@ -225,9 +230,9 @@ static int mtv_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_mtv_demuxer = {
-    .name           = "mtv",
-    .long_name      = NULL_IF_CONFIG_SMALL("MTV"),
+const FFInputFormat ff_mtv_demuxer = {
+    .p.name         = "mtv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("MTV"),
     .priv_data_size = sizeof(MTVDemuxContext),
     .read_probe     = mtv_probe,
     .read_header    = mtv_read_header,

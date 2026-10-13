@@ -29,7 +29,12 @@
 
 #include "config.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
 #ifdef _WIN32
 #if HAVE_DIRECT_H
@@ -41,7 +46,12 @@
 #endif
 
 #ifdef _WIN32
-#  include <fcntl.h>
+#  include <stdint.h>
+#  include <sys/types.h>
+#  ifdef off_t
+#   undef off_t
+#  endif
+#  define off_t int64_t
 #  ifdef lseek
 #   undef lseek
 #  endif
@@ -49,11 +59,38 @@
 #  ifdef stat
 #   undef stat
 #  endif
-#  define stat _stati64
+
+#  define stat win32_stat
+
+    /*
+     * The POSIX definition for the stat() function uses a struct of the
+     * same name (struct stat), that why it takes this extra effort  for
+     * redirecting/replacing the stat() function with our own one which
+     * is capable to handle long path names on Windows.
+     * The struct below roughly follows the POSIX definition. Time values
+     * are 64bit, but in cases when _USE_32BIT_TIME_T is defined, they
+     * will be set to values no larger than INT32_MAX which corresponds
+     * to file times up to the year 2038.
+     */
+    struct win32_stat
+    {
+        _dev_t         st_dev;     /* ID of device containing file */
+        _ino_t         st_ino;     /* inode number */
+        unsigned short st_mode;    /* protection */
+        short          st_nlink;   /* number of hard links */
+        short          st_uid;     /* user ID of owner */
+        short          st_gid;     /* group ID of owner */
+        _dev_t         st_rdev;    /* device ID (if special file) */
+        int64_t        st_size;    /* total size, in bytes */
+        int64_t        st_atime;   /* time of last access */
+        int64_t        st_mtime;   /* time of last modification */
+        int64_t        st_ctime;   /* time of last status change */
+    };
+
 #  ifdef fstat
 #   undef fstat
 #  endif
-#  define fstat(f,s) _fstati64((f), (s))
+#  define fstat win32_fstat
 #endif /* defined(_WIN32) */
 
 
@@ -143,9 +180,17 @@ int ff_poll(struct pollfd *fds, nfds_t numfds, int timeout);
 #endif /* CONFIG_NETWORK */
 
 #ifdef _WIN32
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <windows.h>
+#include "libavutil/mem.h"
 #include "libavutil/wchar_filename.h"
+
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef SSIZE_T ssize_t;
+#endif
 
 #define DEF_FS_FUNCTION(name, wfunc, afunc)               \
 static inline int win32_##name(const char *filename_utf8) \
@@ -153,7 +198,7 @@ static inline int win32_##name(const char *filename_utf8) \
     wchar_t *filename_w;                                  \
     int ret;                                              \
                                                           \
-    if (utf8towchar(filename_utf8, &filename_w))          \
+    if (get_extended_win32_path(filename_utf8, &filename_w)) \
         return -1;                                        \
     if (!filename_w)                                      \
         goto fallback;                                    \
@@ -171,37 +216,76 @@ DEF_FS_FUNCTION(unlink, _wunlink, _unlink)
 DEF_FS_FUNCTION(mkdir,  _wmkdir,  _mkdir)
 DEF_FS_FUNCTION(rmdir,  _wrmdir , _rmdir)
 
-#define DEF_FS_FUNCTION2(name, wfunc, afunc, partype)     \
-static inline int win32_##name(const char *filename_utf8, partype par) \
-{                                                         \
-    wchar_t *filename_w;                                  \
-    int ret;                                              \
-                                                          \
-    if (utf8towchar(filename_utf8, &filename_w))          \
-        return -1;                                        \
-    if (!filename_w)                                      \
-        goto fallback;                                    \
-                                                          \
-    ret = wfunc(filename_w, par);                         \
-    av_free(filename_w);                                  \
-    return ret;                                           \
-                                                          \
-fallback:                                                 \
-    /* filename may be be in CP_ACP */                    \
-    return afunc(filename_utf8, par);                     \
+static inline int win32_access(const char *filename_utf8, int mode)
+{
+    wchar_t *filename_w;
+    int ret;
+    if (get_extended_win32_path(filename_utf8, &filename_w))
+        return -1;
+    if (!filename_w)
+        goto fallback;
+    ret = _waccess(filename_w, mode);
+    av_free(filename_w);
+    return ret;
+fallback:
+    return _access(filename_utf8, mode);
 }
 
-DEF_FS_FUNCTION2(access, _waccess, _access, int)
-DEF_FS_FUNCTION2(stat, _wstati64, _stati64, struct stat*)
+static inline void copy_stat(struct _stat64 *crtstat, struct win32_stat *buf)
+{
+    buf->st_dev   = crtstat->st_dev;
+    buf->st_ino   = crtstat->st_ino;
+    buf->st_mode  = crtstat->st_mode;
+    buf->st_nlink = crtstat->st_nlink;
+    buf->st_uid   = crtstat->st_uid;
+    buf->st_gid   = crtstat->st_gid;
+    buf->st_rdev  = crtstat->st_rdev;
+    buf->st_size  = crtstat->st_size;
+    buf->st_atime = crtstat->st_atime;
+    buf->st_mtime = crtstat->st_mtime;
+    buf->st_ctime = crtstat->st_ctime;
+}
+
+static inline int win32_stat(const char *filename_utf8, struct win32_stat *buf)
+{
+    struct _stat64 crtstat = { 0 };
+    wchar_t *filename_w;
+    int ret;
+
+    if (get_extended_win32_path(filename_utf8, &filename_w))
+        return -1;
+
+    if (filename_w) {
+        ret = _wstat64(filename_w, &crtstat);
+        av_free(filename_w);
+    } else
+        ret = _stat64(filename_utf8, &crtstat);
+
+    copy_stat(&crtstat, buf);
+
+    return ret;
+}
+
+static inline int win32_fstat(int fd, struct win32_stat *buf)
+{
+    struct _stat64 crtstat = { 0 };
+    int ret;
+
+    ret = _fstat64(fd, &crtstat);
+
+    copy_stat(&crtstat, buf);
+
+    return ret;
+}
 
 static inline int win32_rename(const char *src_utf8, const char *dest_utf8)
 {
     wchar_t *src_w, *dest_w;
     int ret;
 
-    if (utf8towchar(src_utf8, &src_w))
+    if (get_extended_win32_path(src_utf8, &src_w))
         return -1;
-    if (utf8towchar(dest_utf8, &dest_w)) {
+    if (get_extended_win32_path(dest_utf8, &dest_w)) {
         av_free(src_w);
         return -1;
     }
@@ -211,7 +295,7 @@ static inline int win32_rename(const char *src_utf8, const char *dest_utf8)
         goto fallback;
     }
 
-    ret = MoveFileExW(src_w, dest_w, MOVEFILE_REPLACE_EXISTING);
+    ret = (MoveFileExW(src_w, dest_w, MOVEFILE_REPLACE_EXISTING) == 0) ? -1 : 0;
     av_free(src_w);
     av_free(dest_w);
     // Lacking proper mapping from GetLastError() error codes to errno codes
@@ -222,7 +306,7 @@ static inline int win32_rename(const char *src_utf8, const char *dest_utf8)
 fallback:
     /* filename may be be in CP_ACP */
 #if !HAVE_UWP
-    ret = MoveFileExA(src_utf8, dest_utf8, MOVEFILE_REPLACE_EXISTING);
+    ret = (MoveFileExA(src_utf8, dest_utf8, MOVEFILE_REPLACE_EXISTING) == 0) ? -1 : 0;
     if (ret)
         errno = EPERM;
 #else
@@ -239,11 +323,89 @@ fallback:
     return ret;
 }
 
+/*
+ * Positional I/O and file locking. Unlike pread() and pwrite() the Windows
+ * versions move the file position of the descriptor. A flock() lock covers
+ * only the first byte of the file, ReadFile() and WriteFile() of that byte
+ * from other processes block or fail while the lock is held. Mapped
+ * views of the file are not affected.
+ */
+#ifndef LOCK_SH
+#define LOCK_SH 1
+#define LOCK_EX 2
+#define LOCK_NB 4
+#define LOCK_UN 8
+#endif
+
+static inline ssize_t win32_pread(int fd, void *buf, size_t size, off_t offset)
+{
+    HANDLE fh = (HANDLE)_get_osfhandle(fd);
+    OVERLAPPED ov = { .Offset = offset, .OffsetHigh = offset >> 32 };
+    DWORD n;
+
+    if (fh == INVALID_HANDLE_VALUE)
+        return -1;
+    if (size > INT_MAX)
+        size = INT_MAX;
+    if (!ReadFile(fh, buf, size, &n, &ov)) {
+        if (GetLastError() == ERROR_HANDLE_EOF)
+            return 0;
+        errno = EIO;
+        return -1;
+    }
+    return n;
+}
+
+static inline ssize_t win32_pwrite(int fd, const void *buf, size_t size, off_t offset)
+{
+    HANDLE fh = (HANDLE)_get_osfhandle(fd);
+    OVERLAPPED ov = { .Offset = offset, .OffsetHigh = offset >> 32 };
+    DWORD n;
+
+    if (fh == INVALID_HANDLE_VALUE)
+        return -1;
+    if (size > INT_MAX)
+        size = INT_MAX;
+    if (!WriteFile(fh, buf, size, &n, &ov)) {
+        errno = GetLastError() == ERROR_DISK_FULL ? ENOSPC : EIO;
+        return -1;
+    }
+    return n;
+}
+
+static inline int win32_flock(int fd, int op)
+{
+    HANDLE fh = (HANDLE)_get_osfhandle(fd);
+    OVERLAPPED ov = { 0 };
+    BOOL ok;
+
+    if (fh == INVALID_HANDLE_VALUE)
+        return -1;
+    if (op & LOCK_UN) {
+        ok = UnlockFileEx(fh, 0, 1, 0, &ov);
+    } else {
+        DWORD flags = 0;
+        if (op & LOCK_EX)
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        if (op & LOCK_NB)
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        ok = LockFileEx(fh, flags, 0, 1, 0, &ov);
+    }
+    if (!ok) {
+        errno = GetLastError() == ERROR_LOCK_VIOLATION ? EWOULDBLOCK : EIO;
+        return -1;
+    }
+    return 0;
+}
+
 #define mkdir(a, b) win32_mkdir(a)
 #define rename      win32_rename
 #define rmdir       win32_rmdir
 #define unlink      win32_unlink
 #define access      win32_access
+#define pread       win32_pread
+#define pwrite      win32_pwrite
+#define flock       win32_flock
 
 #endif
 

@@ -23,9 +23,11 @@
 
 #include "libavutil/common.h"
 #include "libavutil/ffmath.h"
-#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "celp_filters.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "internal.h"
 #include "libavutil/lfg.h"
 
@@ -56,17 +58,18 @@ static av_cold int cng_decode_init(AVCodecContext *avctx)
     CNGContext *p = avctx->priv_data;
 
     avctx->sample_fmt  = AV_SAMPLE_FMT_S16;
-    avctx->channels    = 1;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout   = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_rate = 8000;
 
     p->order            = 12;
     avctx->frame_size   = 640;
-    p->refl_coef        = av_mallocz_array(p->order, sizeof(*p->refl_coef));
-    p->target_refl_coef = av_mallocz_array(p->order, sizeof(*p->target_refl_coef));
-    p->lpc_coef         = av_mallocz_array(p->order, sizeof(*p->lpc_coef));
-    p->filter_out       = av_mallocz_array(avctx->frame_size + p->order,
+    p->refl_coef        = av_calloc(p->order, sizeof(*p->refl_coef));
+    p->target_refl_coef = av_calloc(p->order, sizeof(*p->target_refl_coef));
+    p->lpc_coef         = av_calloc(p->order, sizeof(*p->lpc_coef));
+    p->filter_out       = av_calloc(avctx->frame_size + p->order,
                                      sizeof(*p->filter_out));
-    p->excitation       = av_mallocz_array(avctx->frame_size, sizeof(*p->excitation));
+    p->excitation       = av_calloc(avctx->frame_size, sizeof(*p->excitation));
     if (!p->refl_coef || !p->target_refl_coef || !p->lpc_coef ||
         !p->filter_out || !p->excitation) {
         return AVERROR(ENOMEM);
@@ -94,16 +97,15 @@ static void make_lpc_coefs(float *lpc, const float *refl, int order)
         memcpy(lpc, cur, sizeof(*lpc) * order);
 }
 
-static void cng_decode_flush(AVCodecContext *avctx)
+static av_cold void cng_decode_flush(AVCodecContext *avctx)
 {
     CNGContext *p = avctx->priv_data;
     p->inited = 0;
 }
 
-static int cng_decode_frame(AVCodecContext *avctx, void *data,
+static int cng_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame_ptr, AVPacket *avpkt)
 {
-    AVFrame *frame = data;
     CNGContext *p = avctx->priv_data;
     int buf_size  = avpkt->size;
     int ret, i;
@@ -151,8 +153,10 @@ static int cng_decode_frame(AVCodecContext *avctx, void *data,
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
     buf_out = (int16_t *)frame->data[0];
-    for (i = 0; i < avctx->frame_size; i++)
-        buf_out[i] = av_clip_int16(p->filter_out[i + p->order]);
+    for (i = 0; i < avctx->frame_size; i++) {
+        const float f = p->filter_out[i + p->order];
+        buf_out[i] = !isfinite(f) ? 0 : av_clipf(f, INT16_MIN, INT16_MAX);
+    }
     memcpy(p->filter_out, p->filter_out + avctx->frame_size,
            p->order * sizeof(*p->filter_out));
 
@@ -161,19 +165,16 @@ static int cng_decode_frame(AVCodecContext *avctx, void *data,
     return buf_size;
 }
 
-AVCodec ff_comfortnoise_decoder = {
-    .name           = "comfortnoise",
-    .long_name      = NULL_IF_CONFIG_SMALL("RFC 3389 comfort noise generator"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_COMFORT_NOISE,
+const FFCodec ff_comfortnoise_decoder = {
+    .p.name         = "comfortnoise",
+    CODEC_LONG_NAME("RFC 3389 comfort noise generator"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_COMFORT_NOISE,
     .priv_data_size = sizeof(CNGContext),
     .init           = cng_decode_init,
-    .decode         = cng_decode_frame,
+    FF_CODEC_DECODE_CB(cng_decode_frame),
     .flush          = cng_decode_flush,
     .close          = cng_decode_close,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

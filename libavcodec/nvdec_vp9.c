@@ -20,15 +20,20 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/pixdesc.h"
 
 #include "avcodec.h"
 #include "nvdec.h"
 #include "decode.h"
+#include "hwaccel_internal.h"
 #include "internal.h"
 #include "vp9shared.h"
 
-static int nvdec_vp9_start_frame(AVCodecContext *avctx, const uint8_t *buffer, uint32_t size)
+static int nvdec_vp9_start_frame(AVCodecContext *avctx,
+                                 const AVBufferRef *buffer_ref,
+                                 const uint8_t *buffer, uint32_t size)
 {
     VP9SharedContext *h = avctx->priv_data;
     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
@@ -46,7 +51,7 @@ static int nvdec_vp9_start_frame(AVCodecContext *avctx, const uint8_t *buffer, u
     if (ret < 0)
         return ret;
 
-    fdd = (FrameDecodeData*)cur_frame->private_ref->data;
+    fdd = cur_frame->private_ref;
     cf  = (NVDECFrame*)fdd->hwaccel_priv;
 
     *pp = (CUVIDPICPARAMS) {
@@ -163,22 +168,53 @@ static int nvdec_vp9_start_frame(AVCodecContext *avctx, const uint8_t *buffer, u
 }
 
 static int nvdec_vp9_frame_params(AVCodecContext *avctx,
-                                  AVBufferRef *hw_frames_ctx)
+                                  AVBufferRef *hw_frames_ctx,
+                                  enum AVPixelFormat hw_format)
 {
     // VP9 uses a fixed size pool of 8 possible reference frames
-    return ff_nvdec_frame_params(avctx, hw_frames_ctx, 8, 0);
+    return ff_nvdec_frame_params(avctx, hw_frames_ctx, hw_format, 8, 0);
 }
 
-const AVHWAccel ff_vp9_nvdec_hwaccel = {
-    .name                 = "vp9_nvdec",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_VP9,
-    .pix_fmt              = AV_PIX_FMT_CUDA,
+#if CONFIG_VP9_NVDEC_HWACCEL
+static int nvdec_vp9_cuda_frame_params(AVCodecContext *avctx,
+                                       AVBufferRef *hw_frames_ctx)
+{
+    return nvdec_vp9_frame_params(avctx, hw_frames_ctx, AV_PIX_FMT_CUDA);
+}
+
+const FFHWAccel ff_vp9_nvdec_hwaccel = {
+    .p.name               = "vp9_nvdec",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_VP9,
+    .p.pix_fmt            = AV_PIX_FMT_CUDA,
     .start_frame          = nvdec_vp9_start_frame,
     .end_frame            = ff_nvdec_simple_end_frame,
     .decode_slice         = ff_nvdec_simple_decode_slice,
-    .frame_params         = nvdec_vp9_frame_params,
+    .frame_params         = nvdec_vp9_cuda_frame_params,
     .init                 = ff_nvdec_decode_init,
     .uninit               = ff_nvdec_decode_uninit,
     .priv_data_size       = sizeof(NVDECContext),
 };
+#endif
+
+#if CONFIG_VP9_NVDEC_CUARRAY_HWACCEL
+static int nvdec_vp9_cuarray_frame_params(AVCodecContext *avctx,
+                                          AVBufferRef *hw_frames_ctx)
+{
+    return nvdec_vp9_frame_params(avctx, hw_frames_ctx, AV_PIX_FMT_CUARRAY);
+}
+
+const FFHWAccel ff_vp9_nvdec_cuarray_hwaccel = {
+    .p.name               = "vp9_nvdec_cuarray",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_VP9,
+    .p.pix_fmt            = AV_PIX_FMT_CUARRAY,
+    .start_frame          = nvdec_vp9_start_frame,
+    .end_frame            = ff_nvdec_simple_end_frame,
+    .decode_slice         = ff_nvdec_simple_decode_slice,
+    .frame_params         = nvdec_vp9_cuarray_frame_params,
+    .init                 = ff_nvdec_decode_init,
+    .uninit               = ff_nvdec_decode_uninit,
+    .priv_data_size       = sizeof(NVDECContext),
+};
+#endif

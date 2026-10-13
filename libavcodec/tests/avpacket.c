@@ -22,6 +22,7 @@
 #include <string.h>
 #include "libavcodec/avcodec.h"
 #include "libavutil/error.h"
+#include "libavutil/mem.h"
 
 
 
@@ -50,6 +51,7 @@ static int setup_side_data_entry(AVPacket* avpkt)
     ret = av_packet_add_side_data(avpkt, AV_PKT_DATA_NEW_EXTRADATA,
                                         extra_data, bytes);
     if(ret < 0){
+        av_free(extra_data);
         fprintf(stderr,
                 "Error occurred in av_packet_add_side_data: %s\n",
                 av_err2str(ret));
@@ -62,9 +64,6 @@ static int initializations(AVPacket* avpkt)
 {
     const static uint8_t* data = "selftest for av_packet_clone(...)";
     int ret = 0;
-
-    /* initialize avpkt */
-    av_init_packet(avpkt);
 
     /* set values for avpkt */
     avpkt->pts = 17;
@@ -82,24 +81,35 @@ static int initializations(AVPacket* avpkt)
 
 int main(void)
 {
-    AVPacket avpkt;
+    AVPacket *avpkt = NULL;
     AVPacket *avpkt_clone = NULL;
     int ret = 0;
 
-    if(initializations(&avpkt) < 0){
+    /* test av_packet_alloc */
+    avpkt = av_packet_alloc();
+    if(!avpkt) {
+        av_log(NULL, AV_LOG_ERROR, "av_packet_alloc failed to allocate AVPacket\n");
+        return 1;
+    }
+
+    if (initializations(avpkt) < 0) {
         printf("failed to initialize variables\n");
+        av_packet_free(&avpkt);
         return 1;
     }
     /* test av_packet_clone*/
-    avpkt_clone = av_packet_clone(&avpkt);
+    avpkt_clone = av_packet_clone(avpkt);
 
     if(!avpkt_clone) {
         av_log(NULL, AV_LOG_ERROR,"av_packet_clone failed to clone AVPacket\n");
+        av_packet_free(&avpkt);
         return 1;
     }
     /*test av_grow_packet*/
     if(av_grow_packet(avpkt_clone, 20) < 0){
         av_log(NULL, AV_LOG_ERROR, "av_grow_packet failed\n");
+        av_packet_free(&avpkt_clone);
+        av_packet_free(&avpkt);
         return 1;
     }
     if(av_grow_packet(avpkt_clone, INT_MAX) == 0){
@@ -121,7 +131,7 @@ int main(void)
     }
     /*clean up*/
     av_packet_free(&avpkt_clone);
-    av_packet_unref(&avpkt);
+    av_packet_free(&avpkt);
 
 
     return ret;

@@ -23,16 +23,9 @@
 #include <stdint.h>
 
 #include "cbs_h2645.h"
-#include "hevc.h"
+#include "cbs_sei.h"
 
-enum {
-    // This limit is arbitrary - it is sufficient for one message of each
-    // type plus some repeats, and will therefore easily cover all sane
-    // streams.  However, it is possible to make technically-valid streams
-    // for which it will fail (for example, by including a large number of
-    // user-data-unregistered messages).
-    H265_MAX_SEI_PAYLOADS = 64,
-};
+#include "hevc/hevc.h"
 
 typedef struct H265RawNALUnitHeader {
     uint8_t nal_unit_type;
@@ -183,9 +176,9 @@ typedef struct H265RawVUI {
 } H265RawVUI;
 
 typedef struct H265RawExtensionData {
-    uint8_t *data;
-    size_t bit_length;
+    uint8_t     *data;
     AVBufferRef *data_ref;
+    size_t       bit_length;
 } H265RawExtensionData;
 
 typedef struct H265RawVPS {
@@ -218,7 +211,8 @@ typedef struct H265RawVPS {
     uint16_t vps_num_hrd_parameters;
     uint16_t hrd_layer_set_idx[HEVC_MAX_LAYER_SETS];
     uint8_t cprms_present_flag[HEVC_MAX_LAYER_SETS];
-    H265RawHRDParameters hrd_parameters[HEVC_MAX_LAYER_SETS];
+    H265RawHRDParameters *hrd_parameters;
+    AVBufferRef          *hrd_parameters_ref;
 
     uint8_t vps_extension_flag;
     H265RawExtensionData extension_data;
@@ -255,11 +249,15 @@ typedef struct H265RawSPS {
     uint8_t sps_video_parameter_set_id;
 
     uint8_t sps_max_sub_layers_minus1;
+    uint8_t sps_ext_or_max_sub_layers_minus1;
     uint8_t sps_temporal_id_nesting_flag;
 
     H265RawProfileTierLevel profile_tier_level;
 
     uint8_t sps_seq_parameter_set_id;
+
+    uint8_t update_rep_format_flag;
+    uint8_t sps_rep_format_idx;
 
     uint8_t chroma_format_idc;
     uint8_t separate_colour_plane_flag;
@@ -291,6 +289,8 @@ typedef struct H265RawSPS {
     uint8_t max_transform_hierarchy_depth_intra;
 
     uint8_t scaling_list_enabled_flag;
+    uint8_t sps_infer_scaling_list_flag;
+    uint8_t sps_scaling_list_ref_layer_id;
     uint8_t sps_scaling_list_data_present_flag;
     H265RawScalingList scaling_list;
 
@@ -349,6 +349,9 @@ typedef struct H265RawSPS {
 
     uint8_t motion_vector_resolution_control_idc;
     uint8_t intra_boundary_filtering_disable_flag;
+
+    // Multilayer extension.
+    uint8_t inter_view_mv_vert_constraint_flag;
 } H265RawSPS;
 
 typedef struct H265RawPPS {
@@ -440,6 +443,46 @@ typedef struct H265RawPPS {
     uint8_t luma_bit_depth_entry_minus8;
     uint8_t chroma_bit_depth_entry_minus8;
     uint16_t pps_palette_predictor_initializers[3][128];
+
+    // Multilayer extension.
+    uint8_t poc_reset_info_present_flag;
+    uint8_t pps_infer_scaling_list_flag;
+    uint8_t pps_scaling_list_ref_layer_id;
+    uint8_t num_ref_loc_offsets;
+    uint8_t ref_loc_offset_layer_id[64];
+    uint8_t scaled_ref_layer_offset_present_flag[64];
+    int16_t scaled_ref_layer_left_offset[64];
+    int16_t scaled_ref_layer_top_offset[64];
+    int16_t scaled_ref_layer_right_offset[64];
+    int16_t scaled_ref_layer_bottom_offset[64];
+    uint8_t ref_region_offset_present_flag[64];
+    int16_t ref_region_left_offset[64];
+    int16_t ref_region_top_offset[64];
+    int16_t ref_region_right_offset[64];
+    int16_t ref_region_bottom_offset[64];
+    uint8_t resample_phase_set_present_flag[64];
+    uint8_t phase_hor_luma[64];
+    uint8_t phase_ver_luma[64];
+    uint8_t phase_hor_chroma_plus8[64];
+    uint8_t phase_ver_chroma_plus8[64];
+    uint8_t colour_mapping_enabled_flag;
+    uint8_t num_cm_ref_layers_minus1;
+    uint8_t cm_ref_layer_id[62];
+    uint8_t cm_octant_depth;
+    uint8_t cm_y_part_num_log2;
+    uint8_t luma_bit_depth_cm_input_minus8;
+    uint8_t chroma_bit_depth_cm_input_minus8;
+    uint8_t luma_bit_depth_cm_output_minus8;
+    uint8_t chroma_bit_depth_cm_output_minus8;
+    uint8_t cm_res_quant_bits;
+    uint8_t cm_delta_flc_bits_minus1;
+    int16_t cm_adapt_threshold_u_delta;
+    int16_t cm_adapt_threshold_v_delta;
+    uint8_t split_octant_flag[2];
+    uint8_t coded_res_flag[12][2][2][4];
+    uint8_t res_coeff_q[12][2][2][4][3];
+    uint32_t res_coeff_s[12][2][2][4][3];
+    uint8_t res_coeff_r[12][2][2][4][3];
 } H265RawPPS;
 
 typedef struct H265RawAUD {
@@ -541,10 +584,10 @@ typedef struct  H265RawSliceHeader {
 typedef struct H265RawSlice {
     H265RawSliceHeader header;
 
-    uint8_t *data;
-    size_t   data_size;
-    int      data_bit_start;
+    uint8_t     *data;
     AVBufferRef *data_ref;
+    size_t       data_size;
+    int          data_bit_start;
 } H265RawSlice;
 
 
@@ -596,26 +639,32 @@ typedef struct H265RawSEIPanScanRect {
     uint16_t pan_scan_rect_persistence_flag;
 } H265RawSEIPanScanRect;
 
-typedef struct H265RawSEIUserDataRegistered {
-    uint8_t itu_t_t35_country_code;
-    uint8_t itu_t_t35_country_code_extension_byte;
-    uint8_t     *data;
-    size_t       data_length;
-    AVBufferRef *data_ref;
-} H265RawSEIUserDataRegistered;
-
-typedef struct H265RawSEIUserDataUnregistered {
-    uint8_t uuid_iso_iec_11578[16];
-    uint8_t     *data;
-    size_t       data_length;
-    AVBufferRef *data_ref;
-} H265RawSEIUserDataUnregistered;
-
 typedef struct H265RawSEIRecoveryPoint {
     int16_t recovery_poc_cnt;
     uint8_t exact_match_flag;
     uint8_t broken_link_flag;
 } H265RawSEIRecoveryPoint;
+
+typedef struct H265RawFilmGrainCharacteristics {
+    uint8_t      film_grain_characteristics_cancel_flag;
+    uint8_t      film_grain_model_id;
+    uint8_t      separate_colour_description_present_flag;
+    uint8_t      film_grain_bit_depth_luma_minus8;
+    uint8_t      film_grain_bit_depth_chroma_minus8;
+    uint8_t      film_grain_full_range_flag;
+    uint8_t      film_grain_colour_primaries;
+    uint8_t      film_grain_transfer_characteristics;
+    uint8_t      film_grain_matrix_coeffs;
+    uint8_t      blending_mode_id;
+    uint8_t      log2_scale_factor;
+    uint8_t      comp_model_present_flag[3];
+    uint8_t      num_intensity_intervals_minus1[3];
+    uint8_t      num_model_values_minus1[3];
+    uint8_t      intensity_interval_lower_bound[3][256];
+    uint8_t      intensity_interval_upper_bound[3][256];
+    int16_t      comp_model_value[3][256][6];
+    uint8_t      film_grain_characteristics_persistence_flag;
+} H265RawFilmGrainCharacteristics;
 
 typedef struct H265RawSEIDisplayOrientation {
     uint8_t display_orientation_cancel_flag;
@@ -661,24 +710,6 @@ typedef struct H265RawSEITimeCode {
     int32_t  time_offset_value[3];
 } H265RawSEITimeCode;
 
-typedef struct H265RawSEIMasteringDisplayColourVolume {
-    uint16_t display_primaries_x[3];
-    uint16_t display_primaries_y[3];
-    uint16_t white_point_x;
-    uint16_t white_point_y;
-    uint32_t max_display_mastering_luminance;
-    uint32_t min_display_mastering_luminance;
-} H265RawSEIMasteringDisplayColourVolume;
-
-typedef struct H265RawSEIContentLightLevelInfo {
-    uint16_t max_content_light_level;
-    uint16_t max_pic_average_light_level;
-} H265RawSEIContentLightLevelInfo;
-
-typedef struct H265RawSEIAlternativeTransferCharacteristics {
-    uint8_t preferred_transfer_characteristics;
-} H265RawSEIAlternativeTransferCharacteristics;
-
 typedef struct H265RawSEIAlphaChannelInfo {
     uint8_t  alpha_channel_cancel_flag;
     uint8_t  alpha_channel_use_idc;
@@ -690,40 +721,32 @@ typedef struct H265RawSEIAlphaChannelInfo {
     uint8_t  alpha_channel_clip_type_flag;
 } H265RawSEIAlphaChannelInfo;
 
-typedef struct H265RawSEIPayload {
-    uint32_t payload_type;
-    uint32_t payload_size;
-    union {
-        H265RawSEIBufferingPeriod buffering_period;
-        H265RawSEIPicTiming pic_timing;
-        H265RawSEIPanScanRect pan_scan_rect;
-        H265RawSEIUserDataRegistered user_data_registered;
-        H265RawSEIUserDataUnregistered user_data_unregistered;
-        H265RawSEIRecoveryPoint recovery_point;
-        H265RawSEIDisplayOrientation display_orientation;
-        H265RawSEIActiveParameterSets active_parameter_sets;
-        H265RawSEIDecodedPictureHash decoded_picture_hash;
-        H265RawSEITimeCode time_code;
-        H265RawSEIMasteringDisplayColourVolume mastering_display;
-        H265RawSEIContentLightLevelInfo content_light_level;
-        H265RawSEIAlternativeTransferCharacteristics
-            alternative_transfer_characteristics;
-        H265RawSEIAlphaChannelInfo alpha_channel_info;
-        struct {
-            uint8_t *data;
-            size_t data_length;
-            AVBufferRef *data_ref;
-        } other;
-    } payload;
-    H265RawExtensionData extension_data;
-} H265RawSEIPayload;
+typedef struct H265RawSEI3DReferenceDisplaysInfo {
+    uint8_t prec_ref_display_width;
+    uint8_t ref_viewing_distance_flag;
+    uint8_t prec_ref_viewing_dist;
+    uint8_t num_ref_displays_minus1;
+    uint16_t left_view_id[32];
+    uint16_t right_view_id[32];
+    uint8_t exponent_ref_display_width[32];
+    uint8_t mantissa_ref_display_width[32];
+    uint8_t exponent_ref_viewing_distance[32];
+    uint8_t mantissa_ref_viewing_distance[32];
+    uint8_t additional_shift_present_flag[32];
+    uint16_t num_sample_shift_plus512[32];
+    uint8_t three_dimensional_reference_displays_extension_flag;
+} H265RawSEI3DReferenceDisplaysInfo;
 
 typedef struct H265RawSEI {
     H265RawNALUnitHeader nal_unit_header;
-
-    H265RawSEIPayload payload[H265_MAX_SEI_PAYLOADS];
-    uint8_t payload_count;
+    SEIRawMessageList    message_list;
 } H265RawSEI;
+
+typedef struct H265RawFiller {
+    H265RawNALUnitHeader nal_unit_header;
+
+    uint32_t filler_size;
+} H265RawFiller;
 
 typedef struct CodedBitstreamH265Context {
     // Reader/writer context in common with the H.264 implementation.
@@ -731,12 +754,9 @@ typedef struct CodedBitstreamH265Context {
 
     // All currently available parameter sets.  These are updated when
     // any parameter set NAL unit is read/written with this context.
-    AVBufferRef *vps_ref[HEVC_MAX_VPS_COUNT];
-    AVBufferRef *sps_ref[HEVC_MAX_SPS_COUNT];
-    AVBufferRef *pps_ref[HEVC_MAX_PPS_COUNT];
-    H265RawVPS *vps[HEVC_MAX_VPS_COUNT];
-    H265RawSPS *sps[HEVC_MAX_SPS_COUNT];
-    H265RawPPS *pps[HEVC_MAX_PPS_COUNT];
+    H265RawVPS *vps[HEVC_MAX_VPS_COUNT]; ///< RefStruct references
+    H265RawSPS *sps[HEVC_MAX_SPS_COUNT]; ///< RefStruct references
+    H265RawPPS *pps[HEVC_MAX_PPS_COUNT]; ///< RefStruct references
 
     // The currently active parameter sets.  These are updated when any
     // NAL unit refers to the relevant parameter set.  These pointers

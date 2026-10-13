@@ -26,9 +26,10 @@
 
 #include <inttypes.h>
 
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
-#include "riff.h"
 #include "smjpeg.h"
 
 typedef struct SMJPEGContext {
@@ -50,6 +51,9 @@ static int smjpeg_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     uint32_t version, htype, hlength, duration;
     char *comment;
+
+    sc->audio_stream_index =
+    sc->video_stream_index = -1;
 
     avio_skip(pb, 8); // magic
     version = avio_rb32(pb);
@@ -91,7 +95,7 @@ static int smjpeg_read_header(AVFormatContext *s)
             ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
             ast->codecpar->sample_rate = avio_rb16(pb);
             ast->codecpar->bits_per_coded_sample = avio_r8(pb);
-            ast->codecpar->channels    = avio_r8(pb);
+            ast->codecpar->ch_layout.nb_channels = avio_r8(pb);
             ast->codecpar->codec_tag   = avio_rl32(pb);
             ast->codecpar->codec_id    = ff_codec_get_id(ff_codec_smjpeg_audio_tags,
                                                          ast->codecpar->codec_tag);
@@ -147,6 +151,8 @@ static int smjpeg_read_packet(AVFormatContext *s, AVPacket *pkt)
     dtype = avio_rl32(s->pb);
     switch (dtype) {
     case SMJPEG_SNDD:
+        if (sc->audio_stream_index < 0)
+            return AVERROR_INVALIDDATA;
         timestamp = avio_rb32(s->pb);
         size = avio_rb32(s->pb);
         ret = av_get_packet(s->pb, pkt, size);
@@ -155,6 +161,8 @@ static int smjpeg_read_packet(AVFormatContext *s, AVPacket *pkt)
         pkt->pos = pos;
         break;
     case SMJPEG_VIDD:
+        if (sc->video_stream_index < 0)
+            return AVERROR_INVALIDDATA;
         timestamp = avio_rb32(s->pb);
         size = avio_rb32(s->pb);
         ret = av_get_packet(s->pb, pkt, size);
@@ -173,13 +181,13 @@ static int smjpeg_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_smjpeg_demuxer = {
-    .name           = "smjpeg",
-    .long_name      = NULL_IF_CONFIG_SMALL("Loki SDL MJPEG"),
+const FFInputFormat ff_smjpeg_demuxer = {
+    .p.name         = "smjpeg",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Loki SDL MJPEG"),
+    .p.extensions   = "mjpg",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(SMJPEGContext),
     .read_probe     = smjpeg_probe,
     .read_header    = smjpeg_read_header,
     .read_packet    = smjpeg_read_packet,
-    .extensions     = "mjpg",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

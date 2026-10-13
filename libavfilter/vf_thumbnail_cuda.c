@@ -23,11 +23,14 @@
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_cuda_internal.h"
 #include "libavutil/cuda_check.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+
+#include "cuda/load_helper.h"
 
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(ctx, s->hwctx->internal->cuda_dl, x)
 
@@ -41,7 +44,10 @@ static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_YUV444P,
     AV_PIX_FMT_P010,
+    AV_PIX_FMT_P012,
     AV_PIX_FMT_P016,
+    AV_PIX_FMT_YUV444P10MSB,
+    AV_PIX_FMT_YUV444P12MSB,
     AV_PIX_FMT_YUV444P16,
 };
 
@@ -223,18 +229,21 @@ static int thumbnail(AVFilterContext *ctx, int *histogram, AVFrame *in)
             histogram + 512, in->data[2], in->width, in->height, in->linesize[2], 1);
         break;
     case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_P012LE:
     case AV_PIX_FMT_P016LE:
         thumbnail_kernel(ctx, s->cu_func_ushort, 1,
             histogram, in->data[0], in->width, in->height, in->linesize[0], 2);
         thumbnail_kernel(ctx, s->cu_func_ushort2, 2,
             histogram + 256, in->data[1], in->width / 2, in->height / 2, in->linesize[1], 2);
         break;
+    case AV_PIX_FMT_YUV444P10MSB:
+    case AV_PIX_FMT_YUV444P12MSB:
     case AV_PIX_FMT_YUV444P16:
-        thumbnail_kernel(ctx, s->cu_func_ushort2, 1,
+        thumbnail_kernel(ctx, s->cu_func_ushort, 1,
             histogram, in->data[0], in->width, in->height, in->linesize[0], 2);
-        thumbnail_kernel(ctx, s->cu_func_ushort2, 1,
+        thumbnail_kernel(ctx, s->cu_func_ushort, 1,
             histogram + 256, in->data[1], in->width, in->height, in->linesize[1], 2);
-        thumbnail_kernel(ctx, s->cu_func_ushort2, 1,
+        thumbnail_kernel(ctx, s->cu_func_ushort, 1,
             histogram + 512, in->data[2], in->width, in->height, in->linesize[2], 2);
         break;
     default:
@@ -281,14 +290,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         return ret;
 
     if (hw_frames_ctx->sw_format == AV_PIX_FMT_NV12 || hw_frames_ctx->sw_format == AV_PIX_FMT_YUV420P ||
-        hw_frames_ctx->sw_format == AV_PIX_FMT_P010LE || hw_frames_ctx->sw_format == AV_PIX_FMT_P016LE)
+        hw_frames_ctx->sw_format == AV_PIX_FMT_P010LE || hw_frames_ctx->sw_format == AV_PIX_FMT_P012LE ||
+        hw_frames_ctx->sw_format == AV_PIX_FMT_P016LE)
     {
         int i;
         for (i = 256; i < HIST_SIZE; i++)
             hist[i] = 4 * hist[i];
     }
 
-    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    ret = CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     if (ret < 0)
         return ret;
 
@@ -302,23 +312,27 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
-    int i;
     ThumbnailCudaContext *s = ctx->priv;
-    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
 
-    if (s->data) {
-        CHECK_CU(cu->cuMemFree(s->data));
-        s->data = 0;
+    if (s->hwctx) {
+        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+
+        if (s->data) {
+            CHECK_CU(cu->cuMemFree(s->data));
+            s->data = 0;
+        }
+
+        if (s->cu_module) {
+            CHECK_CU(cu->cuModuleUnload(s->cu_module));
+            s->cu_module = NULL;
+        }
     }
 
-    if (s->cu_module) {
-        CHECK_CU(cu->cuModuleUnload(s->cu_module));
-        s->cu_module = NULL;
+    if (s->frames) {
+        for (int i = 0; i < s->n_frames && s->frames[i].buf; i++)
+            av_frame_free(&s->frames[i].buf);
+        av_freep(&s->frames);
     }
-
-    for (i = 0; i < s->n_frames && s->frames[i].buf; i++)
-        av_frame_free(&s->frames[i].buf);
-    av_freep(&s->frames);
 }
 
 static int request_frame(AVFilterLink *link)
@@ -351,14 +365,17 @@ static int format_is_supported(enum AVPixelFormat fmt)
 static int config_props(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
+    FilterLink      *inl = ff_filter_link(inlink);
+    FilterLink     *outl = ff_filter_link(ctx->outputs[0]);
     ThumbnailCudaContext *s = ctx->priv;
-    AVHWFramesContext     *hw_frames_ctx = (AVHWFramesContext*)inlink->hw_frames_ctx->data;
+    AVHWFramesContext     *hw_frames_ctx = (AVHWFramesContext*)inl->hw_frames_ctx->data;
     AVCUDADeviceContext *device_hwctx = hw_frames_ctx->device_ctx->hwctx;
     CUcontext dummy, cuda_ctx = device_hwctx->cuda_ctx;
     CudaFunctions *cu = device_hwctx->internal->cuda_dl;
     int ret;
 
-    extern char vf_thumbnail_cuda_ptx[];
+    extern const unsigned char ff_vf_thumbnail_cuda_ptx_data[];
+    extern const unsigned int ff_vf_thumbnail_cuda_ptx_len;
 
     s->hwctx = device_hwctx;
     s->cu_stream = s->hwctx->stream;
@@ -367,7 +384,7 @@ static int config_props(AVFilterLink *inlink)
     if (ret < 0)
         return ret;
 
-    ret = CHECK_CU(cu->cuModuleLoadData(&s->cu_module, vf_thumbnail_cuda_ptx));
+    ret = ff_cuda_load_module(ctx, device_hwctx, &s->cu_module, ff_vf_thumbnail_cuda_ptx_data, ff_vf_thumbnail_cuda_ptx_len);
     if (ret < 0)
         return ret;
 
@@ -393,10 +410,10 @@ static int config_props(AVFilterLink *inlink)
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 
-    s->hw_frames_ctx = ctx->inputs[0]->hw_frames_ctx;
+    s->hw_frames_ctx = inl->hw_frames_ctx;
 
-    ctx->outputs[0]->hw_frames_ctx = av_buffer_ref(s->hw_frames_ctx);
-    if (!ctx->outputs[0]->hw_frames_ctx)
+    outl->hw_frames_ctx = av_buffer_ref(s->hw_frames_ctx);
+    if (!outl->hw_frames_ctx)
         return AVERROR(ENOMEM);
 
     s->tb = inlink->time_base;
@@ -409,18 +426,6 @@ static int config_props(AVFilterLink *inlink)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_CUDA,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
-
 static const AVFilterPad thumbnail_cuda_inputs[] = {
     {
         .name         = "default",
@@ -428,7 +433,6 @@ static const AVFilterPad thumbnail_cuda_inputs[] = {
         .config_props = config_props,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad thumbnail_cuda_outputs[] = {
@@ -437,18 +441,17 @@ static const AVFilterPad thumbnail_cuda_outputs[] = {
         .type          = AVMEDIA_TYPE_VIDEO,
         .request_frame = request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_thumbnail_cuda = {
-    .name          = "thumbnail_cuda",
-    .description   = NULL_IF_CONFIG_SMALL("Select the most representative frame in a given sequence of consecutive frames."),
+const FFFilter ff_vf_thumbnail_cuda = {
+    .p.name        = "thumbnail_cuda",
+    .p.description = NULL_IF_CONFIG_SMALL("Select the most representative frame in a given sequence of consecutive frames using CUDA."),
+    .p.priv_class  = &thumbnail_cuda_class,
     .priv_size     = sizeof(ThumbnailCudaContext),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = thumbnail_cuda_inputs,
-    .outputs       = thumbnail_cuda_outputs,
-    .priv_class    = &thumbnail_cuda_class,
+    FILTER_INPUTS(thumbnail_cuda_inputs),
+    FILTER_OUTPUTS(thumbnail_cuda_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

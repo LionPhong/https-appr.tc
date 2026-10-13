@@ -22,6 +22,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "pcm.h"
 
@@ -34,8 +35,8 @@ static int nist_probe(const AVProbeData *p)
 
 static int nist_read_header(AVFormatContext *s)
 {
-    char buffer[256], coding[32] = "pcm", format[32] = "01";
-    int bps = 0, be = 0;
+    char buffer[256]= {0}, coding[32] = "pcm", format[32] = "01";
+    int bps = 0, be = 0, ret;
     int32_t header_size = -1;
     AVStream *st;
 
@@ -72,15 +73,18 @@ static int nist_read_header(AVFormatContext *s)
                 st->codecpar->codec_id = AV_CODEC_ID_PCM_MULAW;
             } else if (!av_strncasecmp(coding, "pcm,embedded-shorten", 20)) {
                 st->codecpar->codec_id = AV_CODEC_ID_SHORTEN;
-                if (ff_alloc_extradata(st->codecpar, 1))
-                    st->codecpar->extradata[0] = 1;
+                ret = ff_alloc_extradata(st->codecpar, 1);
+                if (ret < 0)
+                    return ret;
+                st->codecpar->extradata[0] = 1;
             } else {
                 avpriv_request_sample(s, "coding %s", coding);
             }
 
             avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
 
-            st->codecpar->block_align = st->codecpar->bits_per_coded_sample * st->codecpar->channels / 8;
+            st->codecpar->block_align = st->codecpar->bits_per_coded_sample *
+                                        st->codecpar->ch_layout.nb_channels / 8;
 
             if (avio_tell(s->pb) > header_size)
                 return AVERROR_INVALIDDATA;
@@ -89,7 +93,9 @@ static int nist_read_header(AVFormatContext *s)
 
             return 0;
         } else if (!memcmp(buffer, "channel_count", 13)) {
-            sscanf(buffer, "%*s %*s %u", &st->codecpar->channels);
+            sscanf(buffer, "%*s %*s %u", &st->codecpar->ch_layout.nb_channels);
+            if (st->codecpar->ch_layout.nb_channels <= 0 || st->codecpar->ch_layout.nb_channels > INT16_MAX)
+                return AVERROR_INVALIDDATA;
         } else if (!memcmp(buffer, "sample_byte_format", 18)) {
             sscanf(buffer, "%*s %*s %31s", format);
 
@@ -109,10 +115,14 @@ static int nist_read_header(AVFormatContext *s)
             sscanf(buffer, "%*s %*s %"SCNd64, &st->duration);
         } else if (!memcmp(buffer, "sample_n_bytes", 14)) {
             sscanf(buffer, "%*s %*s %d", &bps);
+            if (bps > INT16_MAX/8U)
+                return AVERROR_INVALIDDATA;
         } else if (!memcmp(buffer, "sample_rate", 11)) {
             sscanf(buffer, "%*s %*s %d", &st->codecpar->sample_rate);
         } else if (!memcmp(buffer, "sample_sig_bits", 15)) {
             sscanf(buffer, "%*s %*s %d", &st->codecpar->bits_per_coded_sample);
+            if (st->codecpar->bits_per_coded_sample <= 0 || st->codecpar->bits_per_coded_sample > INT16_MAX)
+                return AVERROR_INVALIDDATA;
         } else {
             char key[32], value[32];
             if (sscanf(buffer, "%31s %*s %31s", key, value) == 2) {
@@ -126,13 +136,13 @@ static int nist_read_header(AVFormatContext *s)
     return AVERROR_EOF;
 }
 
-AVInputFormat ff_nistsphere_demuxer = {
-    .name           = "nistsphere",
-    .long_name      = NULL_IF_CONFIG_SMALL("NIST SPeech HEader REsources"),
+const FFInputFormat ff_nistsphere_demuxer = {
+    .p.name         = "nistsphere",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("NIST SPeech HEader REsources"),
+    .p.extensions   = "nist,sph",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = nist_probe,
     .read_header    = nist_read_header,
     .read_packet    = ff_pcm_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .extensions     = "nist,sph",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

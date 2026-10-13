@@ -20,13 +20,12 @@
  * are permitted provided that the following conditions are met:
  */
 
-#include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "median.h"
 #include "video.h"
 
@@ -84,32 +83,27 @@ static void hmuladd(htype *dst, const htype *src, int f, int bins)
         dst[i] += f * src[i];
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV410P,
-        AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP, AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9,
-        AV_PIX_FMT_YUV420P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV444P9, AV_PIX_FMT_GBRP9,
-        AV_PIX_FMT_YUVA420P9, AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA444P9,
-        AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10,
-        AV_PIX_FMT_YUV420P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV440P12,
-        AV_PIX_FMT_YUV420P14, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV444P14,
-        AV_PIX_FMT_YUV420P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV444P16,
-        AV_PIX_FMT_YUVA420P10, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA444P10,
-        AV_PIX_FMT_YUVA422P12, AV_PIX_FMT_YUVA444P12,
-        AV_PIX_FMT_YUVA420P16, AV_PIX_FMT_YUVA422P16, AV_PIX_FMT_YUVA444P16,
-        AV_PIX_FMT_GBRP10, AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRP14, AV_PIX_FMT_GBRP16,
-        AV_PIX_FMT_GBRAP10, AV_PIX_FMT_GBRAP12, AV_PIX_FMT_GBRAP16,
-        AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14, AV_PIX_FMT_GRAY16,
-        AV_PIX_FMT_NONE
-    };
-
-    return ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
+    AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV410P,
+    AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP, AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9,
+    AV_PIX_FMT_YUV420P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV444P9, AV_PIX_FMT_GBRP9,
+    AV_PIX_FMT_YUVA420P9, AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA444P9,
+    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_YUV420P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV444P12, AV_PIX_FMT_YUV440P12,
+    AV_PIX_FMT_YUV420P14, AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV444P14,
+    AV_PIX_FMT_YUV420P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV444P16,
+    AV_PIX_FMT_YUVA420P10, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA444P10,
+    AV_PIX_FMT_YUVA422P12, AV_PIX_FMT_YUVA444P12,
+    AV_PIX_FMT_YUVA420P16, AV_PIX_FMT_YUVA422P16, AV_PIX_FMT_YUVA444P16,
+    AV_PIX_FMT_GBRP10, AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRP14, AV_PIX_FMT_GBRP16,
+    AV_PIX_FMT_GBRAP10, AV_PIX_FMT_GBRAP12, AV_PIX_FMT_GBRAP16,
+    AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14, AV_PIX_FMT_GRAY16,
+    AV_PIX_FMT_NONE
+};
 
 static void check_params(MedianContext *s, AVFilterLink *inlink)
 {
@@ -192,8 +186,8 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
     for (int plane = 0; plane < s->nb_planes; plane++) {
         const int h = s->planeheight[plane];
         const int w = s->planewidth[plane];
-        const int slice_h_start = (h * jobnr) / nb_jobs;
-        const int slice_h_end = (h * (jobnr+1)) / nb_jobs;
+        const int slice_h_start = ff_slice_pos(h, jobnr, nb_jobs);
+        const int slice_h_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
 
         if (!(s->planes & (1 << plane))) {
             av_image_copy_plane(out->data[plane] + slice_h_start * out->linesize[plane],
@@ -231,7 +225,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     av_frame_copy_props(out, in);
 
     td.in = in; td.out = out;
-    ctx->internal->execute(ctx, filter_slice, &td, NULL, s->nb_threads);
+    ff_filter_execute(ctx, filter_slice, &td, NULL, s->nb_threads);
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
@@ -274,26 +268,17 @@ static const AVFilterPad median_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad median_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_median = {
-    .name          = "median",
-    .description   = NULL_IF_CONFIG_SMALL("Apply Median filter."),
+const FFFilter ff_vf_median = {
+    .p.name        = "median",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply Median filter."),
+    .p.priv_class  = &median_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(MedianContext),
-    .priv_class    = &median_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = median_inputs,
-    .outputs       = median_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(median_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
     .process_command = process_command,
 };

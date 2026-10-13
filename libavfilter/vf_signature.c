@@ -24,15 +24,14 @@
  * @see http://epubs.surrey.ac.uk/531590/1/MPEG-7%20Video%20Signature%20Author%27s%20Copy.pdf
  */
 
-#include <float.h>
 #include "libavcodec/put_bits.h"
-#include "libavformat/avformat.h"
+#include "libavutil/mem.h"
+#include "libavutil/bprint.h"
 #include "libavutil/opt.h"
 #include "libavutil/avstring.h"
-#include "libavutil/intreadwrite.h"
-#include "libavutil/timestamp.h"
+#include "libavutil/file_open.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "signature.h"
 #include "signature_lookup.c"
 
@@ -42,18 +41,18 @@
 
 static const AVOption signature_options[] = {
     { "detectmode", "set the detectmode",
-        OFFSET(mode),         AV_OPT_TYPE_INT,    {.i64 = MODE_OFF}, 0, NB_LOOKUP_MODE-1, FLAGS, "mode" },
-        { "off",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_OFF},  0, 0, .flags = FLAGS, "mode" },
-        { "full", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FULL}, 0, 0, .flags = FLAGS, "mode" },
-        { "fast", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FAST}, 0, 0, .flags = FLAGS, "mode" },
+        OFFSET(mode),         AV_OPT_TYPE_INT,    {.i64 = MODE_OFF}, 0, NB_LOOKUP_MODE-1, FLAGS, .unit = "mode" },
+        { "off",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_OFF},  0, 0, .flags = FLAGS, .unit = "mode" },
+        { "full", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FULL}, 0, 0, .flags = FLAGS, .unit = "mode" },
+        { "fast", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FAST}, 0, 0, .flags = FLAGS, .unit = "mode" },
     { "nb_inputs",  "number of inputs",
         OFFSET(nb_inputs),    AV_OPT_TYPE_INT,    {.i64 = 1},        1, INT_MAX,          FLAGS },
     { "filename",   "filename for output files",
         OFFSET(filename),     AV_OPT_TYPE_STRING, {.str = ""},       0, NB_FORMATS-1,     FLAGS },
     { "format",     "set output format",
-        OFFSET(format),       AV_OPT_TYPE_INT,    {.i64 = FORMAT_BINARY}, 0, 1,           FLAGS , "format" },
-        { "binary", 0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_BINARY}, 0, 0, FLAGS, "format" },
-        { "xml",    0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_XML},    0, 0, FLAGS, "format" },
+        OFFSET(format),       AV_OPT_TYPE_INT,    {.i64 = FORMAT_BINARY}, 0, 1,           FLAGS , .unit = "format" },
+        { "binary", 0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_BINARY}, 0, 0, FLAGS, .unit = "format" },
+        { "xml",    0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_XML},    0, 0, FLAGS, .unit = "format" },
     { "th_d",       "threshold to detect one word as similar",
         OFFSET(thworddist),   AV_OPT_TYPE_INT,    {.i64 = 9000},     1, INT_MAX,          FLAGS },
     { "th_dc",      "threshold to detect all words as similar",
@@ -69,23 +68,18 @@ static const AVOption signature_options[] = {
 
 AVFILTER_DEFINE_CLASS(signature);
 
-static int query_formats(AVFilterContext *ctx)
-{
-    /* all formats with a separate gray value */
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P,
-        AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_NV12, AV_PIX_FMT_NV21,
-        AV_PIX_FMT_NONE
-    };
-
-    return ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
-}
+/* all formats with a separate gray value */
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_YUVJ420P,
+    AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ444P,
+    AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_NV12, AV_PIX_FMT_NV21,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -132,8 +126,9 @@ static uint64_t get_block_sum(StreamContext *sc, uint64_t intpic[32][32], const 
     return sum;
 }
 
-static int cmp(const uint64_t *a, const uint64_t *b)
+static int cmp(const void *x, const void *y)
 {
+    const uint64_t *a = x, *b = y;
     return *a < *b ? -1 : ( *a > *b ? 1 : 0 );
 }
 
@@ -223,7 +218,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
     dw1 = inlink->w / 32;
     if (inlink->w % 32)
         dw2 = dw1 + 1;
-    denom = (sc->divide) ? dh1 * dh2 * dw1 * dw2 : 1;
+    denom = (sc->divide) ? dh1 * (int64_t)dh2 * dw1 * dw2 : 1;
 
     for (i = 0; i < 32; i++) {
         rowcount = 0;
@@ -249,21 +244,17 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
         }
     }
 
-    denom = (sc->divide) ? 1 : dh1 * dh2 * dw1 * dw2;
+    denom = (sc->divide) ? 1 : dh1 * (int64_t)dh2 * dw1 * dw2;
 
     for (i = 0; i < ELEMENT_COUNT; i++) {
         const ElemCat* elemcat = elements[i];
         int64_t* elemsignature;
         uint64_t* sortsignature;
 
-        elemsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
+        elemsignature = av_malloc_array(elemcat->elem_count, 2 * sizeof(int64_t));
         if (!elemsignature)
             return AVERROR(ENOMEM);
-        sortsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
-        if (!sortsignature) {
-            av_freep(&elemsignature);
-            return AVERROR(ENOMEM);
-        }
+        sortsignature = elemsignature + elemcat->elem_count;
 
         for (j = 0; j < elemcat->elem_count; j++) {
             blocksum = 0;
@@ -291,7 +282,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
         }
 
         /* get threshold */
-        qsort(sortsignature, elemcat->elem_count, sizeof(uint64_t), (void*) cmp);
+        qsort(sortsignature, elemcat->elem_count, sizeof(uint64_t), cmp);
         th = sortsignature[(int) (elemcat->elem_count*0.333)];
 
         /* ternarize */
@@ -313,11 +304,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
             f++;
         }
         av_freep(&elemsignature);
-        av_freep(&sortsignature);
     }
 
     /* confidence */
-    qsort(conflist, DIFFELEM_SIZE, sizeof(uint64_t), (void*) cmp);
+    qsort(conflist, DIFFELEM_SIZE, sizeof(uint64_t), cmp);
     fs->confidence = FFMIN(conflist[DIFFELEM_SIZE/2], 255);
 
     /* coarsesignature */
@@ -390,12 +380,13 @@ static int xml_export(AVFilterContext *ctx, StreamContext *sc, const char* filen
     FILE* f;
     unsigned int pot3[5] = { 3*3*3*3, 3*3*3, 3*3, 3, 1 };
 
-    f = fopen(filename, "w");
+    if (!sc->coarseend->last)
+        return AVERROR(EINVAL); // No frames ?
+
+    f = avpriv_fopen_utf8(filename, "w");
     if (!f) {
         int err = AVERROR(EINVAL);
-        char buf[128];
-        av_strerror(err, buf, sizeof(buf));
-        av_log(ctx, AV_LOG_ERROR, "cannot open xml file %s: %s\n", filename, buf);
+        av_log(ctx, AV_LOG_ERROR, "cannot open xml file %s: %s\n", filename, av_err2str(err));
         return err;
     }
 
@@ -504,12 +495,10 @@ static int binary_export(AVFilterContext *ctx, StreamContext *sc, const char* fi
     if (!buffer)
         return AVERROR(ENOMEM);
 
-    f = fopen(filename, "wb");
+    f = avpriv_fopen_utf8(filename, "wb");
     if (!f) {
         int err = AVERROR(EINVAL);
-        char buf[128];
-        av_strerror(err, buf, sizeof(buf));
-        av_log(ctx, AV_LOG_ERROR, "cannot open file %s: %s\n", filename, buf);
+        av_log(ctx, AV_LOG_ERROR, "cannot open file %s: %s\n", filename, av_err2str(err));
         av_freep(&buffer);
         return err;
     }
@@ -559,12 +548,64 @@ static int binary_export(AVFilterContext *ctx, StreamContext *sc, const char* fi
         }
     }
 
-    avpriv_align_put_bits(&buf);
     flush_put_bits(&buf);
-    fwrite(buffer, 1, put_bits_count(&buf)/8, f);
+    fwrite(buffer, 1, put_bytes_output(&buf), f);
     fclose(f);
     av_freep(&buffer);
     return 0;
+}
+
+static int get_frame_filename(char *buf, int buf_size, const char *path, int64_t number)
+{
+    AVBPrint bp;
+    const char *p;
+    char c;
+    int nd, percentd_found;
+
+    av_bprint_init_for_buffer(&bp, buf, buf_size);
+    p = path;
+    percentd_found = 0;
+    for (;;) {
+        c = *p++;
+        if (c == '\0')
+            break;
+        if (c == '%') {
+            do {
+                nd = 0;
+                while (av_isdigit(*p)) {
+                    if (nd >= INT_MAX / 10 - 255)
+                        goto fail;
+                    nd = nd * 10 + *p++ - '0';
+                }
+                c = *p++;
+            } while (av_isdigit(c));
+
+            switch (c) {
+            case '%':
+                goto addchar;
+            case 'd':
+                if (!percentd_found)
+                    goto fail;
+                percentd_found = 1;
+                if (number < 0)
+                    nd += 1;
+                av_bprintf(&bp, "%0*" PRId64, nd, number);
+                break;
+            default:
+                goto fail;
+            }
+        } else {
+addchar:
+            av_bprint_chars(&bp, c, 1);
+        }
+    }
+    if (!percentd_found)
+        goto fail;
+    if (!av_bprint_is_complete(&bp))
+        return AVERROR(ENOMEM);
+    return 0;
+fail:
+    return AVERROR(EINVAL);
 }
 
 static int export(AVFilterContext *ctx, StreamContext *sc, int input)
@@ -574,7 +615,7 @@ static int export(AVFilterContext *ctx, StreamContext *sc, int input)
 
     if (sic->nb_inputs > 1) {
         /* error already handled */
-        av_assert0(av_get_frame_filename(filename, sizeof(filename), sic->filename, input) == 0);
+        av_assert0(get_frame_filename(filename, sizeof(filename), sic->filename, input) == 0);
     } else {
         if (av_strlcpy(filename, sic->filename, sizeof(filename)) >= sizeof(filename))
             return AVERROR(EINVAL);
@@ -593,7 +634,7 @@ static int request_frame(AVFilterLink *outlink)
     StreamContext *sc, *sc2;
     MatchingInfo match;
     int i, j, ret;
-    int lookup = 1; /* indicates wheather EOF of all files is reached */
+    int lookup = 1; /* indicates whether EOF of all files is reached */
 
     /* process all inputs */
     for (i = 0; i < sic->nb_inputs; i++){
@@ -664,6 +705,8 @@ static av_cold int init(AVFilterContext *ctx)
 
         if (!pad.name)
             return AVERROR(ENOMEM);
+        if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
+            return ret;
 
         sc = &(sic->streamcontexts[i]);
 
@@ -680,15 +723,10 @@ static av_cold int init(AVFilterContext *ctx)
         sc->coarseend = sc->coarsesiglist;
         sc->coarsecount = 0;
         sc->midcoarse = 0;
-
-        if ((ret = ff_insert_inpad(ctx, i, &pad)) < 0) {
-            av_freep(&pad.name);
-            return ret;
-        }
     }
 
     /* check filename */
-    if (sic->nb_inputs > 1 && strlen(sic->filename) > 0 && av_get_frame_filename(tmp, sizeof(tmp), sic->filename, 0) == -1) {
+    if (sic->nb_inputs > 1 && strlen(sic->filename) > 0 && get_frame_filename(tmp, sizeof(tmp), sic->filename, 0) == -1) {
         av_log(ctx, AV_LOG_ERROR, "The filename must contain %%d or %%0nd, if you have more than one input.\n");
         return AVERROR(EINVAL);
     }
@@ -737,9 +775,11 @@ static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink       *il = ff_filter_link(inlink);
+    FilterLink       *ol = ff_filter_link(outlink);
 
     outlink->time_base = inlink->time_base;
-    outlink->frame_rate = inlink->frame_rate;
+    ol->frame_rate = il->frame_rate;
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
     outlink->w = inlink->w;
     outlink->h = inlink->h;
@@ -754,18 +794,17 @@ static const AVFilterPad signature_outputs[] = {
         .request_frame = request_frame,
         .config_props  = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_signature = {
-    .name          = "signature",
-    .description   = NULL_IF_CONFIG_SMALL("Calculate the MPEG-7 video signature"),
+const FFFilter ff_vf_signature = {
+    .p.name        = "signature",
+    .p.description = NULL_IF_CONFIG_SMALL("Calculate the MPEG-7 video signature"),
+    .p.priv_class  = &signature_class,
+    .p.inputs      = NULL,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size     = sizeof(SignatureContext),
-    .priv_class    = &signature_class,
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .outputs       = signature_outputs,
-    .inputs        = NULL,
-    .flags         = AVFILTER_FLAG_DYNAMIC_INPUTS,
+    FILTER_OUTPUTS(signature_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

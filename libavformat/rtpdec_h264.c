@@ -37,6 +37,7 @@
 #include "libavutil/base64.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 
 #include "rtpdec.h"
@@ -196,6 +197,9 @@ void ff_h264_parse_framesize(AVCodecParameters *par, const char *p)
     while (*p && *p != '-' && (dst - buf1) < sizeof(buf1) - 1)
         *dst++ = *p++;
     *dst = '\0';
+
+    if (*p != '-')
+        return;
 
     // a='framesize:96 320-240'
     // set our parameters

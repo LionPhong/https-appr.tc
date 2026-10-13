@@ -63,16 +63,17 @@ After starting the broker, an FFmpeg client may stream data to the broker using
 the command:
 
 @example
-ffmpeg -re -i input -f mpegts amqp://[[user]:[password]@@]hostname[:port]
+ffmpeg -re -i input -f mpegts amqp://[[user]:[password]@@]hostname[:port][/vhost]
 @end example
 
 Where hostname and port (default is 5672) is the address of the broker. The
 client may also set a user/password for authentication. The default for both
-fields is "guest".
+fields is "guest". Name of virtual host on broker can be set with vhost. The
+default value is "/".
 
-Muliple subscribers may stream from the broker using the command:
+Multiple subscribers may stream from the broker using the command:
 @example
-ffplay amqp://[[user]:[password]@@]hostname[:port]
+ffplay amqp://[[user]:[password]@@]hostname[:port][/vhost]
 @end example
 
 In RabbitMQ all data published to the broker flows through a specific exchange,
@@ -108,6 +109,21 @@ the received message may be truncated causing decoding errors.
 @item connection_timeout
 The timeout in seconds during the initial connection to the broker. The
 default value is rw_timeout, or 5 seconds if rw_timeout is not set.
+
+@item delivery_mode @var{mode}
+Sets the delivery mode of each message sent to broker.
+The following values are accepted:
+@table @samp
+@item persistent
+Delivery mode set to "persistent" (2). This is the default value.
+Messages may be written to the broker's disk depending on its setup.
+
+@item non-persistent
+Delivery mode set to "non-persistent" (1).
+Messages will stay in broker's memory unless the broker is under memory
+pressure.
+
+@end table
 
 @end table
 
@@ -153,12 +169,23 @@ Read angle 2 of playlist 4 from BluRay mounted to /mnt/bluray, start from chapte
 -playlist 4 -angle 2 -chapter 2 bluray:/mnt/bluray
 @end example
 
+@anchor{cache}
 @section cache
 
 Caching wrapper for input stream.
 
 Cache the input stream to temporary file. It brings seeking capability to live streams.
 
+The accepted options are:
+@table @option
+
+@item read_ahead_limit
+Amount in bytes that may be read ahead when seeking isn't supported. Range is -1 to INT_MAX.
+-1 for unlimited. Default is 65536.
+
+@end table
+
+URL Syntax is
 @example
 cache:@var{URL}
 @end example
@@ -189,6 +216,38 @@ ffplay concat:split1.mpeg\|split2.mpeg\|split3.mpeg
 Note that you may need to escape the character "|" which is special for
 many shells.
 
+@section concatf
+
+Physical concatenation protocol using a line break delimited list of
+resources.
+
+Read and seek from many resources in sequence as if they were
+a unique resource.
+
+A URL accepted by this protocol has the syntax:
+@example
+concatf:@var{URL}
+@end example
+
+where @var{URL} is the url containing a line break delimited list of
+resources to be concatenated, each one possibly specifying a distinct
+protocol. Special characters must be escaped with backslash or single
+quotes. See @ref{quoting_and_escaping,,the "Quoting and escaping"
+section in the ffmpeg-utils(1) manual,ffmpeg-utils}.
+
+For example to read a sequence of files @file{split1.mpeg},
+@file{split2.mpeg}, @file{split3.mpeg} listed in separate lines within
+a file @file{split.txt} with @command{ffplay} use the command:
+@example
+ffplay concatf:split.txt
+@end example
+Where @file{split.txt} contains the lines:
+@example
+split1.mpeg
+split2.mpeg
+split3.mpeg
+@end example
+
 @section crypto
 
 AES-encrypted stream reading protocol.
@@ -216,6 +275,33 @@ For example, to convert a GIF file given inline with @command{ffmpeg}:
 @example
 ffmpeg -i "data:image/gif;base64,R0lGODdhCAAIAMIEAAAAAAAA//8AAP//AP///////////////ywAAAAACAAIAAADF0gEDLojDgdGiJdJqUX02iB4E8Q9jUMkADs=" smiley.png
 @end example
+
+@section fd
+
+File descriptor access protocol.
+
+The accepted syntax is:
+@example
+fd: -fd @var{file_descriptor}
+@end example
+
+If @option{fd} is not specified, by default the stdout file descriptor will be
+used for writing, stdin for reading. Unlike the pipe protocol, fd protocol has
+seek support if it corresponding to a regular file. fd protocol doesn't support
+pass file descriptor via URL for security.
+
+This protocol accepts the following options:
+
+@table @option
+@item blocksize
+Set I/O operation maximum block size, in bytes. Default value is
+@code{INT_MAX}, which results in not limiting the requested block size.
+Setting this value reasonably low improves user termination request reaction
+time, which is valuable if data transmission is slow.
+
+@item fd
+Set file descriptor.
+@end table
 
 @section file
 
@@ -258,7 +344,8 @@ time, which is valuable for files on slow medium.
 If set to 1, the protocol will retry reading at the end of the file, allowing
 reading files that still are being written. In order for this to terminate,
 you either need to use the rw_timeout option, or use the interrupt callback
-(for API users).
+(for API users). Setting this option also ignores the file size reported by
+the file system.
 
 @item seekable
 Controls if seekability is advertised on the file. 0 means non-seekable, -1
@@ -267,6 +354,17 @@ means auto (seekable for normal files, non-seekable for named pipes).
 Many demuxers handle seekable and non-seekable resources differently,
 overriding this might speed up opening certain files at the cost of losing some
 features (e.g. accurate seeking).
+
+@item pkt_size
+Set the maximum packet size used for file I/O. A smaller value may reduce
+memory usage. A higher value may increase throughput especially with networked
+filesystems.
+
+For reading, if explicitly set, it overrides the default internal buffer size
+(32 KB) and limits the maximum amount of data read per operation.
+
+For writing, this sets the size of each write operation. The default is 256 KB
+for regular files, 32 KB otherwise.
 @end table
 
 @section ftp
@@ -315,25 +413,45 @@ operation. ff* tools may produce incomplete content due to server limitations.
 
 Gopher protocol.
 
-@section hls
+@section gophers
 
-Read Apple HTTP Live Streaming compliant segmented stream as
-a uniform one. The M3U8 playlists describing the segments can be
-remote HTTP resources or local files, accessed using the standard
-file protocol.
-The nested protocol is declared by specifying
-"+@var{proto}" after the hls URI scheme name, where @var{proto}
-is either "file" or "http".
+Gophers protocol.
 
+The Gopher protocol with TLS encapsulation.
+
+@section handle
+
+Windows handle access protocol.
+
+The accepted syntax is:
 @example
-hls+http://host/path/to/remote/resource.m3u8
-hls+file://path/to/local/resource.m3u8
+handle: -handle @var{handle}
 @end example
 
-Using this protocol is discouraged - the hls demuxer should work
-just as well (if not, please report the issues) and is more complete.
-To use the hls demuxer instead, simply use the direct URLs to the
-m3u8 files.
+If @option{handle} is not specified, by default the output handle will be
+used for writing, input handle for reading. This protocol is only available
+on Windows. It has seek support if the handle corresponds to a regular file.
+It doesn't support passing the handle via URL.
+
+This protocol accepts the following options:
+
+@table @option
+@item blocksize
+Set I/O operation maximum block size, in bytes. Default value is
+@code{INT_MAX}, which results in not limiting the requested block size.
+Setting this value reasonably low improves user termination request reaction
+time, which is valuable if data transmission is slow.
+
+@item handle
+Set Windows handle.
+
+The supplied handle must already be valid in the calling process.
+When launching @command{ffmpeg}, arrange for the child process to
+inherit the handle before passing its numeric value with
+@option{handle}. Handles opened with @code{FILE_FLAG_OVERLAPPED}
+are not supported. Closing the protocol does not close the
+caller's original handle.
+@end table
 
 @section http
 
@@ -351,9 +469,6 @@ value is -1.
 @item chunked_post
 If set to 1 use chunked Transfer-Encoding for posts, default is 1.
 
-@item content_type
-Set a specific content type for the POST messages or for listen mode.
-
 @item http_proxy
 set HTTP proxy to tunnel through e.g. http://example.com:1234
 
@@ -361,42 +476,55 @@ set HTTP proxy to tunnel through e.g. http://example.com:1234
 Set custom HTTP headers, can override built in default headers. The
 value must be a string encoding the headers.
 
-@item multiple_requests
-Use persistent connections if set to 1, default is 0.
-
-@item post_data
-Set custom HTTP post data.
-
-@item referer
-Set the Referer header. Include 'Referer: URL' header in HTTP request.
+@item content_type
+Set a specific content type for the POST messages or for listen mode.
 
 @item user_agent
 Override the User-Agent header. If not specified the protocol will use a
 string describing the libavformat build. ("Lavf/<version>")
 
-@item user-agent
-This is a deprecated option, you can use user_agent instead it.
+@item referer
+Set the Referer header. Include 'Referer: URL' header in HTTP request.
 
-@item timeout
-Set timeout in microseconds of socket I/O operations used by the underlying low level
-operation. By default it is set to -1, which means that the timeout is
-not specified.
+@item multiple_requests
+Force persistent connections if set to 1, or disable if 0. Default is -1,
+which means auto (implies keep-alive when using -request_size or
+-initial_request_size).
 
-@item reconnect_at_eof
-If set then eof is treated like an error and causes reconnection, this is useful
-for live / endless streams.
+@item request_size
+Limit the size of requests made. This is useful for some pathological servers
+that throttle unbounded range requests, as well as when expecting to seek
+frequently. Disabled (set to 0) by default.
 
-@item reconnect_streamed
-If set then even streamed/non seekable streams will be reconnected on errors.
+Note that if enabling this option, it's strongly recommended to also set
+@option{short_seek_size} to the same value or higher. Doing so allows FFmpeg
+to reuse a single HTTP connection wherever possible.
 
-@item reconnect_delay_max
-Sets the maximum delay in seconds after which to give up reconnecting
+@item initial_request_size
+Limit the size of initial requests. Similar to @code{request_size}, but only
+used during initial format parsing. Useful for formats like MXF or MOV that
+require frequent seeks during header parsing. Lasts until the demuxer makes a
+read request larger than this size (without a seek in between), after which
+the implementation will continue using requests as usual. Disabled (set to 0)
+by default.
+
+Note that if enabling this option, it's strongly recommended to also enable
+the @option{multiple_requests} option, as well as setting
+@option{short_seek_size} to the same value or higher.
+
+@item post_data
+Set custom HTTP post data.
 
 @item mime_type
 Export the MIME type.
 
 @item http_version
 Exports the HTTP response version number. Usually "1.0" or "1.1".
+
+@item cookies
+Set the cookies to be sent in future requests. The format of each cookie is the
+same as the value of a Set-Cookie HTTP response field. Multiple cookies can be
+delimited by a newline character.
 
 @item icy
 If set to 1 request ICY (SHOUTcast) metadata from the server. If the server
@@ -414,10 +542,40 @@ contains the last non-empty metadata packet sent by the server. It should be
 polled in regular intervals by applications interested in mid-stream metadata
 updates.
 
-@item cookies
-Set the cookies to be sent in future requests. The format of each cookie is the
-same as the value of a Set-Cookie HTTP response field. Multiple cookies can be
-delimited by a newline character.
+@item metadata
+Set an exported dictionary containing Icecast metadata from the bitstream, if present.
+Only useful with the C API.
+
+@item auth_type
+
+Set HTTP authentication type. No option for Digest, since this method requires
+getting nonce parameters from the server first and can't be used straight away like
+Basic.
+
+@table @option
+@item none
+Choose the HTTP authentication type automatically. This is the default.
+@item basic
+
+Choose the HTTP basic authentication.
+
+Basic authentication sends a Base64-encoded string that contains a user name and password
+for the client. Base64 is not a form of encryption and should be considered the same as
+sending the user name and password in clear text (Base64 is a reversible encoding).
+If a resource needs to be protected, strongly consider using an authentication scheme
+other than basic authentication. HTTPS/TLS should be used with basic authentication.
+Without these additional security enhancements, basic authentication should not be used
+to protect sensitive or valuable information.
+@end table
+
+@item send_expect_100
+Send an Expect: 100-continue header for POST. If set to 1 it will send, if set
+to 0 it won't, if set to -1 it will try to send if it is applicable. Default
+value is -1.
+
+@item location
+An exported dictionary containing the content location. Only useful with the C
+API.
 
 @item offset
 Set initial byte offset.
@@ -434,6 +592,45 @@ If the expected and the received HTTP method do not match the client will
 be given a Bad Request response.
 When unset the HTTP method is not checked for now. This will be replaced by
 autodetection in the future.
+
+@item reconnect
+Reconnect automatically when disconnected before EOF is hit.
+
+@item reconnect_at_eof
+If set then eof is treated like an error and causes reconnection, this is useful
+for live / endless streams.
+This does not apply to the deliberately established end of a resource whose
+complete size is unknown, i.e. when a ranged request past the end is answered
+with @code{416}. Such an end is reported as a clean EOF and is not retried,
+unless @option{reconnect_on_http_error} lists 416 by number.
+
+@item reconnect_on_network_error
+Reconnect automatically in case of TCP/TLS errors during connect.
+
+@item reconnect_on_http_error
+A comma separated list of HTTP status codes to reconnect on. The list can
+include specific status codes (e.g. '503') or the strings '4xx' / '5xx'.
+A @code{416} that ends a read or a seek past the end of a resource whose
+complete size is unknown is reported as EOF. It is retried first only if 416
+is listed by number, for example to read a resource that is still being
+written. '4xx' does not cover it.
+
+@item reconnect_streamed
+If set then even streamed/non seekable streams will be reconnected on errors.
+
+@item reconnect_delay_max
+Set the maximum delay in seconds after which to give up reconnecting.
+
+@item reconnect_max_retries
+Set the maximum number of times to retry a connection. Default unset.
+
+@item reconnect_delay_total_max
+Set the maximum total delay in seconds after which to give up reconnecting.
+
+@item respect_retry_after
+If enabled, and a Retry-After header is encountered, its requested reconnection
+delay will be honored, rather than using exponential backoff. Useful for 429 and
+503 errors. Default enabled.
 
 @item listen
 If set to 1 enables experimental HTTP server. This can be used to send data when
@@ -461,10 +658,16 @@ ffmpeg -i somefile.ogg -chunked_post 0 -c copy -f ogg http://@var{server}:@var{p
 wget --post-file=somefile.ogg http://@var{server}:@var{port}
 @end example
 
-@item send_expect_100
-Send an Expect: 100-continue header for POST. If set to 1 it will send, if set
-to 0 it won't, if set to -1 it will try to send if it is applicable. Default
-value is -1.
+@item resource
+The resource requested by a client, when the experimental HTTP server is in use.
+
+@item reply_code
+The HTTP code returned to the client, when the experimental HTTP server is in use.
+
+@item short_seek_size
+Set the threshold, in bytes, for when a readahead should be preferred over a seek and
+new HTTP request. This is useful, for example, to make sure the same connection
+is used for reading large video packets with small audio packets in between.
 
 @end table
 
@@ -520,10 +723,42 @@ audio/mpeg.
 This enables support for Icecast versions < 2.4.0, that do not support the
 HTTP PUT method but the SOURCE method.
 
+@item tls
+Establish a TLS (HTTPS) connection to Icecast.
+
 @end table
 
 @example
 icecast://[@var{username}[:@var{password}]@@]@var{server}:@var{port}/@var{mountpoint}
+@end example
+
+@section ipfs
+
+InterPlanetary File System (IPFS) protocol support. One can access files stored
+on the IPFS network through so-called gateways. These are http(s) endpoints.
+This protocol wraps the IPFS native protocols (ipfs:// and ipns://) to be sent
+to such a gateway. Users can (and should) host their own node which means this
+protocol will use one's local gateway to access files on the IPFS network.
+
+This protocol accepts the following options:
+
+@table @option
+
+@item gateway
+Defines the gateway to use. When not set, the protocol will first try
+locating the local gateway by looking at @code{$IPFS_GATEWAY}, @code{$IPFS_PATH}
+and @code{$HOME/.ipfs/}, in that order.
+
+@end table
+
+One can use this protocol in 2 ways. Using IPFS:
+@example
+ffplay ipfs://<hash>
+@end example
+
+Or the IPNS protocol (IPNS is mutable IPFS):
+@example
+ffplay ipns://<hash>
 @end example
 
 @section mmst
@@ -570,7 +805,7 @@ The accepted syntax is:
 pipe:[@var{number}]
 @end example
 
-@var{number} is the number corresponding to the file descriptor of the
+If @option{fd} isn't specified, @var{number} is the number corresponding to the file descriptor of the
 pipe (e.g. 0 for stdin, 1 for stdout, 2 for stderr).  If @var{number}
 is not specified, by default the stdout file descriptor will be used
 for writing, stdin for reading.
@@ -597,6 +832,8 @@ Set I/O operation maximum block size, in bytes. Default value is
 @code{INT_MAX}, which results in not limiting the requested block size.
 Setting this value reasonably low improves user termination request reaction
 time, which is valuable if data transmission is slow.
+@item fd
+Set file descriptor.
 @end table
 
 Note that some formats (typically MOV), require the output protocol to
@@ -636,6 +873,50 @@ Example usage:
 @example
 -f rtp_mpegts -fec prompeg=l=8:d=4 rtp://@var{hostname}:@var{port}
 @end example
+
+@section rist
+
+Reliable Internet Streaming Transport protocol
+
+The accepted options are:
+@table @option
+@item rist_profile
+Supported values:
+@table @samp
+@item simple
+@item main
+This one is default.
+@item advanced
+@end table
+
+@item buffer_size
+Set internal RIST buffer size in milliseconds for retransmission of data.
+Default value is 0 which means the librist default (1 sec). Maximum value is 30
+seconds.
+
+@item fifo_size
+Size of the librist receiver output fifo in number of packets. This must be a
+power of 2.
+Defaults to 8192 (vs the librist default of 1024).
+
+@item overrun_nonfatal=@var{1|0}
+Survive in case of librist fifo buffer overrun. Default value is 0.
+
+@item pkt_size
+Set maximum packet size for sending data. 1316 by default.
+
+@item log_level
+Set loglevel for RIST logging messages. You only need to set this if you
+explicitly want to enable debug level messages or packet loss simulation,
+otherwise the regular loglevel is respected.
+
+@item secret
+Set override of encryption secret, by default is unset.
+
+@item encryption
+Set encryption type, by default is disabled.
+Acceptable values are 128 and 256.
+@end table
 
 @section rtmp
 
@@ -706,6 +987,13 @@ be named, by prefixing the type with 'N' and specifying the name before
 the value (i.e. @code{NB:myFlag:1}). This option may be used multiple
 times to construct arbitrary AMF sequences.
 
+@item rtmp_enhanced_codecs
+Specify the list of codecs the client advertises to support in an
+enhanced RTMP stream. This option should be set to a comma separated
+list of fourcc values, like @code{hvc1,av01,vp09} for multiple codecs
+or @code{hvc1} for only one codec. The specified list will be presented
+in the "fourCcLive" property of the Connect Command Message.
+
 @item rtmp_flashver
 Version of the Flash plugin used to run the SWF player. The default
 is LNX 9,0,124,2. (When publishing, the default is FMLE/3.0 (compatible;
@@ -750,6 +1038,16 @@ URL to player swf file, compute hash/size automatically.
 
 @item rtmp_tcurl
 URL of the target stream. Defaults to proto://host[:port]/app.
+
+@item tcp_nodelay=@var{1|0}
+Set TCP_NODELAY to disable Nagle's algorithm. Default value is 0.
+
+@emph{Remark: Writing to the socket is currently not optimized to minimize system calls and reduces the efficiency / effect of TCP_NODELAY.}
+
+@item tcp_keepalive=@var{1|0}
+Enable the TCP keepalive mechanism to detect dead peers and help maintain long-lived idle connections. Default value is 0.
+
+Only the basic keepalive option (SO_KEEPALIVE) can be enabled or disabled. Platform-specific tuning parameters such as TCP_KEEPIDLE, TCP_KEEPINTVL, or TCP_KEEPCNT are not configurable and will use the operating system's default values.
 
 @end table
 
@@ -804,6 +1102,158 @@ Real-Time Messaging Protocol tunneled through HTTPS.
 The Real-Time Messaging Protocol tunneled through HTTPS (RTMPTS) is used
 for streaming multimedia content within HTTPS requests to traverse
 firewalls.
+
+@section libcurl
+
+HTTP and HTTPS access through the libcurl library, available as an alternative to
+the native @code{http} protocol when FFmpeg is built with @code{--enable-libcurl}.
+It runs transfers on a dedicated event-loop thread shared per
+@code{AVFormatContext}, so all of a demuxer's connections (for example HLS
+segments) reuse libcurl's connection cache and HTTP/2 and HTTP/3 multiplexing.
+
+The native @code{http} protocol stays the default. There are two ways to use
+libcurl instead:
+
+@itemize @bullet
+@item
+Prefix the URL with @code{libcurl:} to force it explicitly, for example
+@code{libcurl:https://example.com/video.mp4}.
+
+@item
+Set the @option{prefer_libcurl} option to route @code{http://} and
+@code{https://} URLs through libcurl transparently.
+@end itemize
+
+@table @option
+@item prefer_libcurl
+When set to @code{1}, open @code{http(s)} URLs with the libcurl protocol instead
+of the native one. This is a generic IO option rather than a libcurl-specific
+one, so it also applies on builds without libcurl (where it has no effect).
+Default is @code{0}.
+@end table
+
+The libcurl protocol accepts the following options.
+
+@table @option
+@item user_agent
+Override the @code{User-Agent} header. Defaults to @code{Lavf/<version>}.
+
+@item referer
+Set the @code{Referer} header.
+
+@item headers
+Set custom HTTP headers, overriding internal defaults. Multiple headers are
+separated by newlines.
+
+@item http_proxy
+Set the HTTP proxy to tunnel through.
+
+@item cookies
+Cookies to be sent in future requests, given as newline-delimited
+@code{Set-Cookie}-style values.
+
+@item location
+The actual location of the data after following redirects. This is an output
+option, read with @command{av_opt_get}; demuxers use it to resolve relative URLs.
+
+@item offset
+Initial byte offset of the request. Default is @code{0}.
+
+@item end_offset
+If greater than @code{0}, limit the request to the bytes preceding this offset.
+Together with @option{offset} this requests a sub-range of the resource, as used
+for HLS byte-range segments.
+
+@item seekable
+Control seekability of the connection. If set to @code{0} the stream is treated
+as non-seekable, @code{1} forces seekable, and @code{-1} (the default) lets it be
+detected from the server response.
+
+@item tls_verify
+Verify the peer certificate and host name. Enabled by default.
+
+@item ca_file
+Path to a certificate authority bundle that overrides the system store.
+
+@item cert_file
+@item key_file
+Client certificate and private key files for mutual TLS.
+
+@item connect_timeout
+Connection timeout in seconds. @code{0} (the default) uses libcurl's own timeout.
+
+@item max_redirects
+Maximum number of redirects to follow. Default is @code{16}.
+
+@item multiple_requests
+Reuse the connection across requests (HTTP keep-alive). Enabled by default;
+setting it to @code{0} uses a fresh connection per transfer.
+
+@item http_version
+HTTP version to use: @code{auto} (default), @code{1.0}, @code{1.1}, @code{2},
+@code{2tls}, @code{2-prior-knowledge}, @code{3} or @code{3only}.
+
+@item buffer_size
+Size in bytes of the receive buffer. Default is 4 MiB.
+
+@item request_size
+If greater than @code{0}, split a seekable transfer into ranged requests of at
+most this many bytes each. Default is @code{0} (a single request).
+
+@item initial_request_size
+Limit the size of initial requests. Similar to @code{request_size}, but only
+used during initial format parsing. Useful for formats like MXF or MOV that
+require frequent seeks during header parsing. Lasts until the demuxer makes a
+read request larger than this size (without a seek in between), after which
+the implementation will continue using requests as usual. Disabled (set to 0)
+by default.
+
+Note that if enabling this option, it's strongly recommended to also set
+@option{short_seek_size} to the same value or higher, otherwise the HTTP
+connection may be closed and recreated for each subsequent initial request.
+
+@item max_retries
+Maximum number of retries after a recoverable error on a seekable transfer.
+Default is @code{5}.
+
+@item short_seek_size
+Set the threshold, in bytes, for when a readahead should be preferred over a seek and
+new HTTP request. This is useful, for example, to make sure the same connection
+is used for reading large video packets with small audio packets in between.
+
+@item icy
+If set to 1 request ICY (SHOUTcast) metadata from the server. If the server
+supports this, the metadata has to be retrieved by the application by reading
+the @option{icy_metadata_headers} and @option{icy_metadata_packet} options.
+The default is 1.
+
+@item icy_status
+If set to 1 accept the legacy Shoutcast v1 @code{ICY 200 OK} status line in
+place of an HTTP one. Any reply whose status line starts with @code{ICY 200}
+is then treated as a successful HTTP 200.
+The default is 1.
+
+@item icy_metadata_headers
+If the server supports ICY metadata, this contains the ICY-specific HTTP reply
+headers, separated by newline characters.
+
+@item icy_metadata_packet
+If the server supports ICY metadata, and @option{icy} was set to 1, this
+contains the last non-empty metadata packet sent by the server. It should be
+polled in regular intervals by applications interested in mid-stream metadata
+updates.
+
+@item metadata
+Set an exported dictionary containing Icecast metadata from the bitstream, if present.
+Only useful with the C API.
+@end table
+
+A stream carrying in-band ICY metadata is always treated as non-seekable, since
+its byte offsets do not address the payload. @option{seekable},
+@option{request_size} and @option{max_retries} therefore have no effect on such
+a stream.
+
+For more information see: @url{https://curl.se/libcurl/}.
 
 @section libsmbclient
 
@@ -862,6 +1312,11 @@ truncating. Default value is 1.
 Specify the path of the file containing private key to use during authorization.
 By default libssh searches for keys in the @file{~/.ssh/} directory.
 
+@item verify
+Verify the server host key against the known_hosts file before
+authenticating, if set to 1. Servers that are not in the file, or whose
+key differs from the one recorded there, are refused. Default value is 1.
+
 @end table
 
 Example: Play a file stored on remote server.
@@ -915,11 +1370,20 @@ ffplay "rtmp://myserver/live/mystream live=1"
 Real-time Transport Protocol.
 
 The required syntax for an RTP URL is:
-rtp://@var{hostname}[:@var{port}][?@var{option}=@var{val}...]
+@example
+rtp://@var{hostname}[:@var{port}][?@var{options}]
+@end example
 
 @var{port} specifies the RTP port to use.
 
-The following URL options are supported:
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+The list of supported options follows.
 
 @table @option
 
@@ -929,14 +1393,19 @@ Set the TTL (Time-To-Live) value (for multicast only).
 @item rtcpport=@var{n}
 Set the remote RTCP port to @var{n}.
 
-@item localrtpport=@var{n}
+@item localport, local_rtpport, localrtpport=@var{n}
 Set the local RTP port to @var{n}.
 
-@item localrtcpport=@var{n}'
+Using the localport option name is deprecated and should not be used.
+
+@item local_rtcpport, localrtcpport=@var{n}'
 Set the local RTCP port to @var{n}.
 
 @item pkt_size=@var{n}
 Set max packet size (in bytes) to @var{n}.
+
+@item buffer_size=@var{size}
+Set the maximum UDP socket buffer size in bytes.
 
 @item connect=0|1
 Do a @code{connect()} on the UDP socket (if set to 1) or not (if set
@@ -952,12 +1421,12 @@ List disallowed (blocked) source IP addresses.
 Send packets to the source address of the latest received packet (if
 set to 1) or to a default remote address (if set to 0).
 
-@item localport=@var{n}
-Set the local RTP port to @var{n}.
+@item localaddr=@var{addr}
+Local IP address of a network interface used for sending packets or joining
+multicast groups.
 
-This is a deprecated option. Instead, @option{localrtpport} should be
-used.
-
+@item timeout=@var{n}
+Set timeout (in microseconds) of socket I/O operations to @var{n}.
 @end table
 
 Important notes:
@@ -999,6 +1468,59 @@ Options can be set on the @command{ffmpeg}/@command{ffplay} command
 line, or set in code via @code{AVOption}s or in
 @code{avformat_open_input}.
 
+@subsection Muxer
+The following options are supported.
+
+@table @option
+@item rtsp_transport
+Set RTSP transport protocols.
+
+It accepts the following values:
+@table @samp
+@item udp
+Use UDP as lower transport protocol.
+
+@item tcp
+Use TCP (interleaving within the RTSP control channel) as lower
+transport protocol.
+@end table
+
+Default value is @samp{0}.
+
+@item rtsp_flags
+Set RTSP flags.
+
+The following values are accepted:
+@table @samp
+@item latm
+Use MP4A-LATM packetization instead of MPEG4-GENERIC for AAC.
+@item rfc2190
+Use RFC 2190 packetization instead of RFC 4629 for H.263.
+@item skip_rtcp
+Don't send RTCP sender reports.
+@item h264_mode0
+Use mode 0 for H.264 in RTP.
+@item send_bye
+Send RTCP BYE packets when finishing.
+@end table
+
+Default value is @samp{0}.
+
+
+@item min_port
+Set minimum local UDP port. Default value is 5000.
+
+@item max_port
+Set maximum local UDP port. Default value is 65000.
+
+@item buffer_size
+Set the maximum socket buffer size in bytes.
+
+@item pkt_size
+Set max send packet size (in bytes). Default value is 1472.
+@end table
+
+@subsection Demuxer
 The following options are supported.
 
 @table @option
@@ -1024,6 +1546,10 @@ Use UDP multicast as lower transport protocol.
 @item http
 Use HTTP tunneling as lower transport protocol, which is useful for
 passing proxies.
+
+@item https
+Use HTTPs tunneling as lower transport protocol, which is useful for
+passing proxies and widely used for security consideration.
 @end table
 
 Multiple lower transport protocols may be specified, in that case they are
@@ -1041,6 +1567,9 @@ Accept packets only from negotiated peer address and port.
 Act as a server, listening for an incoming connection.
 @item prefer_tcp
 Try TCP for RTP transport first, if TCP is available as RTSP RTP transport.
+@item satip_raw
+Export raw MPEG-TS stream instead of demuxing. The flag will simply write out
+the raw stream, with the original PAT/PMT/PIDs intact.
 @end table
 
 Default value is @samp{none}.
@@ -1053,6 +1582,7 @@ The following flags are accepted:
 @item video
 @item audio
 @item data
+@item subtitle
 @end table
 
 By default it accepts all media types.
@@ -1063,21 +1593,23 @@ Set minimum local UDP port. Default value is 5000.
 @item max_port
 Set maximum local UDP port. Default value is 65000.
 
-@item timeout
-Set maximum timeout (in seconds) to wait for incoming connections.
-
-A value of -1 means infinite (default). This option implies the
-@option{rtsp_flags} set to @samp{listen}.
+@item listen_timeout
+Set maximum timeout (in seconds) to establish an initial connection. Setting
+@option{listen_timeout} > 0 sets @option{rtsp_flags} to @samp{listen}. Default is -1
+which means an infinite timeout when @samp{listen} mode is set.
 
 @item reorder_queue_size
 Set number of packets to buffer for handling of reordered packets.
 
-@item stimeout
+@item timeout
 Set socket TCP I/O timeout in microseconds.
 
-@item user-agent
+@item user_agent
 Override User-Agent header. If not specified, it defaults to the
 libavformat identifier string.
+
+@item buffer_size
+Set the maximum socket buffer size in bytes.
 @end table
 
 When receiving data over UDP, the demuxer tries to reorder received packets
@@ -1222,7 +1754,15 @@ The accepted URL syntax is:
 sctp://@var{host}:@var{port}[?@var{options}]
 @end example
 
-The protocol accepts the following options:
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+The list of supported options follows.
+
 @table @option
 @item listen
 If set to any value, listen for an incoming connection. Outgoing connection is done by default.
@@ -1230,6 +1770,92 @@ If set to any value, listen for an incoming connection. Outgoing connection is d
 @item max_streams
 Set the maximum number of streams. By default no limit is set.
 @end table
+
+@section shared
+
+Thread-safe, persistent, cross-process cache wrapper for input streams. Caches
+the input stream to a file in the specified directory. This is similar to
+@ref{cache}, but with a persistent cache on disk that may be shared between
+multiple processes or demuxers, even concurrently.
+
+The filename of the cache is obtained by hashing the input URL, so there is
+some risk of collision if the same URL is used for different content (e.g.
+as a result of extra POST data being used to select the stream ID). To avoid
+this, make sure to only use this protocol for URLs that uniquely identify
+the content; otherwise you may get a garbled mix of sources.
+
+The accepted options are:
+@table @option
+
+@item cache_dir
+Path to the directory where cache files are stored. This option is required.
+
+@item metadata_dir
+Path to the directory where metadata files are stored. Optional. If not
+specified, metadata is stored in the same directory as the cache file.
+
+@item block_shift
+Shift factor (log2) of the block size used for internal reads/writes. Defaults
+to 15, i.e. 32KB blocks. If this does not match the value that was specified
+when an existing cache file was created, the previously specified value will
+be used instead.
+
+@item read_only
+If true, use the shared cache for reads but don't write any new blocks to it.
+Default is false. Note that even with this option enabled, the cache file will
+be initialized if it does not already exist.
+
+@item cache_verify
+If true, verify any data read from the cache against the underlying input
+stream, and error out on any mismatches. Note that this will make the cache
+layer effectively useless. This is purely a debug option.
+
+@item cache_timeout
+If set to a nonzero value, specifies the maximum time (in microseconds) to wait
+for data to become available, if another process is currently trying to fetch
+and cache the same block at the same time. If this timeout elapses, it's
+assumed that the other process may have gotten stuck or died in the meantime.
+
+If set to zero, no waiting is done and all processes will immediately race
+to try and fetch the same missing blocks themselves. Defaults to 10000 (10 ms).
+
+@item ignore_errors
+If true, failures of the underlying input stream are not treated as fatal, and
+playback continues using only the data already present in the cache file.
+Default is false. Any attempt to read into uncached data will result in an
+unrecoverable IO error.
+
+@item retry_errors
+If true (the default), transient read errors from the underlying input stream
+are ignored and retried again. If false, any blocks that previously failed
+being read from will be treated as permanently inaccessible.
+
+@item retry_corrupt
+If true (the default), blocks whose contents fail the CRC integrity check are
+re-fetched from the underlying input stream, overwriting the corrupt cached
+data. If false, cache corruption is treated as a fatal read error.
+
+@item cache_size_max
+Maximum amount of data to cache, in bytes, rounded down to a multiple of the
+chosen block size. Accepts the usual size suffixes, e.g. @code{10G} for
+10*10^9 bytes, or @code{10Gi} for 10*2^30 bytes. Defaults to 0, meaning no
+limit.
+
+Once this limit is reached, the protocol switches to read-only mode (see
+@option{read_only}). Already cached data is never evicted, so once this limit
+is reached, no new data will ever be cached until the cache file is deleted.
+
+Note that this option is best-effort only, and may over-write up to N-1
+blocks, where N is the number of concurrent processes using the same cache
+file. Note also that the underlying file system may reserve more space than
+written, if the underlying allocation granularity is larger than the block
+size.
+@end table
+
+URL Syntax is
+@example
+shared:@var{URL}
+@end example
 
 @section srt
 
@@ -1241,18 +1867,13 @@ srt://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
 @var{options} contains a list of &-separated options of the form
-@var{key}=@var{val}.
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
 
-or
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
 
-@example
-@var{options} srt://@var{hostname}:@var{port}
-@end example
-
-@var{options} contains a list of '-@var{key} @var{val}'
-options.
-
-This protocol accepts the following options.
+The list of supported options follows.
 
 @table @option
 @item connect_timeout=@var{milliseconds}
@@ -1362,6 +1983,12 @@ when the old encryption key is decommissioned. Default is -1.
 -1 means auto (0x1000 in srt library). The range for
 this option is integers in the 0 - @code{INT_MAX}.
 
+@item snddropdelay=@var{microseconds}
+The sender's extra delay before dropping packets. This delay is
+added to the default drop delay time interval value.
+
+Special value -1: Do not drop packets on the sender at all.
+
 @item payload_size=@var{bytes}
 Sets the maximum declared size of a packet transferred
 during the single call to the sending function in Live
@@ -1461,6 +2088,9 @@ This option doesn’t make sense in Rendezvous connection; the result
 might be that simply one side will override the value from the other
 side and it’s the matter of luck which one would win
 
+@item srt_streamid=@var{string}
+Alias for @samp{streamid} to avoid conflict with ffmpeg command line option.
+
 @item smoother=@var{live|file}
 The type of Smoother used for the transmission for that socket, which
 is responsible for the transmission and congestion control. The Smoother
@@ -1509,6 +2139,15 @@ The number of seconds that the socket waits for unsent data when closing.
 Default is -1. -1 means auto (off with 0 seconds in live mode, on with 180
 seconds in file mode). The range for this option is integers in the
 0 - @code{INT_MAX}.
+
+@item tsbpd=@var{1|0}
+When true, use Timestamp-based Packet Delivery mode. The default behavior
+depends on the transmission type: enabled in live mode, disabled in file
+mode.
+
+@item ipv6only=@var{1|0}
+Accept IPv4 or not while using the IPv6 wildcard address. This should be set
+when listening on a IPv6 wildcard address.
 
 @end table
 
@@ -1591,13 +2230,24 @@ tcp://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
 @var{options} contains a list of &-separated options of the form
-@var{key}=@var{val}.
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
 
 The list of supported options follows.
 
 @table @option
-@item listen=@var{1|0}
-Listen for an incoming connection. Default value is 0.
+@item listen=@var{2|1|0}
+Listen for an incoming connection. 0 disables listen, 1 enables listen in
+single client mode, 2 enables listen in multi-client mode. Default value is 0.
+
+@item local_addr=@var{addr}
+Local IP address of a network interface used for tcp socket connect.
+
+@item local_port=@var{port}
+Local port used for tcp socket connect.
 
 @item timeout=@var{microseconds}
 Set raise error timeout, expressed in microseconds.
@@ -1616,6 +2266,8 @@ Set send buffer size, expressed bytes.
 
 @item tcp_nodelay=@var{1|0}
 Set TCP_NODELAY to disable Nagle's algorithm. Default value is 0.
+
+@emph{Remark: Writing to the socket is currently not optimized to minimize system calls and reduces the efficiency / effect of TCP_NODELAY.}
 
 @item tcp_mss=@var{bytes}
 Set maximum segment size for outgoing TCP packets, expressed in bytes.
@@ -1637,8 +2289,14 @@ The required syntax for a TLS/SSL url is:
 tls://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
-The following parameters can be set via command line options
-(or in code via @code{AVOption}s):
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+The list of supported options follows.
 
 @table @option
 
@@ -1649,7 +2307,7 @@ need to be specified for verification to work, but not all libraries and
 setups have defaults built in.
 The file must be in OpenSSL PEM format.
 
-@item tls_verify=@var{1|0}
+@item tls_verify, verify=@var{1|0}
 If enabled, try to verify the peer that we are communicating with.
 Note, if using OpenSSL, this currently only makes sure that the
 peer certificate is signed by one of the root certificates in the CA
@@ -1657,8 +2315,8 @@ database, but it does not validate that the certificate actually
 matches the host name we are trying to connect to. (With other backends,
 the host name is validated as well.)
 
-This is disabled by default since it requires a CA database to be
-provided by the caller in many cases.
+This is enabled by default. Verifying the peer requires a CA database,
+which in some cases has to be provided by the caller.
 
 @item cert_file, cert=@var{filename}
 A file containing a certificate to use in the handshake with the peer.
@@ -1672,6 +2330,10 @@ A file containing the private key for the certificate.
 @item listen=@var{1|0}
 If enabled, listen for connections on the provided port, and assume
 the server role in the handshake instead of the client role.
+
+@item http_proxy
+The HTTP proxy to tunnel through, e.g. @code{http://example.com:1234}.
+The proxy must support the CONNECT method.
 
 @end table
 
@@ -1689,6 +2351,94 @@ To play back a stream from the TLS/SSL server using @command{ffplay}:
 ffplay tls://@var{hostname}:@var{port}
 @end example
 
+@section dtls
+
+Datagram Transport Layer Security (DTLS)
+
+The required syntax for a DTLS URL is:
+@example
+dtls://@var{hostname}:@var{port}[?@var{options}]
+@end example
+
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+DTLS shares most options with TLS, but operates over UDP instead of TCP.
+
+The list of supported options follows.
+
+@table @option
+
+@item ca_file, cafile=@var{filename}
+A file containing certificate authority (CA) root certificates to treat
+as trusted. If the linked TLS library contains a default this might not
+need to be specified for verification to work, but not all libraries and
+setups have defaults built in.
+The file must be in OpenSSL PEM format.
+
+@item tls_verify, verify=@var{1|0}
+If enabled, try to verify the peer that we are communicating with.
+Note, if using OpenSSL, this currently only makes sure that the
+peer certificate is signed by one of the root certificates in the CA
+database, but it does not validate that the certificate actually
+matches the host name we are trying to connect to.
+
+This is enabled by default. Verifying the peer requires a CA database,
+which in some cases has to be provided by the caller.
+
+@item cert_file, cert=@var{filename}
+A file containing a certificate to use in the handshake with the peer.
+(When operating as server, in listen mode, this is more often required
+by the peer, while client certificates only are mandated in certain
+setups.)
+
+@item key_file, key=@var{filename}
+A file containing the private key for the certificate.
+
+@item cert_pem=@var{string}
+Certificate PEM string
+
+@item key_pem=@var{string}
+Private key PEM string
+
+@item listen=@var{1|0}
+If enabled, listen for connections on the provided port, and assume
+the server role in the handshake instead of the client role.
+
+@item mtu=@var{size}
+Set the Maximum Transmission Unit (MTU) for DTLS packets.
+
+@item use_srtp=@var{1|0}
+Enable the use_srtp DTLS extension.
+This is used in WebRTC applications to establish SRTP encryption keys
+through the DTLS handshake. Default is disabled.
+
+@item external_sock=@var{1|0}
+Use an external socket instead of creating a new one.
+This option only makes sense to pass when interacting with the code via
+API, enabling this from CLI will cause immediate failure.
+Default is disabled.
+
+@end table
+
+Example command lines:
+
+To create a DTLS server:
+
+@example
+ffmpeg -listen 1 -i dtls://@var{hostname}:@var{port} @var{output}
+@end example
+
+To create a DTLS client and send data to server:
+
+@example
+ffmpeg -i @var{input} -f @var{format} dtls://@var{hostname}:@var{port}
+@end example
+
 @section udp
 
 User Datagram Protocol.
@@ -1698,7 +2448,12 @@ The required syntax for an UDP URL is:
 udp://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
-@var{options} contains a list of &-separated options of the form @var{key}=@var{val}.
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
 
 In case threading is enabled on the system, a circular buffer is used
 to store the incoming data, which allows one to reduce loss of data due to
@@ -1736,6 +2491,9 @@ Explicitly allow or disallow reusing UDP sockets.
 
 @item ttl=@var{ttl}
 Set the time to live value (for multicast only).
+
+@item dscp=@var{dscp}
+Set the 6-bit DSCP field for outgoing packets.
 
 @item connect=@var{1|0}
 Initialize the UDP socket with @code{connect()}. In this case, the
@@ -1818,6 +2576,17 @@ The following parameters can be set via command line options
 Timeout in ms.
 @item listen
 Create the Unix socket in listening mode.
+@item type
+Select socket type.
+@table @samp
+@item stream Corresponds to SOCK_STREAM (reliable stream-oriented)
+@item datagram Corresponds to SOCK_DGRAM (unreliable packet-oriented)
+@item seqpacket Corresponds to SOCK_SEQPACKET (reliable packet-oriented)
+@end table
+@item pkt_size
+Maximum packet size for packet-oriented sockets (SOCK_DGRAM and
+SOCK_SEQPACKET). If greater than zero, this value is used as
+@code{max_packet_size}. Ignored for SOCK_STREAM. Default is @code{0}.
 @end table
 
 @section zmq
@@ -1865,6 +2634,5 @@ pkt_size on the server. Otherwise the received message may be truncated causing
 decoding errors.
 
 @end table
-
 
 @c man end PROTOCOLS

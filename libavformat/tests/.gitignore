@@ -1,7 +1,14 @@
+/id3v2
+/id3v2enc
 /fifo_muxer
-/movenc
+/imf
+/mkdir
 /noproxy
+/rename
 /rtmpdh
 /seek
 /srtp
 /url
+/seek_utils
+/http
+/ogg_pages

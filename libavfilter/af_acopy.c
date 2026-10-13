@@ -18,7 +18,7 @@
 
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
@@ -51,20 +51,12 @@ static const AVFilterPad acopy_inputs[] = {
         .type         = AVMEDIA_TYPE_AUDIO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad acopy_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_acopy = {
-    .name          = "acopy",
-    .description   = NULL_IF_CONFIG_SMALL("Copy the input audio unchanged to the output."),
-    .inputs        = acopy_inputs,
-    .outputs       = acopy_outputs,
+const FFFilter ff_af_acopy = {
+    .p.name        = "acopy",
+    .p.description = NULL_IF_CONFIG_SMALL("Copy the input audio unchanged to the output."),
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_INPUTS(acopy_inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };

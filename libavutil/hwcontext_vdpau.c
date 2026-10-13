@@ -32,27 +32,6 @@
 #include "pixfmt.h"
 #include "pixdesc.h"
 
-typedef struct VDPAUDeviceContext {
-    VdpVideoSurfaceQueryGetPutBitsYCbCrCapabilities *get_transfer_caps;
-    VdpVideoSurfaceGetBitsYCbCr                     *get_data;
-    VdpVideoSurfacePutBitsYCbCr                     *put_data;
-    VdpVideoSurfaceCreate                           *surf_create;
-    VdpVideoSurfaceDestroy                          *surf_destroy;
-
-    enum AVPixelFormat *pix_fmts[3];
-    int              nb_pix_fmts[3];
-} VDPAUDeviceContext;
-
-typedef struct VDPAUFramesContext {
-    VdpVideoSurfaceGetBitsYCbCr *get_data;
-    VdpVideoSurfacePutBitsYCbCr *put_data;
-    VdpChromaType chroma_type;
-    int chroma_idx;
-
-    const enum AVPixelFormat *pix_fmts;
-    int                       nb_pix_fmts;
-} VDPAUFramesContext;
-
 typedef struct VDPAUPixFmtMap {
     VdpYCbCrFormat vdpau_fmt;
     enum AVPixelFormat pix_fmt;
@@ -61,6 +40,10 @@ typedef struct VDPAUPixFmtMap {
 static const VDPAUPixFmtMap pix_fmts_420[] = {
     { VDP_YCBCR_FORMAT_NV12, AV_PIX_FMT_NV12    },
     { VDP_YCBCR_FORMAT_YV12, AV_PIX_FMT_YUV420P },
+#ifdef VDP_YCBCR_FORMAT_P016
+    { VDP_YCBCR_FORMAT_P016, AV_PIX_FMT_P016    },
+    { VDP_YCBCR_FORMAT_P010, AV_PIX_FMT_P010    },
+#endif
     { 0,                     AV_PIX_FMT_NONE,   },
 };
 
@@ -76,6 +59,9 @@ static const VDPAUPixFmtMap pix_fmts_444[] = {
 #ifdef VDP_YCBCR_FORMAT_Y_U_V_444
     { VDP_YCBCR_FORMAT_Y_U_V_444, AV_PIX_FMT_YUV444P },
 #endif
+#ifdef VDP_YCBCR_FORMAT_P016
+    {VDP_YCBCR_FORMAT_Y_U_V_444_16, AV_PIX_FMT_YUV444P16},
+#endif
     { 0,                          AV_PIX_FMT_NONE,   },
 };
 
@@ -87,7 +73,40 @@ static const struct {
     { VDP_CHROMA_TYPE_420, AV_PIX_FMT_YUV420P, pix_fmts_420 },
     { VDP_CHROMA_TYPE_422, AV_PIX_FMT_YUV422P, pix_fmts_422 },
     { VDP_CHROMA_TYPE_444, AV_PIX_FMT_YUV444P, pix_fmts_444 },
+#ifdef VDP_YCBCR_FORMAT_P016
+    { VDP_CHROMA_TYPE_420_16, AV_PIX_FMT_YUV420P10, pix_fmts_420 },
+    { VDP_CHROMA_TYPE_420_16, AV_PIX_FMT_YUV420P12, pix_fmts_420 },
+    { VDP_CHROMA_TYPE_422_16, AV_PIX_FMT_YUV422P10, pix_fmts_422 },
+    { VDP_CHROMA_TYPE_444_16, AV_PIX_FMT_YUV444P10, pix_fmts_444 },
+    { VDP_CHROMA_TYPE_444_16, AV_PIX_FMT_YUV444P12, pix_fmts_444 },
+#endif
 };
+
+typedef struct VDPAUDeviceContext {
+    /**
+     * The public AVVDPAUDeviceContext. See hwcontext_vdpau.h for it.
+     */
+    AVVDPAUDeviceContext p;
+
+    VdpVideoSurfaceQueryGetPutBitsYCbCrCapabilities *get_transfer_caps;
+    VdpVideoSurfaceGetBitsYCbCr                     *get_data;
+    VdpVideoSurfacePutBitsYCbCr                     *put_data;
+    VdpVideoSurfaceCreate                           *surf_create;
+    VdpVideoSurfaceDestroy                          *surf_destroy;
+
+    enum AVPixelFormat *pix_fmts[FF_ARRAY_ELEMS(vdpau_pix_fmts)];
+    int              nb_pix_fmts[FF_ARRAY_ELEMS(vdpau_pix_fmts)];
+} VDPAUDeviceContext;
+
+typedef struct VDPAUFramesContext {
+    VdpVideoSurfaceGetBitsYCbCr *get_data;
+    VdpVideoSurfacePutBitsYCbCr *put_data;
+    VdpChromaType chroma_type;
+    int chroma_idx;
+
+    const enum AVPixelFormat *pix_fmts;
+    int                       nb_pix_fmts;
+} VDPAUFramesContext;
 
 static int count_pixfmts(const VDPAUPixFmtMap *map)
 {
@@ -101,8 +120,8 @@ static int count_pixfmts(const VDPAUPixFmtMap *map)
 
 static int vdpau_init_pixmfts(AVHWDeviceContext *ctx)
 {
-    AVVDPAUDeviceContext *hwctx = ctx->hwctx;
-    VDPAUDeviceContext    *priv = ctx->internal->priv;
+    VDPAUDeviceContext    *priv = ctx->hwctx;
+    AVVDPAUDeviceContext *hwctx = &priv->p;
     int i;
 
     for (i = 0; i < FF_ARRAY_ELEMS(priv->pix_fmts); i++) {
@@ -143,8 +162,8 @@ do {                                                                            
 
 static int vdpau_device_init(AVHWDeviceContext *ctx)
 {
-    AVVDPAUDeviceContext *hwctx = ctx->hwctx;
-    VDPAUDeviceContext   *priv  = ctx->internal->priv;
+    VDPAUDeviceContext    *priv = ctx->hwctx;
+    AVVDPAUDeviceContext *hwctx = &priv->p;
     VdpStatus             err;
     int                   ret;
 
@@ -166,7 +185,7 @@ static int vdpau_device_init(AVHWDeviceContext *ctx)
 
 static void vdpau_device_uninit(AVHWDeviceContext *ctx)
 {
-    VDPAUDeviceContext *priv = ctx->internal->priv;
+    VDPAUDeviceContext *priv = ctx->hwctx;
     int i;
 
     for (i = 0; i < FF_ARRAY_ELEMS(priv->pix_fmts); i++)
@@ -177,7 +196,7 @@ static int vdpau_frames_get_constraints(AVHWDeviceContext *ctx,
                                         const void *hwconfig,
                                         AVHWFramesConstraints *constraints)
 {
-    VDPAUDeviceContext   *priv  = ctx->internal->priv;
+    VDPAUDeviceContext *priv  = ctx->hwctx;
     int nb_sw_formats = 0;
     int i;
 
@@ -205,18 +224,18 @@ static int vdpau_frames_get_constraints(AVHWDeviceContext *ctx,
 static void vdpau_buffer_free(void *opaque, uint8_t *data)
 {
     AVHWFramesContext          *ctx = opaque;
-    VDPAUDeviceContext *device_priv = ctx->device_ctx->internal->priv;
+    VDPAUDeviceContext *device_priv = ctx->device_ctx->hwctx;
     VdpVideoSurface            surf = (VdpVideoSurface)(uintptr_t)data;
 
     device_priv->surf_destroy(surf);
 }
 
-static AVBufferRef *vdpau_pool_alloc(void *opaque, int size)
+static AVBufferRef *vdpau_pool_alloc(void *opaque, size_t size)
 {
     AVHWFramesContext             *ctx = opaque;
-    VDPAUFramesContext           *priv = ctx->internal->priv;
-    AVVDPAUDeviceContext *device_hwctx = ctx->device_ctx->hwctx;
-    VDPAUDeviceContext    *device_priv = ctx->device_ctx->internal->priv;
+    VDPAUFramesContext           *priv = ctx->hwctx;
+    VDPAUDeviceContext    *device_priv = ctx->device_ctx->hwctx;
+    AVVDPAUDeviceContext *device_hwctx = &device_priv->p;
 
     AVBufferRef *ret;
     VdpVideoSurface surf;
@@ -241,8 +260,8 @@ static AVBufferRef *vdpau_pool_alloc(void *opaque, int size)
 
 static int vdpau_frames_init(AVHWFramesContext *ctx)
 {
-    VDPAUDeviceContext *device_priv = ctx->device_ctx->internal->priv;
-    VDPAUFramesContext        *priv = ctx->internal->priv;
+    VDPAUDeviceContext *device_priv = ctx->device_ctx->hwctx;
+    VDPAUFramesContext        *priv = ctx->hwctx;
 
     int i;
 
@@ -262,9 +281,10 @@ static int vdpau_frames_init(AVHWFramesContext *ctx)
     }
 
     if (!ctx->pool) {
-        ctx->internal->pool_internal = av_buffer_pool_init2(sizeof(VdpVideoSurface), ctx,
-                                                            vdpau_pool_alloc, NULL);
-        if (!ctx->internal->pool_internal)
+        ffhwframesctx(ctx)->pool_internal =
+            av_buffer_pool_init2(sizeof(VdpVideoSurface), ctx,
+                                 vdpau_pool_alloc, NULL);
+        if (!ffhwframesctx(ctx)->pool_internal)
             return AVERROR(ENOMEM);
     }
 
@@ -292,7 +312,7 @@ static int vdpau_transfer_get_formats(AVHWFramesContext *ctx,
                                       enum AVHWFrameTransferDirection dir,
                                       enum AVPixelFormat **formats)
 {
-    VDPAUFramesContext *priv  = ctx->internal->priv;
+    VDPAUFramesContext *priv  = ctx->hwctx;
 
     enum AVPixelFormat *fmts;
 
@@ -315,7 +335,7 @@ static int vdpau_transfer_get_formats(AVHWFramesContext *ctx,
 static int vdpau_transfer_data_from(AVHWFramesContext *ctx, AVFrame *dst,
                                     const AVFrame *src)
 {
-    VDPAUFramesContext *priv = ctx->internal->priv;
+    VDPAUFramesContext *priv = ctx->hwctx;
     VdpVideoSurface     surf = (VdpVideoSurface)(uintptr_t)src->data[3];
 
     void *data[3];
@@ -355,6 +375,9 @@ static int vdpau_transfer_data_from(AVHWFramesContext *ctx, AVFrame *dst,
 #ifdef VDP_YCBCR_FORMAT_Y_U_V_444
             || (vdpau_format == VDP_YCBCR_FORMAT_Y_U_V_444)
 #endif
+#ifdef VDP_YCBCR_FORMAT_P016
+            || (vdpau_format == VDP_YCBCR_FORMAT_Y_U_V_444_16)
+#endif
             )
         FFSWAP(void*, data[1], data[2]);
 
@@ -370,7 +393,7 @@ static int vdpau_transfer_data_from(AVHWFramesContext *ctx, AVFrame *dst,
 static int vdpau_transfer_data_to(AVHWFramesContext *ctx, AVFrame *dst,
                                   const AVFrame *src)
 {
-    VDPAUFramesContext *priv = ctx->internal->priv;
+    VDPAUFramesContext *priv = ctx->hwctx;
     VdpVideoSurface     surf = (VdpVideoSurface)(uintptr_t)dst->data[3];
 
     const void *data[3];
@@ -491,9 +514,8 @@ const HWContextType ff_hwcontext_type_vdpau = {
     .type                 = AV_HWDEVICE_TYPE_VDPAU,
     .name                 = "VDPAU",
 
-    .device_hwctx_size    = sizeof(AVVDPAUDeviceContext),
-    .device_priv_size     = sizeof(VDPAUDeviceContext),
-    .frames_priv_size     = sizeof(VDPAUFramesContext),
+    .device_hwctx_size    = sizeof(VDPAUDeviceContext),
+    .frames_hwctx_size    = sizeof(VDPAUFramesContext),
 
 #if HAVE_VDPAU_X11
     .device_create        = vdpau_device_create,

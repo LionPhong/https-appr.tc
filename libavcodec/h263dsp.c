@@ -28,7 +28,7 @@ const uint8_t ff_h263_loop_filter_strength[32] = {
     7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12
 };
 
-static void h263_h_loop_filter_c(uint8_t *src, int stride, int qscale)
+static void h263_h_loop_filter_c(uint8_t *src, ptrdiff_t stride, int qscale)
 {
     int y;
     const int strength = ff_h263_loop_filter_strength[qscale];
@@ -71,7 +71,7 @@ static void h263_h_loop_filter_c(uint8_t *src, int stride, int qscale)
     }
 }
 
-static void h263_v_loop_filter_c(uint8_t *src, int stride, int qscale)
+static void h263_v_loop_filter_c(uint8_t *src, ptrdiff_t stride, int qscale)
 {
     int x;
     const int strength = ff_h263_loop_filter_strength[qscale];
@@ -119,8 +119,11 @@ av_cold void ff_h263dsp_init(H263DSPContext *ctx)
     ctx->h263_h_loop_filter = h263_h_loop_filter_c;
     ctx->h263_v_loop_filter = h263_v_loop_filter_c;
 
-    if (ARCH_X86)
-        ff_h263dsp_init_x86(ctx);
-    if (ARCH_MIPS)
-        ff_h263dsp_init_mips(ctx);
+#if ARCH_RISCV
+    ff_h263dsp_init_riscv(ctx);
+#elif ARCH_X86 && HAVE_X86ASM
+    ff_h263dsp_init_x86(ctx);
+#elif ARCH_MIPS
+    ff_h263dsp_init_mips(ctx);
+#endif
 }

@@ -28,7 +28,8 @@
 #ifndef AVCODEC_DIRAC_ARITH_H
 #define AVCODEC_DIRAC_ARITH_H
 
-#include "libavutil/x86/asm.h"
+#include "config.h"
+
 #include "bytestream.h"
 #include "get_bits.h"
 
@@ -86,7 +87,6 @@ typedef struct {
 } DiracArith;
 
 extern const uint8_t ff_dirac_next_ctx[DIRAC_CTX_COUNT];
-extern const uint16_t ff_dirac_prob[256];
 extern int16_t ff_dirac_prob_branchless[256][2];
 
 static inline void renorm(DiracArith *c)
@@ -140,7 +140,7 @@ static inline int dirac_get_arith_bit(DiracArith *c, int ctx)
 
     range_times_prob = (c->range * prob_zero) >> 16;
 
-#if ARCH_X86 && HAVE_FAST_CMOV && HAVE_INLINE_ASM && HAVE_6REGS
+#if ARCH_X86 && HAVE_FAST_CMOV && HAVE_INLINE_ASM && HAVE_X86_6REGS
     low   -= range_times_prob << 16;
     range -= range_times_prob;
     bit = 0;

@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "libavfilter/vf_nlmeans.c"
 
 static void display_integral(const uint32_t *ii, int w, int h, int lz_32)
@@ -54,8 +55,8 @@ int main(void)
     const int ii_lz_32 = ((ii_w + 1) + 3) & ~3;
 
     // "+1" is for the space of the top 0-line
-    uint32_t *ii  = av_mallocz_array(ii_h + 1, ii_lz_32 * sizeof(*ii));
-    uint32_t *ii2 = av_mallocz_array(ii_h + 1, ii_lz_32 * sizeof(*ii2));
+    uint32_t *ii  = av_calloc(ii_h + 1, ii_lz_32 * sizeof(*ii));
+    uint32_t *ii2 = av_calloc(ii_h + 1, ii_lz_32 * sizeof(*ii2));
 
     if (!ii || !ii2)
         return -1;

@@ -21,9 +21,10 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/mem.h"
+#include "libavutil/pixfmt.h"
 #include "libavcodec/av1.h"
 #include "libavcodec/av1_parse.h"
-#include "libavcodec/profiles.h"
+#include "libavcodec/defs.h"
 #include "libavcodec/put_bits.h"
 #include "av1.h"
 #include "avio.h"
@@ -33,8 +34,7 @@ static int av1_filter_obus(AVIOContext *pb, const uint8_t *buf,
                            int size, int *offset)
 {
     const uint8_t *start = buf, *end = buf + size;
-    int64_t obu_size;
-    int off, start_pos, type, temporal_id, spatial_id;
+    int off;
     enum {
         START_NOT_FOUND,
         START_FOUND,
@@ -44,6 +44,8 @@ static int av1_filter_obus(AVIOContext *pb, const uint8_t *buf,
 
     off = size = 0;
     while (buf < end) {
+        int64_t obu_size;
+        int start_pos, type, temporal_id, spatial_id;
         int len = parse_obu_header(buf, end - buf, &obu_size, &start_pos,
                                    &type, &temporal_id, &spatial_id);
         if (len < 0)
@@ -86,7 +88,7 @@ int ff_av1_filter_obus(AVIOContext *pb, const uint8_t *buf, int size)
 int ff_av1_filter_obus_buf(const uint8_t *in, uint8_t **out,
                            int *size, int *offset)
 {
-    AVIOContext pb;
+    FFIOContext pb;
     uint8_t *buf;
     int len, off, ret;
 
@@ -106,9 +108,9 @@ int ff_av1_filter_obus_buf(const uint8_t *in, uint8_t **out,
     if (!buf)
         return AVERROR(ENOMEM);
 
-    ffio_init_context(&pb, buf, len, 1, NULL, NULL, NULL, NULL);
+    ffio_init_write_context(&pb, buf, len);
 
-    ret = av1_filter_obus(&pb, in, *size, NULL);
+    ret = av1_filter_obus(&pb.pub, in, *size, NULL);
     av_assert1(ret == len);
 
     memset(buf + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
@@ -124,8 +126,8 @@ static inline void uvlc(GetBitContext *gb)
 {
     int leading_zeros = 0;
 
-    while (get_bits_left(gb)) {
-        if (get_bits1(gb))
+    while (leading_zeros < 32) {
+        if (get_bits_left(gb) < 1 || get_bits1(gb))
             break;
         leading_zeros++;
     }
@@ -140,12 +142,12 @@ static int parse_color_config(AV1SequenceParameters *seq_params, GetBitContext *
 {
     int twelve_bit = 0;
     int high_bitdepth = get_bits1(gb);
-    if (seq_params->profile == FF_PROFILE_AV1_PROFESSIONAL && high_bitdepth)
+    if (seq_params->profile == AV_PROFILE_AV1_PROFESSIONAL && high_bitdepth)
         twelve_bit = get_bits1(gb);
 
     seq_params->bitdepth = 8 + (high_bitdepth * 2) + (twelve_bit * 2);
 
-    if (seq_params->profile == FF_PROFILE_AV1_HIGH)
+    if (seq_params->profile == AV_PROFILE_AV1_HIGH)
         seq_params->monochrome = 0;
     else
         seq_params->monochrome = get_bits1(gb);
@@ -175,10 +177,10 @@ static int parse_color_config(AV1SequenceParameters *seq_params, GetBitContext *
     } else {
         seq_params->color_range = get_bits1(gb);
 
-        if (seq_params->profile == FF_PROFILE_AV1_MAIN) {
+        if (seq_params->profile == AV_PROFILE_AV1_MAIN) {
             seq_params->chroma_subsampling_x = 1;
             seq_params->chroma_subsampling_y = 1;
-        } else if (seq_params->profile == FF_PROFILE_AV1_HIGH) {
+        } else if (seq_params->profile == AV_PROFILE_AV1_HIGH) {
             seq_params->chroma_subsampling_x = 0;
             seq_params->chroma_subsampling_y = 0;
         } else {
@@ -333,13 +335,46 @@ static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_
 
 int ff_av1_parse_seq_header(AV1SequenceParameters *seq, const uint8_t *buf, int size)
 {
-    int64_t obu_size;
-    int start_pos, type, temporal_id, spatial_id;
+    int is_av1c;
 
     if (size <= 0)
         return AVERROR_INVALIDDATA;
 
+    is_av1c = !!(buf[0] & 0x80);
+    if (is_av1c) {
+        GetBitContext gb;
+        int ret, version = buf[0] & 0x7F;
+
+        if (version != 1 || size < 4)
+            return AVERROR_INVALIDDATA;
+
+        ret = init_get_bits8(&gb, buf, 4);
+        if (ret < 0)
+            return ret;
+
+        memset(seq, 0, sizeof(*seq));
+
+        skip_bits(&gb, 8);
+        seq->profile    = get_bits(&gb, 3);
+        seq->level      = get_bits(&gb, 5);
+        seq->tier       = get_bits(&gb, 1);
+        seq->bitdepth   = get_bits(&gb, 1) * 2 + 8;
+        seq->bitdepth  += get_bits(&gb, 1) * 2;
+        seq->monochrome               = get_bits(&gb, 1);
+        seq->chroma_subsampling_x     = get_bits(&gb, 1);
+        seq->chroma_subsampling_y     = get_bits(&gb, 1);
+        seq->chroma_sample_position   = get_bits(&gb, 2);
+        seq->color_primaries          = AVCOL_PRI_UNSPECIFIED;
+        seq->transfer_characteristics = AVCOL_TRC_UNSPECIFIED;
+        seq->matrix_coefficients      = AVCOL_SPC_UNSPECIFIED;
+
+        size -= 4;
+        buf  += 4;
+    }
+
     while (size > 0) {
+        int64_t obu_size;
+        int start_pos, type, temporal_id, spatial_id;
         int len = parse_obu_header(buf, size, &obu_size, &start_pos,
                                    &type, &temporal_id, &spatial_id);
         if (len < 0)
@@ -358,31 +393,43 @@ int ff_av1_parse_seq_header(AV1SequenceParameters *seq, const uint8_t *buf, int 
         buf  += len;
     }
 
-    return AVERROR_INVALIDDATA;
+    return is_av1c ? 0 : AVERROR_INVALIDDATA;
 }
 
-int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size)
+int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
+                       int write_seq_header)
 {
-    AVIOContext *seq_pb = NULL, *meta_pb = NULL;
+    AVIOContext *meta_pb;
     AV1SequenceParameters seq_params;
     PutBitContext pbc;
-    uint8_t header[4];
-    uint8_t *seq, *meta;
-    int64_t obu_size;
-    int start_pos, type, temporal_id, spatial_id;
+    uint8_t header[4], *meta;
+    const uint8_t *seq;
     int ret, nb_seq = 0, seq_size, meta_size;
 
     if (size <= 0)
         return AVERROR_INVALIDDATA;
 
-    ret = avio_open_dyn_buf(&seq_pb);
-    if (ret < 0)
-        return ret;
+    if (buf[0] & 0x80) {
+        // first bit is nonzero, the passed data does not consist purely of
+        // OBUs. Expect that the data is already in AV1CodecConfigurationRecord
+        // format.
+        int config_record_version = buf[0] & 0x7f;
+        if (config_record_version != 1 || size < 4) {
+            return AVERROR_INVALIDDATA;
+        }
+
+        avio_write(pb, buf, size);
+
+        return 0;
+    }
+
     ret = avio_open_dyn_buf(&meta_pb);
     if (ret < 0)
-        goto fail;
+        return ret;
 
     while (size > 0) {
+        int64_t obu_size;
+        int start_pos, type, temporal_id, spatial_id;
         int len = parse_obu_header(buf, size, &obu_size, &start_pos,
                                    &type, &temporal_id, &spatial_id);
         if (len < 0) {
@@ -401,7 +448,8 @@ int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size)
             if (ret < 0)
                 goto fail;
 
-            avio_write(seq_pb, buf, len);
+            seq      = buf;
+            seq_size = len;
             break;
         case AV1_OBU_METADATA:
             if (!obu_size) {
@@ -417,8 +465,7 @@ int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size)
         buf  += len;
     }
 
-    seq_size  = avio_get_dyn_buf(seq_pb, &seq);
-    if (!seq_size) {
+    if (!nb_seq) {
         ret = AVERROR_INVALIDDATA;
         goto fail;
     }
@@ -440,14 +487,15 @@ int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size)
     flush_put_bits(&pbc);
 
     avio_write(pb, header, sizeof(header));
-    avio_write(pb, seq, seq_size);
+    if (write_seq_header) {
+        avio_write(pb, seq, seq_size);
+    }
 
     meta_size = avio_get_dyn_buf(meta_pb, &meta);
     if (meta_size)
         avio_write(pb, meta, meta_size);
 
 fail:
-    ffio_free_dyn_buf(&seq_pb);
     ffio_free_dyn_buf(&meta_pb);
 
     return ret;

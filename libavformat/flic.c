@@ -34,6 +34,8 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 #define FLIC_FILE_MAGIC_1 0xAF11
@@ -96,8 +98,8 @@ static int flic_read_header(AVFormatContext *s)
     flic->frame_number = 0;
 
     /* load the whole header and pull out the width and height */
-    if (avio_read(pb, header, FLIC_HEADER_SIZE) != FLIC_HEADER_SIZE)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, header, FLIC_HEADER_SIZE)) < 0)
+        return ret;
 
     magic_number = AV_RL16(&header[4]);
     speed = AV_RL32(&header[0x10]);
@@ -130,9 +132,9 @@ static int flic_read_header(AVFormatContext *s)
     memcpy(st->codecpar->extradata, header, FLIC_HEADER_SIZE);
 
     /* peek at the preamble to detect TFTD videos - they seem to always start with an audio chunk */
-    if (avio_read(pb, preamble, FLIC_PREAMBLE_SIZE) != FLIC_PREAMBLE_SIZE) {
+    if ((ret = ffio_read_size(pb, preamble, FLIC_PREAMBLE_SIZE)) < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to peek at preamble\n");
-        return AVERROR(EIO);
+        return ret;
     }
 
     avio_seek(pb, -FLIC_PREAMBLE_SIZE, SEEK_CUR);
@@ -157,10 +159,9 @@ static int flic_read_header(AVFormatContext *s)
         ast->codecpar->codec_id = AV_CODEC_ID_PCM_U8;
         ast->codecpar->codec_tag = 0;
         ast->codecpar->sample_rate = FLIC_TFTD_SAMPLE_RATE;
-        ast->codecpar->channels = 1;
         ast->codecpar->bit_rate = st->codecpar->sample_rate * 8;
         ast->codecpar->bits_per_coded_sample = 8;
-        ast->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+        ast->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
         ast->codecpar->extradata_size = 0;
 
         /* Since the header information is incorrect we have to figure out the
@@ -202,14 +203,12 @@ static int flic_read_packet(AVFormatContext *s,
     int magic;
     int ret = 0;
     unsigned char preamble[FLIC_PREAMBLE_SIZE];
+    int64_t pos = avio_tell(pb);
 
     while (!packet_read && !avio_feof(pb)) {
 
-        if ((ret = avio_read(pb, preamble, FLIC_PREAMBLE_SIZE)) !=
-            FLIC_PREAMBLE_SIZE) {
-            ret = AVERROR(EIO);
+        if ((ret = ffio_read_size(pb, preamble, FLIC_PREAMBLE_SIZE)) < 0)
             break;
-        }
 
         size = AV_RL32(&preamble[0]);
         magic = AV_RL16(&preamble[4]);
@@ -219,15 +218,16 @@ static int flic_read_packet(AVFormatContext *s,
                 return ret;
 
             pkt->stream_index = flic->video_stream_index;
-            pkt->pts = flic->frame_number++;
-            pkt->pos = avio_tell(pb);
+            pkt->pos = pos;
             memcpy(pkt->data, preamble, FLIC_PREAMBLE_SIZE);
-            ret = avio_read(pb, pkt->data + FLIC_PREAMBLE_SIZE,
+            ret = ffio_read_size(pb, pkt->data + FLIC_PREAMBLE_SIZE,
                 size - FLIC_PREAMBLE_SIZE);
-            if (ret != size - FLIC_PREAMBLE_SIZE) {
-                ret = AVERROR(EIO);
-            }
+            pkt->flags = flic->frame_number == 0 ? AV_PKT_FLAG_KEY : 0;
+            pkt->pts = flic->frame_number;
+            if (flic->frame_number == 0)
+                av_add_index_entry(s->streams[flic->video_stream_index], pkt->pos, pkt->pts, pkt->size, 0, AVINDEX_KEYFRAME);
             packet_read = 1;
+            flic->frame_number++;
         } else if (magic == FLIC_TFTD_CHUNK_AUDIO) {
             if ((ret = av_new_packet(pkt, size)) < 0)
                 return ret;
@@ -236,13 +236,12 @@ static int flic_read_packet(AVFormatContext *s,
             avio_skip(pb, 10);
 
             pkt->stream_index = flic->audio_stream_index;
-            pkt->pos = avio_tell(pb);
-            ret = avio_read(pb, pkt->data, size);
+            pkt->pos = pos;
+            pkt->flags = AV_PKT_FLAG_KEY;
+            ret = ffio_read_size(pb, pkt->data, size);
 
-            if (ret != size) {
-                ret = AVERROR(EIO);
+            if (ret < 0)
                 break;
-            }
 
             packet_read = 1;
         } else {
@@ -254,11 +253,38 @@ static int flic_read_packet(AVFormatContext *s,
     return avio_feof(pb) ? AVERROR_EOF : ret;
 }
 
-AVInputFormat ff_flic_demuxer = {
-    .name           = "flic",
-    .long_name      = NULL_IF_CONFIG_SMALL("FLI/FLC/FLX animation"),
+static int flic_read_seek(AVFormatContext *s, int stream_index,
+                          int64_t pts, int flags)
+{
+    FlicDemuxContext *flic = s->priv_data;
+    AVStream *st = s->streams[stream_index];
+    FFStream *const sti = ffstream(st);
+    int64_t pos, ts;
+    int index;
+
+    if (!sti->index_entries || stream_index != flic->video_stream_index)
+        return -1;
+
+    index = av_index_search_timestamp(st, pts, flags);
+
+    if (index < 0)
+        index = av_index_search_timestamp(st, pts, flags ^ AVSEEK_FLAG_BACKWARD);
+    if (index < 0)
+        return -1;
+
+    pos = sti->index_entries[index].pos;
+    ts  = sti->index_entries[index].timestamp;
+    flic->frame_number = ts;
+    avio_seek(s->pb, pos, SEEK_SET);
+    return 0;
+}
+
+const FFInputFormat ff_flic_demuxer = {
+    .p.name         = "flic",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("FLI/FLC/FLX animation"),
     .priv_data_size = sizeof(FlicDemuxContext),
     .read_probe     = flic_probe,
     .read_header    = flic_read_header,
     .read_packet    = flic_read_packet,
+    .read_seek      = flic_read_seek,
 };

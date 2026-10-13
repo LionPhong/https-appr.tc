@@ -21,12 +21,13 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/intfloat.h"
-#include "libavutil/opt.h"
 #include "libavutil/mathematics.h"
-#include "libavutil/timecode.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "avio_internal.h"
 #include "internal.h"
 #include "gxf.h"
+#include "mux.h"
 
 #define GXF_SAMPLES_PER_FRAME 32768
 #define GXF_AUDIO_PACKET_SIZE 65536
@@ -134,12 +135,10 @@ static int gxf_find_lines_index(AVStream *st)
 
 static void gxf_write_padding(AVIOContext *pb, int64_t to_pad)
 {
-    for (; to_pad > 0; to_pad--) {
-        avio_w8(pb, 0);
-    }
+    ffio_fill(pb, 0, to_pad);
 }
 
-static int64_t updatePacketSize(AVIOContext *pb, int64_t pos)
+static int64_t update_packet_size(AVIOContext *pb, int64_t pos)
 {
     int64_t curpos;
     int size;
@@ -156,7 +155,7 @@ static int64_t updatePacketSize(AVIOContext *pb, int64_t pos)
     return curpos - pos;
 }
 
-static int64_t updateSize(AVIOContext *pb, int64_t pos)
+static int64_t update_size(AVIOContext *pb, int64_t pos)
 {
     int64_t curpos;
 
@@ -302,7 +301,7 @@ static int gxf_write_track_description(AVFormatContext *s, GXFStreamContext *sc,
     avio_w8(pb, 4);
     avio_wb32(pb, sc->fields);
 
-    return updateSize(pb, pos);
+    return update_size(pb, pos);
 }
 
 static int gxf_write_material_data_section(AVFormatContext *s)
@@ -353,7 +352,7 @@ static int gxf_write_material_data_section(AVFormatContext *s)
     avio_w8(pb, 4);
     avio_wb32(pb, avio_size(pb) / 1024);
 
-    return updateSize(pb, pos);
+    return update_size(pb, pos);
 }
 
 static int gxf_write_track_description_section(AVFormatContext *s)
@@ -370,7 +369,7 @@ static int gxf_write_track_description_section(AVFormatContext *s)
 
     gxf_write_track_description(s, &gxf->timecode_track, s->nb_streams);
 
-    return updateSize(pb, pos);
+    return update_size(pb, pos);
 }
 
 static int gxf_write_map_packet(AVFormatContext *s, int rewrite)
@@ -402,7 +401,7 @@ static int gxf_write_map_packet(AVFormatContext *s, int rewrite)
     gxf_write_material_data_section(s);
     gxf_write_track_description_section(s);
 
-    return updatePacketSize(pb, pos);
+    return update_packet_size(pb, pos);
 }
 
 static int gxf_write_flt_packet(AVFormatContext *s)
@@ -424,10 +423,9 @@ static int gxf_write_flt_packet(AVFormatContext *s)
             avio_wl32(pb, gxf->flt_entries[(i*fields_per_flt)>>1]);
     }
 
-    for (; i < 1000; i++)
-        avio_wl32(pb, 0);
+    ffio_fill(pb, 0, (1000 - i) * 4);
 
-    return updatePacketSize(pb, pos);
+    return update_packet_size(pb, pos);
 }
 
 static int gxf_write_umf_material_description(AVFormatContext *s)
@@ -542,13 +540,7 @@ static int gxf_write_umf_media_mpeg(AVIOContext *pb, AVStream *st)
 static int gxf_write_umf_media_timecode(AVIOContext *pb, int drop)
 {
     avio_wl32(pb, drop); /* drop frame */
-    avio_wl32(pb, 0); /* reserved */
-    avio_wl32(pb, 0); /* reserved */
-    avio_wl32(pb, 0); /* reserved */
-    avio_wl32(pb, 0); /* reserved */
-    avio_wl32(pb, 0); /* reserved */
-    avio_wl32(pb, 0); /* reserved */
-    avio_wl32(pb, 0); /* reserved */
+    ffio_fill(pb, 0, 7 * 4); /* reserved */
     return 32;
 }
 
@@ -559,13 +551,7 @@ static int gxf_write_umf_media_dv(AVIOContext *pb, GXFStreamContext *sc, AVStrea
     if (st->codecpar->format == AV_PIX_FMT_YUV420P)
         dv_umf_data |= 0x20; /* marks as DVCAM instead of DVPRO */
     avio_wl32(pb, dv_umf_data);
-    avio_wl32(pb, 0);
-    avio_wl32(pb, 0);
-    avio_wl32(pb, 0);
-    avio_wl32(pb, 0);
-    avio_wl32(pb, 0);
-    avio_wl32(pb, 0);
-    avio_wl32(pb, 0);
+    ffio_fill(pb, 0, 7 * 4);
     return 32;
 }
 
@@ -585,11 +571,10 @@ static int gxf_write_umf_media_description(AVFormatContext *s)
     GXFContext *gxf = s->priv_data;
     AVIOContext *pb = s->pb;
     int64_t pos;
-    int i, j;
 
     pos = avio_tell(pb);
     gxf->umf_media_offset = pos - gxf->umf_start_offset;
-    for (i = 0; i <= s->nb_streams; ++i) {
+    for (unsigned i = 0; i <= s->nb_streams; ++i) {
         GXFStreamContext *sc;
         int64_t startpos, curpos;
 
@@ -609,8 +594,7 @@ static int gxf_write_umf_media_description(AVFormatContext *s)
         avio_wl32(pb, gxf->nb_fields); /* mark out */
         avio_write(pb, ES_NAME_PATTERN, strlen(ES_NAME_PATTERN));
         avio_wb16(pb, sc->media_info);
-        for (j = strlen(ES_NAME_PATTERN)+2; j < 88; j++)
-            avio_w8(pb, 0);
+        ffio_fill(pb, 0, 88 - (strlen(ES_NAME_PATTERN) + 2));
         avio_wl32(pb, sc->track_type);
         avio_wl32(pb, sc->sample_rate);
         avio_wl32(pb, sc->sample_size);
@@ -660,7 +644,7 @@ static int gxf_write_umf_packet(AVFormatContext *s)
     gxf->umf_track_size = gxf_write_umf_track_description(s);
     gxf->umf_media_size = gxf_write_umf_media_description(s);
     gxf->umf_length = avio_tell(pb) - gxf->umf_start_offset;
-    return updatePacketSize(pb, pos);
+    return update_packet_size(pb, pos);
 }
 
 static void gxf_init_timecode_track(GXFStreamContext *sc, GXFStreamContext *vsc)
@@ -685,8 +669,11 @@ static int gxf_init_timecode(AVFormatContext *s, GXFTimecode *tc, const char *tc
     if (sscanf(tcstr, "%d:%d:%d%c%d", &tc->hh, &tc->mm, &tc->ss, &c, &tc->ff) != 5) {
         av_log(s, AV_LOG_ERROR, "unable to parse timecode, "
                                 "syntax: hh:mm:ss[:;.]ff\n");
-        return -1;
+        return AVERROR(EINVAL);
     }
+
+    if (tc->hh > 31U  || tc->mm > 255U || tc->ss > 255U || tc->ff > (255U >> (fields == 2)))
+        return AVERROR(EINVAL);
 
     tc->color = 0;
     tc->drop = c != ':';
@@ -709,7 +696,7 @@ static int gxf_write_header(AVFormatContext *s)
 
     if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         av_log(s, AV_LOG_ERROR, "gxf muxer does not support streamed output, patch welcome\n");
-        return -1;
+        return AVERROR_PATCHWELCOME;
     }
 
     gxf->flags |= 0x00080000; /* material is simple clip */
@@ -724,15 +711,15 @@ static int gxf_write_header(AVFormatContext *s)
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (st->codecpar->codec_id != AV_CODEC_ID_PCM_S16LE) {
                 av_log(s, AV_LOG_ERROR, "only 16 BIT PCM LE allowed for now\n");
-                return -1;
+                return AVERROR(EINVAL);
             }
             if (st->codecpar->sample_rate != 48000) {
                 av_log(s, AV_LOG_ERROR, "only 48000hz sampling rate is allowed\n");
-                return -1;
+                return AVERROR(EINVAL);
             }
-            if (st->codecpar->channels != 1) {
+            if (st->codecpar->ch_layout.nb_channels != 1) {
                 av_log(s, AV_LOG_ERROR, "only mono tracks are allowed\n");
-                return -1;
+                return AVERROR(EINVAL);
             }
             ret = ff_stream_add_bitstream_filter(st, "pcm_rechunk", "n="AV_STRINGIFY(GXF_SAMPLES_PER_FRAME));
             if (ret < 0)
@@ -750,7 +737,7 @@ static int gxf_write_header(AVFormatContext *s)
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (i != 0) {
                 av_log(s, AV_LOG_ERROR, "video stream must be the first track\n");
-                return -1;
+                return AVERROR(EINVAL);
             }
             /* FIXME check from time_base ? */
             if (st->codecpar->height == 480 || st->codecpar->height == 512) { /* NTSC or NTSC+VBI */
@@ -767,7 +754,7 @@ static int gxf_write_header(AVFormatContext *s)
             } else {
                 av_log(s, AV_LOG_ERROR, "unsupported video resolution, "
                        "gxf muxer only accepts PAL or NTSC resolutions currently\n");
-                return -1;
+                return AVERROR(EINVAL);
             }
             if (!tcr)
                 tcr = av_dict_get(st->metadata, "timecode", NULL, 0);
@@ -819,8 +806,11 @@ static int gxf_write_header(AVFormatContext *s)
         sc->order = s->nb_streams - st->index;
     }
 
-    if (tcr && vsc)
-        gxf_init_timecode(s, &gxf->tc, tcr->value, vsc->fields);
+    if (tcr && vsc) {
+        ret = gxf_init_timecode(s, &gxf->tc, tcr->value, vsc->fields);
+        if (ret < 0)
+            return ret;
+    }
 
     gxf_init_timecode_track(&gxf->timecode_track, vsc);
     gxf->flags |= 0x200000; // time code track is non-drop frame
@@ -840,7 +830,7 @@ static int gxf_write_eos_packet(AVIOContext *pb)
     int64_t pos = avio_tell(pb);
 
     gxf_write_packet_header(pb, PKT_EOS);
-    return updatePacketSize(pb, pos);
+    return update_packet_size(pb, pos);
 }
 
 static int gxf_write_trailer(AVFormatContext *s)
@@ -888,7 +878,7 @@ static int gxf_parse_mpeg_frame(GXFStreamContext *sc, const uint8_t *buf, int si
         if(c == 0x1B8 && sc->first_gop_closed == -1) /* GOP start code */
             sc->first_gop_closed= (buf[i+4]>>6)&1;
     }
-    return (buf[i+1]>>3)&7;
+    return i + 1 < size ? (buf[i+1]>>3)&7 : 0;
 }
 
 static int gxf_write_media_preamble(AVFormatContext *s, AVPacket *pkt, int size)
@@ -973,7 +963,7 @@ static int gxf_write_packet(AVFormatContext *s, AVPacket *pkt)
         gxf->nb_fields += 2; // count fields
     }
 
-    updatePacketSize(pb, pos);
+    update_packet_size(pb, pos);
 
     gxf->packet_count++;
     if (gxf->packet_count == 100) {
@@ -1008,10 +998,11 @@ static int gxf_compare_field_nb(AVFormatContext *s, const AVPacket *next,
         (field_nb[1] == field_nb[0] && sc[1]->order > sc[0]->order);
 }
 
-static int gxf_interleave_packet(AVFormatContext *s, AVPacket *out, AVPacket *pkt, int flush)
+static int gxf_interleave_packet(AVFormatContext *s, AVPacket *pkt,
+                                 int flush, int has_packet)
 {
     int ret;
-    if (pkt) {
+    if (has_packet) {
         AVStream *st = s->streams[pkt->stream_index];
         GXFStreamContext *sc = st->priv_data;
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
@@ -1022,16 +1013,16 @@ static int gxf_interleave_packet(AVFormatContext *s, AVPacket *out, AVPacket *pk
         if ((ret = ff_interleave_add_packet(s, pkt, gxf_compare_field_nb)) < 0)
             return ret;
     }
-    return ff_interleave_packet_per_dts(s, out, NULL, flush);
+    return ff_interleave_packet_per_dts(s, pkt, flush, 0);
 }
 
-AVOutputFormat ff_gxf_muxer = {
-    .name              = "gxf",
-    .long_name         = NULL_IF_CONFIG_SMALL("GXF (General eXchange Format)"),
-    .extensions        = "gxf",
+const FFOutputFormat ff_gxf_muxer = {
+    .p.name            = "gxf",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("GXF (General eXchange Format)"),
+    .p.extensions      = "gxf",
     .priv_data_size    = sizeof(GXFContext),
-    .audio_codec       = AV_CODEC_ID_PCM_S16LE,
-    .video_codec       = AV_CODEC_ID_MPEG2VIDEO,
+    .p.audio_codec     = AV_CODEC_ID_PCM_S16LE,
+    .p.video_codec     = AV_CODEC_ID_MPEG2VIDEO,
     .write_header      = gxf_write_header,
     .write_packet      = gxf_write_packet,
     .write_trailer     = gxf_write_trailer,

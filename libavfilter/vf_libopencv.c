@@ -24,34 +24,30 @@
  */
 
 #include "config.h"
-#if HAVE_OPENCV2_CORE_CORE_C_H
 #include <opencv2/core/core_c.h>
 #include <opencv2/imgproc/imgproc_c.h>
-#else
-#include <opencv/cv.h>
-#include <opencv/cxcore.h>
-#endif
+#include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/common.h"
 #include "libavutil/file.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
-static void fill_iplimage_from_frame(IplImage *img, const AVFrame *frame, enum AVPixelFormat pixfmt)
+static void fill_iplimage_from_frame(IplImage **_img, const AVFrame *frame, enum AVPixelFormat pixfmt)
 {
-    IplImage *tmpimg;
+    IplImage *img;
     int depth, channels_nb;
 
     if      (pixfmt == AV_PIX_FMT_GRAY8) { depth = IPL_DEPTH_8U;  channels_nb = 1; }
     else if (pixfmt == AV_PIX_FMT_BGRA)  { depth = IPL_DEPTH_8U;  channels_nb = 4; }
     else if (pixfmt == AV_PIX_FMT_BGR24) { depth = IPL_DEPTH_8U;  channels_nb = 3; }
-    else return;
+    else av_unreachable("unsupported pix fmt");
 
-    tmpimg = cvCreateImageHeader((CvSize){frame->width, frame->height}, depth, channels_nb);
-    *img = *tmpimg;
+    *_img = img = cvCreateImageHeader((CvSize){frame->width, frame->height}, depth, channels_nb);
     img->imageData = img->imageDataOrigin = frame->data[0];
     img->dataOrder = IPL_DATA_ORDER_PIXEL;
     img->origin    = IPL_ORIGIN_TL;
@@ -62,17 +58,6 @@ static void fill_frame_from_iplimage(AVFrame *frame, const IplImage *img, enum A
 {
     frame->linesize[0] = img->widthStep;
     frame->data[0]     = img->imageData;
-}
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
 }
 
 typedef struct OCVContext {
@@ -145,16 +130,20 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
                                 void *log_ctx)
 {
     uint8_t *buf, *p, *pend;
-    size_t size;
-    int ret, i, j, w;
+    size_t size, i;
+    int ret, j, w;
 
     if ((ret = av_file_map(filename, &buf, &size, 0, log_ctx)) < 0)
         return ret;
 
-    /* prescan file to get the number of lines and the maximum width */
+    /* the file alone defines the size of the shape */
+    *cols = *rows = 0;
+
+    /* prescan file to get the number of lines and the maximum width,
+     * the last line need not be newline terminated */
     w = 0;
-    for (i = 0; i < size; i++) {
-        if (buf[i] == '\n') {
+    for (i = 0; i < size || w; i++) {
+        if (i == size || buf[i] == '\n') {
             if (*rows == INT_MAX) {
                 av_log(log_ctx, AV_LOG_ERROR, "Overflow on the number of rows in the file\n");
                 ret = AVERROR_INVALIDDATA;
@@ -165,9 +154,15 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
             w = 0;
         } else if (w == INT_MAX) {
             av_log(log_ctx, AV_LOG_ERROR, "Overflow on the number of columns in the file\n");
-            return AVERROR_INVALIDDATA;
-        }
-        w++;
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        } else
+            w++;
+    }
+    if (*cols == 0) {
+        av_log(log_ctx, AV_LOG_ERROR, "No columns in the shape file\n");
+        ret = AVERROR_INVALIDDATA;
+        goto end;
     }
     if (*rows > (SIZE_MAX / sizeof(int) / *cols)) {
         av_log(log_ctx, AV_LOG_ERROR, "File with size %dx%d is too big\n",
@@ -175,7 +170,7 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
-    if (!(*values = av_mallocz_array(sizeof(int) * *rows, *cols))) {
+    if (!(*values = av_calloc(*cols, sizeof(**values) * *rows))) {
         ret = AVERROR(ENOMEM);
         goto end;
     }
@@ -195,6 +190,8 @@ static int read_shape_from_file(int *cols, int *rows, int **values, const char *
 
 end:
     av_file_unmap(buf, size);
+    if (ret < 0)
+        return ret;
 
 #ifdef DEBUG
     {
@@ -205,7 +202,7 @@ end:
             for (j = 0; j < *cols; j++)
                 line[j] = (*values)[i * *cols + j] ? '@' : ' ';
             line[j] = 0;
-            av_log(log_ctx, AV_LOG_DEBUG, "%3d: %s\n", i, line);
+            av_log(log_ctx, AV_LOG_DEBUG, "%3zu: %s\n", i, line);
         }
         av_free(line);
     }
@@ -220,7 +217,7 @@ static int parse_iplconvkernel(IplConvKernel **kernel, char *buf, void *log_ctx)
     int cols = 0, rows = 0, anchor_x = 0, anchor_y = 0, shape = CV_SHAPE_RECT;
     int *values = NULL, ret = 0;
 
-    sscanf(buf, "%dx%d+%dx%d/%32[^=]=%127s", &cols, &rows, &anchor_x, &anchor_y, shape_str, shape_filename);
+    sscanf(buf, "%dx%d+%dx%d/%31[^=]=%127s", &cols, &rows, &anchor_x, &anchor_y, shape_str, shape_filename);
 
     if      (!strcmp(shape_str, "rect"   )) shape = CV_SHAPE_RECT;
     else if (!strcmp(shape_str, "cross"  )) shape = CV_SHAPE_CROSS;
@@ -228,7 +225,7 @@ static int parse_iplconvkernel(IplConvKernel **kernel, char *buf, void *log_ctx)
     else if (!strcmp(shape_str, "custom" )) {
         shape = CV_SHAPE_CUSTOM;
         if ((ret = read_shape_from_file(&cols, &rows, &values, shape_filename, log_ctx)) < 0)
-            return ret;
+            goto out;
     } else {
         av_log(log_ctx, AV_LOG_ERROR,
                "Shape unspecified or type '%s' unknown.\n", shape_str);
@@ -309,6 +306,8 @@ static av_cold void dilate_uninit(AVFilterContext *ctx)
     OCVContext *s = ctx->priv;
     DilateContext *dilate = s->priv;
 
+    if (!dilate)
+        return;
     cvReleaseStructuringElement(&dilate->kernel);
 }
 
@@ -381,7 +380,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     OCVContext *s = ctx->priv;
     AVFilterLink *outlink= inlink->dst->outputs[0];
     AVFrame *out;
-    IplImage inimg, outimg;
+    IplImage *inimg, *outimg;
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
@@ -392,10 +391,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     fill_iplimage_from_frame(&inimg , in , inlink->format);
     fill_iplimage_from_frame(&outimg, out, inlink->format);
-    s->end_frame_filter(ctx, &inimg, &outimg);
-    fill_frame_from_iplimage(out, &outimg, inlink->format);
+    s->end_frame_filter(ctx, inimg, outimg);
+    fill_frame_from_iplimage(out, outimg, inlink->format);
 
     av_frame_free(&in);
+    cvReleaseImageHeader(&inimg);
+    cvReleaseImageHeader(&outimg);
 
     return ff_filter_frame(outlink, out);
 }
@@ -416,7 +417,6 @@ static const AVFilterPad avfilter_vf_ocv_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad avfilter_vf_ocv_outputs[] = {
@@ -424,17 +424,16 @@ static const AVFilterPad avfilter_vf_ocv_outputs[] = {
         .name = "default",
         .type = AVMEDIA_TYPE_VIDEO,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_ocv = {
-    .name          = "ocv",
-    .description   = NULL_IF_CONFIG_SMALL("Apply transform using libopencv."),
+const FFFilter ff_vf_ocv = {
+    .p.name        = "ocv",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply transform using libopencv."),
+    .p.priv_class  = &ocv_class,
     .priv_size     = sizeof(OCVContext),
-    .priv_class    = &ocv_class,
-    .query_formats = query_formats,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = avfilter_vf_ocv_inputs,
-    .outputs       = avfilter_vf_ocv_outputs,
+    FILTER_INPUTS(avfilter_vf_ocv_inputs),
+    FILTER_OUTPUTS(avfilter_vf_ocv_outputs),
+    FILTER_PIXFMTS(AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8),
 };

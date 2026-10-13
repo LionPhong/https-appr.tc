@@ -28,9 +28,11 @@
 
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavcodec/apng.h"
 #include "libavcodec/png.h"
@@ -127,7 +129,7 @@ static int append_extradata(AVCodecParameters *par, AVIOContext *pb, int len)
     int new_size, ret;
     uint8_t *new_extradata;
 
-    if (previous_size > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE - len)
+    if (len > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE - previous_size)
         return AVERROR_INVALIDDATA;
 
     new_size = previous_size + len;
@@ -138,7 +140,7 @@ static int append_extradata(AVCodecParameters *par, AVIOContext *pb, int len)
     par->extradata = new_extradata;
     par->extradata_size = new_size;
 
-    if ((ret = avio_read(pb, par->extradata + previous_size, len)) < 0)
+    if ((ret = ffio_read_size(pb, par->extradata + previous_size, len)) < 0)
         return ret;
 
     return previous_size;
@@ -151,17 +153,17 @@ static int apng_read_header(AVFormatContext *s)
     uint32_t len, tag;
     AVStream *st;
     int acTL_found = 0;
-    int64_t ret = AVERROR_INVALIDDATA;
+    int64_t ret;
 
     /* verify PNGSIG */
     if (avio_rb64(pb) != PNGSIG)
-        return ret;
+        return AVERROR_INVALIDDATA;
 
     /* parse IHDR (must be first chunk) */
     len = avio_rb32(pb);
     tag = avio_rl32(pb);
     if (len != 13 || tag != MKTAG('I', 'H', 'D', 'R'))
-        return ret;
+        return AVERROR_INVALIDDATA;
 
     st = avformat_new_stream(s, NULL);
     if (!st)
@@ -185,40 +187,33 @@ static int apng_read_header(AVFormatContext *s)
     AV_WL32(st->codecpar->extradata+4,  tag);
     AV_WB32(st->codecpar->extradata+8,  st->codecpar->width);
     AV_WB32(st->codecpar->extradata+12, st->codecpar->height);
-    if ((ret = avio_read(pb, st->codecpar->extradata+16, 9)) < 0)
-        goto fail;
+    if ((ret = ffio_read_size(pb, st->codecpar->extradata + 16, 9)) < 0)
+        return ret;
 
-    while (!avio_feof(pb)) {
+    while (1) {
         if (acTL_found && ctx->num_play != 1) {
             int64_t size   = avio_size(pb);
             int64_t offset = avio_tell(pb);
-            if (size < 0) {
-                ret = size;
-                goto fail;
-            } else if (offset < 0) {
-                ret = offset;
-                goto fail;
-            } else if ((ret = ffio_ensure_seekback(pb, size - offset)) < 0) {
+            if (size < 0 || offset < 0 ||
+                (ret = ffio_ensure_seekback(pb, size - offset)) < 0) {
                 av_log(s, AV_LOG_WARNING, "Could not ensure seekback, will not loop\n");
                 ctx->num_play = 1;
             }
         }
         if ((ctx->num_play == 1 || !acTL_found) &&
             ((ret = ffio_ensure_seekback(pb, 4 /* len */ + 4 /* tag */)) < 0))
-            goto fail;
+            return ret;
 
         len = avio_rb32(pb);
-        if (len > 0x7fffffff) {
-            ret = AVERROR_INVALIDDATA;
-            goto fail;
-        }
+        if (len > INT_MAX - 12)
+            return AVERROR_INVALIDDATA;
 
         tag = avio_rl32(pb);
         switch (tag) {
         case MKTAG('a', 'c', 'T', 'L'):
             if ((ret = avio_seek(pb, -8, SEEK_CUR)) < 0 ||
                 (ret = append_extradata(st->codecpar, pb, len + 12)) < 0)
-                goto fail;
+                return ret;
             acTL_found = 1;
             ctx->num_frames = AV_RB32(st->codecpar->extradata + ret + 8);
             ctx->num_play   = AV_RB32(st->codecpar->extradata + ret + 12);
@@ -226,25 +221,21 @@ static int apng_read_header(AVFormatContext *s)
                                     ctx->num_frames, ctx->num_play);
             break;
         case MKTAG('f', 'c', 'T', 'L'):
-            if (!acTL_found) {
-               ret = AVERROR_INVALIDDATA;
-               goto fail;
+            if (!acTL_found || len != APNG_FCTL_CHUNK_SIZE) {
+                return AVERROR_INVALIDDATA;
             }
             if ((ret = avio_seek(pb, -8, SEEK_CUR)) < 0)
-                goto fail;
+                return ret;
             return 0;
         default:
             if ((ret = avio_seek(pb, -8, SEEK_CUR)) < 0 ||
                 (ret = append_extradata(st->codecpar, pb, len + 12)) < 0)
-                goto fail;
+                return ret;
         }
     }
-
-fail:
-    return ret;
 }
 
-static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx, AVPacket *pkt)
+static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx)
 {
     uint32_t sequence_number, width, height, x_offset, y_offset;
     uint16_t delay_num, delay_den;
@@ -282,7 +273,7 @@ static int decode_fctl_chunk(AVFormatContext *s, APNGDemuxContext *ctx, AVPacket
             "delay_den: %"PRIu16", "
             "dispose_op: %d, "
             "blend_op: %d\n",
-            __FUNCTION__,
+            __func__,
             sequence_number,
             width,
             height,
@@ -344,18 +335,21 @@ static int apng_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     switch (tag) {
     case MKTAG('f', 'c', 'T', 'L'):
-        if (len != 26)
+        if (len != APNG_FCTL_CHUNK_SIZE)
             return AVERROR_INVALIDDATA;
 
-        if ((ret = decode_fctl_chunk(s, ctx, pkt)) < 0)
+        if ((ret = decode_fctl_chunk(s, ctx)) < 0)
             return ret;
 
-        /* fcTL must precede fdAT or IDAT */
+        /* fcTL may be followed by other chunks before fdAT or IDAT */
         len = avio_rb32(pb);
         tag = avio_rl32(pb);
-        if (len > 0x7fffffff ||
-            tag != MKTAG('f', 'd', 'A', 'T') &&
-            tag != MKTAG('I', 'D', 'A', 'T'))
+        if (len > 0x7fffffff)
+            return AVERROR_INVALIDDATA;
+
+        /* check for empty frame */
+        if (tag == MKTAG('f', 'c', 'T', 'L') ||
+            tag == MKTAG('I', 'E', 'N', 'D'))
             return AVERROR_INVALIDDATA;
 
         size = 38 /* fcTL */ + 8 /* len, tag */ + len + 4 /* crc */;
@@ -429,13 +423,13 @@ static const AVClass demuxer_class = {
     .category   = AV_CLASS_CATEGORY_DEMUXER,
 };
 
-AVInputFormat ff_apng_demuxer = {
-    .name           = "apng",
-    .long_name      = NULL_IF_CONFIG_SMALL("Animated Portable Network Graphics"),
+const FFInputFormat ff_apng_demuxer = {
+    .p.name         = "apng",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Animated Portable Network Graphics"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &demuxer_class,
     .priv_data_size = sizeof(APNGDemuxContext),
     .read_probe     = apng_probe,
     .read_header    = apng_read_header,
     .read_packet    = apng_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .priv_class     = &demuxer_class,
 };

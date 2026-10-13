@@ -29,9 +29,13 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "formats.h"
+#include "video.h"
 
 #define MAX_NB_THREADS 32
 #define NB_PLANES 4
@@ -52,6 +56,7 @@ typedef struct GEQContext {
     AVFrame *picref;            ///< current input buffer
     uint8_t *dst;               ///< reference pointer to the 8bits output
     uint16_t *dst16;            ///< reference pointer to the 16bits output
+    float *dst32;               ///< reference pointer to the 32bits output
     double values[VAR_VARS_NB]; ///< expression values
     int hsub, vsub;             ///< chroma subsampling
     int planes;                 ///< number of planes
@@ -83,12 +88,12 @@ static const AVOption geq_options[] = {
     { "g",          "set green expression",       OFFSET(expr_str[G]), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
     { "blue_expr",  "set blue expression",        OFFSET(expr_str[B]), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
     { "b",          "set blue expression",        OFFSET(expr_str[B]), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
-    { "interpolation","set interpolation method", OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=INTERP_BILINEAR}, 0, NB_INTERP-1, FLAGS, "interp" },
-    { "i",          "set interpolation method",   OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=INTERP_BILINEAR}, 0, NB_INTERP-1, FLAGS, "interp" },
-    { "nearest",    "nearest interpolation",      0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_NEAREST},  0, 0, FLAGS, "interp" },
-    { "n",          "nearest interpolation",      0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_NEAREST},  0, 0, FLAGS, "interp" },
-    { "bilinear",   "bilinear interpolation",     0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_BILINEAR}, 0, 0, FLAGS, "interp" },
-    { "b",          "bilinear interpolation",     0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_BILINEAR}, 0, 0, FLAGS, "interp" },
+    { "interpolation","set interpolation method", OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=INTERP_BILINEAR}, 0, NB_INTERP-1, FLAGS, .unit = "interp" },
+    { "i",          "set interpolation method",   OFFSET(interpolation), AV_OPT_TYPE_INT, {.i64=INTERP_BILINEAR}, 0, NB_INTERP-1, FLAGS, .unit = "interp" },
+    { "nearest",    "nearest interpolation",      0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_NEAREST},  0, 0, FLAGS, .unit = "interp" },
+    { "n",          "nearest interpolation",      0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_NEAREST},  0, 0, FLAGS, .unit = "interp" },
+    { "bilinear",   "bilinear interpolation",     0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_BILINEAR}, 0, 0, FLAGS, .unit = "interp" },
+    { "b",          "bilinear interpolation",     0,                   AV_OPT_TYPE_CONST, {.i64=INTERP_BILINEAR}, 0, 0, FLAGS, .unit = "interp" },
     {NULL},
 };
 
@@ -108,35 +113,52 @@ static inline double getpix(void *priv, double x, double y, int plane)
         return 0;
 
     if (geq->interpolation == INTERP_BILINEAR) {
-        xi = x = av_clipd(x, 0, w - 2);
-        yi = y = av_clipd(y, 0, h - 2);
+        int xn, yn;
+
+        xi = x = av_clipd(x, 0, w - 1);
+        yi = y = av_clipd(y, 0, h - 1);
+        xn = FFMIN(xi + 1, w - 1);
+        yn = FFMIN(yi + 1, h - 1);
 
         x -= xi;
         y -= yi;
 
-        if (geq->bps > 8) {
+        if (geq->bps > 8 && geq->bps <= 16) {
             const uint16_t *src16 = (const uint16_t*)src;
             linesize /= 2;
 
-            return (1-y)*((1-x)*src16[xi +  yi    * linesize] + x*src16[xi + 1 +  yi    * linesize])
-                  +   y *((1-x)*src16[xi + (yi+1) * linesize] + x*src16[xi + 1 + (yi+1) * linesize]);
-        } else {
-            return (1-y)*((1-x)*src[xi +  yi    * linesize] + x*src[xi + 1 +  yi    * linesize])
-                  +   y *((1-x)*src[xi + (yi+1) * linesize] + x*src[xi + 1 + (yi+1) * linesize]);
+            return (1-y)*((1-x)*src16[xi + yi * linesize] + x*src16[xn + yi * linesize])
+                  +   y *((1-x)*src16[xi + yn * linesize] + x*src16[xn + yn * linesize]);
+        } else if (geq->bps == 32) {
+            const float *src32 = (const float*)src;
+            linesize /= 4;
+
+            return (1-y)*((1-x)*src32[xi + yi * linesize] + x*src32[xn + yi * linesize])
+                  +   y *((1-x)*src32[xi + yn * linesize] + x*src32[xn + yn * linesize]);
+        } else if (geq->bps == 8) {
+            return (1-y)*((1-x)*src[xi + yi * linesize] + x*src[xn + yi * linesize])
+                  +   y *((1-x)*src[xi + yn * linesize] + x*src[xn + yn * linesize]);
         }
     } else {
         xi = av_clipd(x, 0, w - 1);
         yi = av_clipd(y, 0, h - 1);
 
-        if (geq->bps > 8) {
+        if (geq->bps > 8 && geq->bps <= 16) {
             const uint16_t *src16 = (const uint16_t*)src;
             linesize /= 2;
 
             return src16[xi + yi * linesize];
-        } else {
+        } else if (geq->bps == 32) {
+            const float *src32 = (const float*)src;
+            linesize /= 4;
+
+            return src32[xi + yi * linesize];
+        } else if (geq->bps == 8) {
             return src[xi + yi * linesize];
         }
     }
+
+    return 0;
 }
 
 static int calculate_sums(GEQContext *geq, int plane, int w, int h)
@@ -150,10 +172,12 @@ static int calculate_sums(GEQContext *geq, int plane, int w, int h)
         geq->pixel_sums[plane] = av_malloc_array(w, h * sizeof (*geq->pixel_sums[plane]));
     if (!geq->pixel_sums[plane])
         return AVERROR(ENOMEM);
-    if (geq->bps > 8)
+    if (geq->bps == 32)
+        linesize /= 4;
+    else if (geq->bps > 8 && geq->bps <= 16)
         linesize /= 2;
     for (yi = 0; yi < h; yi ++) {
-        if (geq->bps > 8) {
+        if (geq->bps > 8 && geq->bps <= 16) {
             const uint16_t *src16 = (const uint16_t*)src;
             double linesum = 0;
 
@@ -161,11 +185,19 @@ static int calculate_sums(GEQContext *geq, int plane, int w, int h)
                 linesum += src16[xi + yi * linesize];
                 geq->pixel_sums[plane][xi + yi * w] = linesum;
             }
-        } else {
+        } else if (geq->bps == 8) {
             double linesum = 0;
 
             for (xi = 0; xi < w; xi ++) {
                 linesum += src[xi + yi * linesize];
+                geq->pixel_sums[plane][xi + yi * w] = linesum;
+            }
+        } else if (geq->bps == 32) {
+            const float *src32 = (const float*)src;
+            double linesum = 0;
+
+            for (xi = 0; xi < w; xi ++) {
+                linesum += src32[xi + yi * linesize];
                 geq->pixel_sums[plane][xi + yi * w] = linesum;
             }
         }
@@ -249,10 +281,10 @@ static av_cold int geq_init(AVFilterContext *ctx)
         if (!geq->expr_str[V]) geq->expr_str[V] = av_strdup(geq->expr_str[U]);
     }
 
-    if (!geq->expr_str[A]) {
-        char bps_string[8];
-        snprintf(bps_string, sizeof(bps_string), "%d", (1<<geq->bps) - 1);
-        geq->expr_str[A] = av_strdup(bps_string);
+    if (!geq->expr_str[A] && geq->bps != 32) {
+        geq->expr_str[A] = av_asprintf("%d", (1<<geq->bps) - 1);
+    } else if (!geq->expr_str[A]) {
+        geq->expr_str[A] = av_asprintf("%f", 1.f);
     }
     if (!geq->expr_str[G])
         geq->expr_str[G] = av_strdup("g(X,Y)");
@@ -270,7 +302,7 @@ static av_cold int geq_init(AVFilterContext *ctx)
     }
 
     for (plane = 0; plane < NB_PLANES; plane++) {
-        static double (*p[])(void *, double, double) = {
+        static double (*const p[])(void *, double, double) = {
             lum   , cb   , cr   , alpha   ,
             lumsum, cbsum, crsub, alphasum,
         };
@@ -283,7 +315,7 @@ static av_cold int geq_init(AVFilterContext *ctx)
             "gsum", "bsum", "rsum", "alphasum", "psum",
             NULL };
         const char *const *func2_names       = geq->is_rgb ? func2_rgb_names : func2_yuv_names;
-        double (*func2[])(void *, double, double) = {
+        double (*const func2[])(void *, double, double) = {
             lum   , cb   , cr   , alpha   , p[plane],
             lumsum, cbsum, crsub, alphasum, p[plane + 4],
             NULL };
@@ -304,9 +336,11 @@ end:
     return ret;
 }
 
-static int geq_query_formats(AVFilterContext *ctx)
+static int geq_query_formats(const AVFilterContext *ctx,
+                             AVFilterFormatsConfig **cfg_in,
+                             AVFilterFormatsConfig **cfg_out)
 {
-    GEQContext *geq = ctx->priv;
+    const GEQContext *geq = ctx->priv;
     static const enum AVPixelFormat yuv_pix_fmts[] = {
         AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
         AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
@@ -324,6 +358,7 @@ static int geq_query_formats(AVFilterContext *ctx)
         AV_PIX_FMT_YUV444P16,  AV_PIX_FMT_YUV422P16,  AV_PIX_FMT_YUV420P16,
         AV_PIX_FMT_YUVA444P16, AV_PIX_FMT_YUVA422P16, AV_PIX_FMT_YUVA420P16,
         AV_PIX_FMT_GRAY16,
+        AV_PIX_FMT_GRAYF32,
         AV_PIX_FMT_NONE
     };
     static const enum AVPixelFormat rgb_pix_fmts[] = {
@@ -333,17 +368,12 @@ static int geq_query_formats(AVFilterContext *ctx)
         AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRAP12,
         AV_PIX_FMT_GBRP14,
         AV_PIX_FMT_GBRP16, AV_PIX_FMT_GBRAP16,
+        AV_PIX_FMT_GBRPF32, AV_PIX_FMT_GBRAPF32,
         AV_PIX_FMT_NONE
     };
-    AVFilterFormats *fmts_list;
+    const enum AVPixelFormat *pix_fmts = geq->is_rgb ? rgb_pix_fmts : yuv_pix_fmts;
 
-    if (geq->is_rgb) {
-        fmts_list = ff_make_format_list(rgb_pix_fmts);
-    } else
-        fmts_list = ff_make_format_list(yuv_pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
+    return ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
 }
 
 static int geq_config_props(AVFilterLink *inlink)
@@ -375,8 +405,8 @@ static int slice_geq_filter(AVFilterContext *ctx, void *arg, int jobnr, int nb_j
     const int width = td->width;
     const int plane = td->plane;
     const int linesize = td->linesize;
-    const int slice_start = (height *  jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
     int x, y;
 
     double values[VAR_VARS_NB];
@@ -398,7 +428,7 @@ static int slice_geq_filter(AVFilterContext *ctx, void *arg, int jobnr, int nb_j
             }
             ptr += linesize;
         }
-    } else {
+    } else if (geq->bps <= 16) {
         uint16_t *ptr16 = geq->dst16 + (linesize/2) * slice_start;
         for (y = slice_start; y < slice_end; y++) {
             values[VAR_Y] = y;
@@ -408,6 +438,16 @@ static int slice_geq_filter(AVFilterContext *ctx, void *arg, int jobnr, int nb_j
             }
             ptr16 += linesize/2;
         }
+    } else {
+        float *ptr32 = geq->dst32 + (linesize/4) * slice_start;
+        for (y = slice_start; y < slice_end; y++) {
+            values[VAR_Y] = y;
+            for (x = 0; x < width; x++) {
+                values[VAR_X] = x;
+                ptr32[x] = av_expr_eval(geq->e[plane][jobnr], values, geq);
+            }
+            ptr32 += linesize/4;
+        }
     }
 
     return 0;
@@ -416,13 +456,14 @@ static int slice_geq_filter(AVFilterContext *ctx, void *arg, int jobnr, int nb_j
 static int geq_filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     int plane;
+    FilterLink *inl = ff_filter_link(inlink);
     AVFilterContext *ctx = inlink->dst;
     const int nb_threads = FFMIN(MAX_NB_THREADS, ff_filter_get_nb_threads(ctx));
     GEQContext *geq = ctx->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     AVFrame *out;
 
-    geq->values[VAR_N] = inlink->frame_count_out,
+    geq->values[VAR_N] = inl->frame_count_out,
     geq->values[VAR_T] = in->pts == AV_NOPTS_VALUE ? NAN : in->pts * av_q2d(inlink->time_base),
 
     geq->picref = in;
@@ -441,6 +482,7 @@ static int geq_filter_frame(AVFilterLink *inlink, AVFrame *in)
 
         geq->dst = out->data[plane];
         geq->dst16 = (uint16_t*)out->data[plane];
+        geq->dst32 = (float*)out->data[plane];
 
         geq->values[VAR_W]  = width;
         geq->values[VAR_H]  = height;
@@ -455,7 +497,8 @@ static int geq_filter_frame(AVFilterLink *inlink, AVFrame *in)
         if (geq->needs_sum[plane])
             calculate_sums(geq, plane, width, height);
 
-        ctx->internal->execute(ctx, slice_geq_filter, &td, NULL, FFMIN(height, nb_threads));
+        ff_filter_execute(ctx, slice_geq_filter, &td,
+                          NULL, FFMIN(height, nb_threads));
     }
 
     av_frame_free(&geq->picref);
@@ -471,7 +514,7 @@ static av_cold void geq_uninit(AVFilterContext *ctx)
         for (int j = 0; j < MAX_NB_THREADS; j++)
             av_expr_free(geq->e[i][j]);
     for (i = 0; i < NB_PLANES; i++)
-        av_freep(&geq->pixel_sums);
+        av_freep(&geq->pixel_sums[i]);
 }
 
 static const AVFilterPad geq_inputs[] = {
@@ -481,26 +524,17 @@ static const AVFilterPad geq_inputs[] = {
         .config_props = geq_config_props,
         .filter_frame = geq_filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad geq_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_geq = {
-    .name          = "geq",
-    .description   = NULL_IF_CONFIG_SMALL("Apply generic equation to each pixel."),
+const FFFilter ff_vf_geq = {
+    .p.name        = "geq",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply generic equation to each pixel."),
+    .p.priv_class  = &geq_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(GEQContext),
     .init          = geq_init,
     .uninit        = geq_uninit,
-    .query_formats = geq_query_formats,
-    .inputs        = geq_inputs,
-    .outputs       = geq_outputs,
-    .priv_class    = &geq_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(geq_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(geq_query_formats),
 };

@@ -27,8 +27,10 @@
  * Known FOURCCs: 'IV50'
  */
 
+#include "libavutil/attributes.h"
 #define BITSTREAM_READER_LE
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "get_bits.h"
 #include "ivi.h"
 #include "ivi_dsp.h"
@@ -614,7 +616,7 @@ static void switch_buffers(IVI45DecContext *ctx)
     switch (ctx->frame_type) {
     case FRAMETYPE_INTRA:
         ctx->buf_switch = 0;
-        /* FALLTHROUGH */
+        av_fallthrough;
     case FRAMETYPE_INTER:
         ctx->inter_scal = 0;
         ctx->dst_buf = ctx->buf_switch;
@@ -682,14 +684,15 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_indeo5_decoder = {
-    .name           = "indeo5",
-    .long_name      = NULL_IF_CONFIG_SMALL("Intel Indeo Video Interactive 5"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_INDEO5,
+const FFCodec ff_indeo5_decoder = {
+    .p.name         = "indeo5",
+    CODEC_LONG_NAME("Intel Indeo Video Interactive 5"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_INDEO5,
     .priv_data_size = sizeof(IVI45DecContext),
     .init           = decode_init,
     .close          = ff_ivi_decode_close,
-    .decode         = ff_ivi_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(ff_ivi_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

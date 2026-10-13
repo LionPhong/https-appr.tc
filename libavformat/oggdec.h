@@ -26,7 +26,6 @@
 #define AVFORMAT_OGGDEC_H
 
 #include "avformat.h"
-#include "metadata.h"
 
 struct ogg_codec {
     const int8_t *magic;
@@ -39,6 +38,13 @@ struct ogg_codec {
      *         -1 if an error occurred or for unsupported stream
      */
     int (*header)(AVFormatContext *, int);
+    /**
+     * Attempt to process a packet as a data packet
+     * @return < 0 (AVERROR) code or -1 on error
+     *         == 0 if the packet was a regular data packet.
+     *         == 1 if the packet was a header from a chained bitstream.
+     *            This will cause the packet to be skipped in calling code (ogg_packet()
+     */
     int (*packet)(AVFormatContext *, int);
     /**
      * Translate a granule into a timestamp.
@@ -79,6 +85,7 @@ struct ogg_stream {
     int nsegs, segp;
     uint8_t segments[255];
     int incomplete; ///< whether we're expecting a continuation in the next page
+    int page_start; ///< current packet is the first one starting in the page
     int page_end;   ///< current packet is the last one completed in the page
     int keyframe_seek;
     int got_start;
@@ -86,8 +93,11 @@ struct ogg_stream {
     int nb_header; ///< set to the number of parsed headers
     int start_trimming; ///< set the number of packets to drop from the start
     int end_trimming; ///< set the number of packets to drop from the end
+    int replace; // < set to 1 after initializing a new chained stream
     uint8_t *new_metadata;
-    unsigned int new_metadata_size;
+    size_t new_metadata_size;
+    uint8_t *new_extradata;
+    size_t new_extradata_size;
     void *private;
 };
 
@@ -114,7 +124,6 @@ struct ogg {
 
 #define OGG_NOGRANULE_VALUE (-1ull)
 
-extern const struct ogg_codec ff_celt_codec;
 extern const struct ogg_codec ff_dirac_codec;
 extern const struct ogg_codec ff_flac_codec;
 extern const struct ogg_codec ff_ogm_audio_codec;
@@ -130,11 +139,41 @@ extern const struct ogg_codec ff_theora_codec;
 extern const struct ogg_codec ff_vorbis_codec;
 extern const struct ogg_codec ff_vp8_codec;
 
+/**
+ * Parse Vorbis comments
+ *
+ * @note  The buffer will be temporarily modified by this function,
+ *        so it needs to be writable. Furthermore it must be padded
+ *        by a single byte (not counted in size).
+ *        All changes will have been reverted upon return.
+ */
 int ff_vorbis_comment(AVFormatContext *ms, AVDictionary **m,
                       const uint8_t *buf, int size, int parse_picture);
 
+/**
+ * Parse Vorbis comments and add metadata to an AVStream
+ *
+ * @note  The buffer will be temporarily modified by this function,
+ *        so it needs to be writable. Furthermore it must be padded
+ *        by a single byte (not counted in size).
+ *        All changes will have been reverted upon return.
+ */
 int ff_vorbis_stream_comment(AVFormatContext *as, AVStream *st,
                              const uint8_t *buf, int size);
+
+/**
+ * Parse Vorbis comments, add metadata to an AVStream
+ *
+ * This function also attaches the metadata to the next decoded
+ * packet as AV_PKT_DATA_STRINGS_METADATA
+ *
+ * @note  The buffer will be temporarily modified by this function,
+ *        so it needs to be writable. Furthermore it must be padded
+ *        by a single byte (not counted in size).
+ *        All changes will have been reverted upon return.
+ */
+int ff_vorbis_update_metadata(AVFormatContext *s, AVStream *st,
+                              const uint8_t *buf, int size);
 
 static inline int
 ogg_find_stream (struct ogg * ogg, int serial)

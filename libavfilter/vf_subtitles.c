@@ -29,20 +29,23 @@
 
 #include <ass/ass.h>
 
-#include "config.h"
+#include "config_components.h"
 #if CONFIG_SUBTITLES_FILTER
 # include "libavcodec/avcodec.h"
+# include "libavcodec/codec_desc.h"
 # include "libavformat/avformat.h"
 #endif
 #include "libavutil/avstring.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/parseutils.h"
+
+#include "filters.h"
 #include "drawutils.h"
 #include "avfilter.h"
-#include "internal.h"
 #include "formats.h"
 #include "video.h"
+
+#define FF_ASS_FEATURE_WRAP_UNICODE     (LIBASS_VERSION >= 0x01600010)
 
 typedef struct AssContext {
     const AVClass *class;
@@ -50,6 +53,7 @@ typedef struct AssContext {
     ASS_Renderer *renderer;
     ASS_Track    *track;
     char *filename;
+    char *script;
     char *fontsdir;
     char *charenc;
     char *force_style;
@@ -60,6 +64,7 @@ typedef struct AssContext {
     int original_w, original_h;
     int shaping;
     FFDrawContext draw;
+    int wrap_unicode;
 } AssContext;
 
 #define OFFSET(x) offsetof(AssContext, x)
@@ -72,6 +77,12 @@ typedef struct AssContext {
     {"fontsdir",       "set the directory containing the fonts to read",           OFFSET(fontsdir),   AV_OPT_TYPE_STRING,     {.str = NULL},  0, 0, FLAGS }, \
     {"alpha",          "enable processing of alpha channel",                       OFFSET(alpha),      AV_OPT_TYPE_BOOL,       {.i64 = 0   },         0,        1, FLAGS }, \
 
+#define SHAPING_OPTIONS \
+    {"shaping", "set shaping engine", OFFSET(shaping), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, FLAGS, .unit = "shaping_mode"}, \
+        {"auto",    NULL,              0, AV_OPT_TYPE_CONST, {.i64 = -1},                  INT_MIN, INT_MAX, FLAGS, .unit = "shaping_mode"}, \
+        {"simple",  "simple shaping",  0, AV_OPT_TYPE_CONST, {.i64 = ASS_SHAPING_SIMPLE},  INT_MIN, INT_MAX, FLAGS, .unit = "shaping_mode"}, \
+        {"complex", "complex shaping", 0, AV_OPT_TYPE_CONST, {.i64 = ASS_SHAPING_COMPLEX}, INT_MIN, INT_MAX, FLAGS, .unit = "shaping_mode"}, \
+
 /* libass supports a log level ranging from 0 to 7 */
 static const int ass_libavfilter_log_level_map[] = {
     [0] = AV_LOG_FATAL,     /* MSGL_FATAL */
@@ -83,6 +94,40 @@ static const int ass_libavfilter_log_level_map[] = {
     [6] = AV_LOG_VERBOSE,   /* MSGL_V */
     [7] = AV_LOG_DEBUG,     /* MSGL_DBG2 */
 };
+
+static enum AVColorSpace ass_get_color_space(ASS_YCbCrMatrix ass_matrix, enum AVColorSpace inlink_space) {
+    switch (ass_matrix) {
+    case YCBCR_NONE:            return inlink_space;
+    case YCBCR_SMPTE240M_TV:
+    case YCBCR_SMPTE240M_PC:    return AVCOL_SPC_SMPTE240M;
+    case YCBCR_FCC_TV:
+    case YCBCR_FCC_PC:          return AVCOL_SPC_FCC;
+    case YCBCR_BT709_TV:
+    case YCBCR_BT709_PC:        return AVCOL_SPC_BT709;
+    case YCBCR_BT601_TV:
+    case YCBCR_BT601_PC:
+    case YCBCR_DEFAULT:
+    case YCBCR_UNKNOWN:
+    default:                    return AVCOL_SPC_SMPTE170M;
+    }
+}
+
+static enum AVColorRange ass_get_color_range(ASS_YCbCrMatrix ass_matrix, enum AVColorRange inlink_range) {
+    switch (ass_matrix) {
+    case YCBCR_NONE:            return inlink_range;
+    case YCBCR_SMPTE240M_PC:
+    case YCBCR_FCC_PC:
+    case YCBCR_BT709_PC:
+    case YCBCR_BT601_PC:        return AVCOL_RANGE_JPEG;
+    case YCBCR_SMPTE240M_TV:
+    case YCBCR_FCC_TV:
+    case YCBCR_BT709_TV:
+    case YCBCR_BT601_TV:
+    case YCBCR_DEFAULT:
+    case YCBCR_UNKNOWN:
+    default:                    return AVCOL_RANGE_MPEG;
+    }
+}
 
 static void ass_log(int ass_level, const char *fmt, va_list args, void *ctx)
 {
@@ -98,11 +143,6 @@ static av_cold int init(AVFilterContext *ctx)
 {
     AssContext *ass = ctx->priv;
 
-    if (!ass->filename) {
-        av_log(ctx, AV_LOG_ERROR, "No filename provided!\n");
-        return AVERROR(EINVAL);
-    }
-
     ass->library = ass_library_init();
     if (!ass->library) {
         av_log(ctx, AV_LOG_ERROR, "Could not initialize libass.\n");
@@ -111,6 +151,7 @@ static av_cold int init(AVFilterContext *ctx)
     ass_set_message_cb(ass->library, ass_log, ctx);
 
     ass_set_fonts_dir(ass->library, ass->fontsdir);
+    ass_set_extract_fonts(ass->library, 1);
 
     ass->renderer = ass_renderer_init(ass->library);
     if (!ass->renderer) {
@@ -133,21 +174,37 @@ static av_cold void uninit(AVFilterContext *ctx)
         ass_library_done(ass->library);
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    return ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(0));
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_draw_supported_pixel_formats(0));
 }
 
 static int config_input(AVFilterLink *inlink)
 {
-    AssContext *ass = inlink->dst->priv;
+    AVFilterContext *ctx = inlink->dst;
+    AssContext *ass = ctx->priv;
+    int ret;
 
-    ff_draw_init(&ass->draw, inlink->format, ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
+    ret = ff_draw_init2(&ass->draw, inlink->format,
+                        ass_get_color_space(ass->track->YCbCrMatrix, inlink->colorspace),
+                        ass_get_color_range(ass->track->YCbCrMatrix, inlink->color_range),
+                        inlink->alpha_mode, ass->alpha ? FF_DRAW_PROCESS_ALPHA : 0);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFDrawContext\n");
+        return ret;
+    }
 
     ass_set_frame_size  (ass->renderer, inlink->w, inlink->h);
-    if (ass->original_w && ass->original_h)
-        ass_set_aspect_ratio(ass->renderer, (double)inlink->w / inlink->h,
-                             (double)ass->original_w / ass->original_h);
+    if (ass->original_w && ass->original_h) {
+        ass_set_pixel_aspect(ass->renderer, (double)inlink->w / inlink->h /
+                             ((double)ass->original_w / ass->original_h));
+        ass_set_storage_size(ass->renderer, ass->original_w, ass->original_h);
+    } else
+        ass_set_storage_size(ass->renderer, inlink->w, inlink->h);
+
     if (ass->shaping != -1)
         ass_set_shaper(ass->renderer, ass->shaping);
 
@@ -197,65 +254,80 @@ static const AVFilterPad ass_inputs[] = {
     {
         .name             = "default",
         .type             = AVMEDIA_TYPE_VIDEO,
+        .flags            = AVFILTERPAD_FLAG_NEEDS_WRITABLE,
         .filter_frame     = filter_frame,
         .config_props     = config_input,
-        .needs_writable   = 1,
     },
-    { NULL }
-};
-
-static const AVFilterPad ass_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
 };
 
 #if CONFIG_ASS_FILTER
 
 static const AVOption ass_options[] = {
     COMMON_OPTIONS
-    {"shaping", "set shaping engine", OFFSET(shaping), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, FLAGS, "shaping_mode"},
-        {"auto", NULL,                 0, AV_OPT_TYPE_CONST, {.i64 = -1},                  INT_MIN, INT_MAX, FLAGS, "shaping_mode"},
-        {"simple",  "simple shaping",  0, AV_OPT_TYPE_CONST, {.i64 = ASS_SHAPING_SIMPLE},  INT_MIN, INT_MAX, FLAGS, "shaping_mode"},
-        {"complex", "complex shaping", 0, AV_OPT_TYPE_CONST, {.i64 = ASS_SHAPING_COMPLEX}, INT_MIN, INT_MAX, FLAGS, "shaping_mode"},
+    SHAPING_OPTIONS
+    {"script", "set the ASS script to render instead of reading a file", OFFSET(script), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS | AV_OPT_FLAG_RUNTIME_PARAM },
     {NULL},
 };
 
 AVFILTER_DEFINE_CLASS(ass);
 
+static int read_track(AVFilterContext *ctx)
+{
+    AssContext *ass = ctx->priv;
+    ASS_Track *track = ass->script ? ass_read_memory(ass->library, ass->script, strlen(ass->script), NULL)
+                                   : ass_read_file(ass->library, ass->filename, NULL);
+
+    if (!track) {
+        av_log(ctx, AV_LOG_ERROR, "Could not create a libass track from %s\n",
+               ass->filename ? ass->filename : "the script");
+        return AVERROR(EINVAL);
+    }
+    if (ass->track)
+        ass_free_track(ass->track);
+    ass->track = track;
+    return 0;
+}
+
 static av_cold int init_ass(AVFilterContext *ctx)
 {
     AssContext *ass = ctx->priv;
-    int ret = init(ctx);
+    int ret;
 
+    if (!ass->filename == !ass->script) {
+        av_log(ctx, AV_LOG_ERROR, "Exactly one of filename and script must be set\n");
+        return AVERROR(EINVAL);
+    }
+    ret = init(ctx);
     if (ret < 0)
         return ret;
 
     /* Initialize fonts */
     ass_set_fonts(ass->renderer, NULL, NULL, 1, NULL, 1);
 
-    ass->track = ass_read_file(ass->library, ass->filename, NULL);
-    if (!ass->track) {
-        av_log(ctx, AV_LOG_ERROR,
-               "Could not create a libass track when reading file '%s'\n",
-               ass->filename);
-        return AVERROR(EINVAL);
-    }
-    return 0;
+    return read_track(ctx);
 }
 
-AVFilter ff_vf_ass = {
-    .name          = "ass",
-    .description   = NULL_IF_CONFIG_SMALL("Render ASS subtitles onto input video using the libass library."),
+static int process_command(AVFilterContext *ctx, const char *cmd, const char *arg,
+                           char *res, int res_len, int flags)
+{
+    int ret = ff_filter_process_command(ctx, cmd, arg, res, res_len, flags);
+
+    if (ret < 0 || (ret = read_track(ctx)) < 0)
+        return ret;
+    return config_input(ctx->inputs[0]);
+}
+
+const FFFilter ff_vf_ass = {
+    .p.name        = "ass",
+    .p.description = NULL_IF_CONFIG_SMALL("Render ASS subtitles onto input video using the libass library."),
+    .p.priv_class  = &ass_class,
     .priv_size     = sizeof(AssContext),
     .init          = init_ass,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = ass_inputs,
-    .outputs       = ass_outputs,
-    .priv_class    = &ass_class,
+    FILTER_INPUTS(ass_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
+    .process_command = process_command,
 };
 #endif
 
@@ -267,10 +339,21 @@ static const AVOption subtitles_options[] = {
     {"stream_index", "set stream index",             OFFSET(stream_index), AV_OPT_TYPE_INT,    { .i64 = -1 }, -1,       INT_MAX,  FLAGS},
     {"si",           "set stream index",             OFFSET(stream_index), AV_OPT_TYPE_INT,    { .i64 = -1 }, -1,       INT_MAX,  FLAGS},
     {"force_style",  "force subtitle style",         OFFSET(force_style),  AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
+#if FF_ASS_FEATURE_WRAP_UNICODE
+    {"wrap_unicode", "break lines according to the Unicode Line Breaking Algorithm", OFFSET(wrap_unicode), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, FLAGS },
+#endif
+    SHAPING_OPTIONS
     {NULL},
 };
 
 static const char * const font_mimetypes[] = {
+    "font/ttf",
+    "font/otf",
+    "font/sfnt",
+    "font/woff",
+    "font/woff2",
+    "application/font-sfnt",
+    "application/font-woff",
     "application/x-truetype-font",
     "application/vnd.ms-opentype",
     "application/x-font-ttf",
@@ -302,11 +385,16 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
     AVDictionary *codec_opts = NULL;
     AVFormatContext *fmt = NULL;
     AVCodecContext *dec_ctx = NULL;
-    AVCodec *dec = NULL;
+    const AVCodec *dec;
     const AVCodecDescriptor *dec_desc;
     AVStream *st;
     AVPacket pkt;
     AssContext *ass = ctx->priv;
+
+    if (!ass->filename) {
+        av_log(ctx, AV_LOG_ERROR, "No filename provided!\n");
+        return AVERROR(EINVAL);
+    }
 
     /* Init libass */
     ret = init(ctx);
@@ -384,22 +472,24 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
     if (!dec) {
         av_log(ctx, AV_LOG_ERROR, "Failed to find subtitle codec %s\n",
                avcodec_get_name(st->codecpar->codec_id));
-        return AVERROR(EINVAL);
+        ret = AVERROR_DECODER_NOT_FOUND;
+        goto end;
     }
     dec_desc = avcodec_descriptor_get(st->codecpar->codec_id);
     if (dec_desc && !(dec_desc->props & AV_CODEC_PROP_TEXT_SUB)) {
         av_log(ctx, AV_LOG_ERROR,
                "Only text based subtitles are currently supported\n");
-        return AVERROR_PATCHWELCOME;
+        ret = AVERROR_PATCHWELCOME;
+        goto end;
     }
     if (ass->charenc)
         av_dict_set(&codec_opts, "sub_charenc", ass->charenc, 0);
-    if (LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57,26,100))
-        av_dict_set(&codec_opts, "sub_text_format", "ass", 0);
 
     dec_ctx = avcodec_alloc_context3(dec);
-    if (!dec_ctx)
-        return AVERROR(ENOMEM);
+    if (!dec_ctx) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
 
     ret = avcodec_parameters_to_context(dec_ctx, st->codecpar);
     if (ret < 0)
@@ -418,6 +508,18 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
     ret = avcodec_open2(dec_ctx, NULL, &codec_opts);
     if (ret < 0)
         goto end;
+
+#if FF_ASS_FEATURE_WRAP_UNICODE
+    /* Don't overwrite wrap automatically for native ASS */
+    if (ass->wrap_unicode == -1)
+        ass->wrap_unicode = st->codecpar->codec_id != AV_CODEC_ID_ASS;
+    if (ass->wrap_unicode) {
+        ret = ass_track_set_feature(ass->track, ASS_FEATURE_WRAP_UNICODE, 1);
+        if (ret < 0)
+            av_log(ctx, AV_LOG_WARNING,
+                   "libass wasn't built with ASS_FEATURE_WRAP_UNICODE support\n");
+    }
+#endif
 
     if (ass->force_style) {
         char **list = NULL;
@@ -445,9 +547,6 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
         ass_process_codec_private(ass->track,
                                   dec_ctx->subtitle_header,
                                   dec_ctx->subtitle_header_size);
-    av_init_packet(&pkt);
-    pkt.data = NULL;
-    pkt.size = 0;
     while (av_read_frame(fmt, &pkt) >= 0) {
         int i, got_subtitle;
         AVSubtitle sub = {0};
@@ -464,11 +563,8 @@ static av_cold int init_subtitles(AVFilterContext *ctx)
                     char *ass_line = sub.rects[i]->ass;
                     if (!ass_line)
                         break;
-                    if (LIBAVCODEC_VERSION_INT < AV_VERSION_INT(57,25,100))
-                        ass_process_data(ass->track, ass_line, strlen(ass_line));
-                    else
-                        ass_process_chunk(ass->track, ass_line, strlen(ass_line),
-                                          start_time, duration);
+                    ass_process_chunk(ass->track, ass_line, strlen(ass_line),
+                                      start_time, duration);
                 }
             }
         }
@@ -483,15 +579,15 @@ end:
     return ret;
 }
 
-AVFilter ff_vf_subtitles = {
-    .name          = "subtitles",
-    .description   = NULL_IF_CONFIG_SMALL("Render text subtitles onto input video using the libass library."),
+const FFFilter ff_vf_subtitles = {
+    .p.name        = "subtitles",
+    .p.description = NULL_IF_CONFIG_SMALL("Render text subtitles onto input video using the libass library."),
+    .p.priv_class  = &subtitles_class,
     .priv_size     = sizeof(AssContext),
     .init          = init_subtitles,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = ass_inputs,
-    .outputs       = ass_outputs,
-    .priv_class    = &subtitles_class,
+    FILTER_INPUTS(ass_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
 };
 #endif

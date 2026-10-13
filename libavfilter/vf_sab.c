@@ -23,13 +23,14 @@
  * Shape Adaptive Blur filter, ported from MPlayer libmpcodecs/vf_sab.c
  */
 
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libswscale/swscale.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 typedef struct FilterParam {
     float radius;
@@ -55,21 +56,14 @@ typedef struct SabContext {
     unsigned int sws_flags;
 } SabContext;
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUV410P,
-        AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV410P,
+    AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_NONE
+};
 
 #define RADIUS_MIN 0.1
 #define RADIUS_MAX 4.0
@@ -312,26 +306,17 @@ static const AVFilterPad sab_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_props,
     },
-    { NULL }
 };
 
-static const AVFilterPad sab_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_sab = {
-    .name          = "sab",
-    .description   = NULL_IF_CONFIG_SMALL("Apply shape adaptive blur."),
+const FFFilter ff_vf_sab = {
+    .p.name        = "sab",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply shape adaptive blur."),
+    .p.priv_class  = &sab_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(SabContext),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = sab_inputs,
-    .outputs       = sab_outputs,
-    .priv_class    = &sab_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(sab_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

@@ -18,16 +18,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
 #include "drawutils.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "framesync.h"
 #include "video.h"
 
@@ -46,6 +49,8 @@ typedef struct StackContext {
     int is_vertical;
     int is_horizontal;
     int nb_planes;
+    int nb_grid_columns;
+    int nb_grid_rows;
     uint8_t fillcolor[4];
     char *fillcolor_str;
     int fillcolor_enable;
@@ -58,26 +63,22 @@ typedef struct StackContext {
     FFFrameSync fs;
 } StackContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    AVFilterFormats *pix_fmts = NULL;
-    StackContext *s = ctx->priv;
-    int fmt, ret;
+    const StackContext *s = ctx->priv;
+    int reject_flags = AV_PIX_FMT_FLAG_BITSTREAM |
+                       AV_PIX_FMT_FLAG_HWACCEL   |
+                       AV_PIX_FMT_FLAG_PAL;
 
     if (s->fillcolor_enable) {
-        return ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(0));
+        return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                      ff_draw_supported_pixel_formats(0));
     }
 
-    for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
-        if (!(desc->flags & AV_PIX_FMT_FLAG_PAL ||
-              desc->flags & AV_PIX_FMT_FLAG_HWACCEL ||
-              desc->flags & AV_PIX_FMT_FLAG_BITSTREAM) &&
-            (ret = ff_add_format(&pix_fmts, fmt)) < 0)
-            return ret;
-    }
-
-    return ff_set_common_formats(ctx, pix_fmts);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_formats_pixdesc_filter(0, reject_flags));
 }
 
 static av_cold int init(AVFilterContext *ctx)
@@ -91,6 +92,34 @@ static av_cold int init(AVFilterContext *ctx)
     if (!strcmp(ctx->filter->name, "hstack"))
         s->is_horizontal = 1;
 
+    if (!strcmp(ctx->filter->name, "xstack")) {
+        int is_grid;
+        if (strcmp(s->fillcolor_str, "none") &&
+            av_parse_color(s->fillcolor, s->fillcolor_str, -1, ctx) >= 0) {
+            s->fillcolor_enable = 1;
+        } else {
+            s->fillcolor_enable = 0;
+        }
+        is_grid = s->nb_grid_rows && s->nb_grid_columns;
+        if (s->layout && is_grid) {
+            av_log(ctx, AV_LOG_ERROR, "Both layout and grid were specified. Only one is allowed.\n");
+            return AVERROR(EINVAL);
+        }
+        if (!s->layout && !is_grid) {
+            if (s->nb_inputs == 2) {
+                s->nb_grid_rows = 1;
+                s->nb_grid_columns = 2;
+                is_grid = 1;
+            } else {
+                av_log(ctx, AV_LOG_ERROR, "No layout or grid specified.\n");
+                return AVERROR(EINVAL);
+            }
+        }
+
+        if (is_grid)
+            s->nb_inputs = s->nb_grid_rows * s->nb_grid_columns;
+    }
+
     s->frames = av_calloc(s->nb_inputs, sizeof(*s->frames));
     if (!s->frames)
         return AVERROR(ENOMEM);
@@ -98,25 +127,6 @@ static av_cold int init(AVFilterContext *ctx)
     s->items = av_calloc(s->nb_inputs, sizeof(*s->items));
     if (!s->items)
         return AVERROR(ENOMEM);
-
-    if (!strcmp(ctx->filter->name, "xstack")) {
-        if (strcmp(s->fillcolor_str, "none") &&
-            av_parse_color(s->fillcolor, s->fillcolor_str, -1, ctx) >= 0) {
-            s->fillcolor_enable = 1;
-        } else {
-            s->fillcolor_enable = 0;
-        }
-        if (!s->layout) {
-            if (s->nb_inputs == 2) {
-                s->layout = av_strdup("0_0|w0_0");
-                if (!s->layout)
-                    return AVERROR(ENOMEM);
-            } else {
-                av_log(ctx, AV_LOG_ERROR, "No layout specified.\n");
-                return AVERROR(EINVAL);
-            }
-        }
-    }
 
     for (i = 0; i < s->nb_inputs; i++) {
         AVFilterPad pad = { 0 };
@@ -126,10 +136,8 @@ static av_cold int init(AVFilterContext *ctx)
         if (!pad.name)
             return AVERROR(ENOMEM);
 
-        if ((ret = ff_insert_inpad(ctx, i, &pad)) < 0) {
-            av_freep(&pad.name);
+        if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
             return ret;
-        }
     }
 
     return 0;
@@ -182,7 +190,8 @@ static int process_frame(FFFrameSync *fs)
         ff_fill_rectangle(&s->draw, &s->color, out->data, out->linesize,
                           0, 0, outlink->w, outlink->h);
 
-    ctx->internal->execute(ctx, process_slice, out, NULL, FFMIN(s->nb_inputs, ff_filter_get_nb_threads(ctx)));
+    ff_filter_execute(ctx, process_slice, out, NULL,
+                      FFMIN(s->nb_inputs, ff_filter_get_nb_threads(ctx)));
 
     return ff_filter_frame(outlink, out);
 }
@@ -191,7 +200,9 @@ static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     StackContext *s = ctx->priv;
-    AVRational frame_rate = ctx->inputs[0]->frame_rate;
+    FilterLink *il = ff_filter_link(ctx->inputs[0]);
+    FilterLink *ol = ff_filter_link(outlink);
+    AVRational frame_rate = il->frame_rate;
     AVRational sar = ctx->inputs[0]->sample_aspect_ratio;
     int height = ctx->inputs[0]->h;
     int width = ctx->inputs[0]->w;
@@ -223,6 +234,8 @@ static int config_output(AVFilterLink *outlink)
                 item->y[1] = item->y[2] = AV_CEIL_RSHIFT(height, s->desc->log2_chroma_h);
                 item->y[0] = item->y[3] = height;
 
+                if (height > INT_MAX - ctx->inputs[i]->h)
+                    return AVERROR(EINVAL);
                 height += ctx->inputs[i]->h;
             }
         }
@@ -248,7 +261,56 @@ static int config_output(AVFilterLink *outlink)
                     return ret;
                 }
 
+                if (width > INT_MAX - ctx->inputs[i]->w)
+                    return AVERROR(EINVAL);
                 width += ctx->inputs[i]->w;
+            }
+        }
+    } else if (s->nb_grid_rows && s->nb_grid_columns) {
+        int inw = 0, inh = 0;
+        int k = 0;
+        int row_height;
+        height = 0;
+        width = 0;
+        for (i = 0; i < s->nb_grid_rows; i++, inh += row_height) {
+            row_height = ctx->inputs[i * s->nb_grid_columns]->h;
+            inw = 0;
+            for (int j = 0; j < s->nb_grid_columns; j++, k++) {
+                AVFilterLink *inlink = ctx->inputs[k];
+                StackItem *item = &s->items[k];
+
+                if (ctx->inputs[k]->h != row_height) {
+                    av_log(ctx, AV_LOG_ERROR, "Input %d height %d does not match current row's height %d.\n",
+                           k, ctx->inputs[k]->h, row_height);
+                    return AVERROR(EINVAL);
+                }
+
+                if ((ret = av_image_fill_linesizes(item->linesize, inlink->format, inlink->w)) < 0) {
+                    return ret;
+                }
+
+                item->height[1] = item->height[2] = AV_CEIL_RSHIFT(inlink->h, s->desc->log2_chroma_h);
+                item->height[0] = item->height[3] = inlink->h;
+
+                if ((ret = av_image_fill_linesizes(item->x, inlink->format, inw)) < 0) {
+                    return ret;
+                }
+
+                item->y[1] = item->y[2] = AV_CEIL_RSHIFT(inh, s->desc->log2_chroma_h);
+                item->y[0] = item->y[3] = inh;
+
+                if (inw > INT_MAX - ctx->inputs[k]->w)
+                    return AVERROR(EINVAL);
+                inw += ctx->inputs[k]->w;
+            }
+            if (height > INT_MAX - row_height)
+                return AVERROR(EINVAL);
+            height += row_height;
+            if (!i)
+                width = inw;
+            if (i && width != inw) {
+                av_log(ctx, AV_LOG_ERROR, "Row %d width %d does not match previous row width %d.\n", i, inw, width);
+                return AVERROR(EINVAL);
             }
         }
     } else {
@@ -258,7 +320,12 @@ static int config_output(AVFilterLink *outlink)
         int inw, inh, size;
 
         if (s->fillcolor_enable) {
-            ff_draw_init(&s->draw, ctx->inputs[0]->format, 0);
+            const AVFilterLink *inlink = ctx->inputs[0];
+            ret = ff_draw_init_from_link(&s->draw, inlink, 0);
+            if (ret < 0) {
+                av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFDrawContext\n");
+                return ret;
+            }
             ff_draw_color(&s->draw, &s->color, s->fillcolor);
         }
 
@@ -293,26 +360,41 @@ static int config_output(AVFilterLink *outlink)
                         if (size == i || size < 0 || size >= s->nb_inputs)
                             return AVERROR(EINVAL);
 
-                        if (!j)
+                        if (!j) {
+                            if (inw > INT_MAX - ctx->inputs[size]->w)
+                                return AVERROR(EINVAL);
                             inw += ctx->inputs[size]->w;
-                        else
+                        } else {
+                            if (inh > INT_MAX - ctx->inputs[size]->w)
+                                return AVERROR(EINVAL);
                             inh += ctx->inputs[size]->w;
+                        }
                     } else if (sscanf(arg3, "h%d", &size) == 1) {
                         if (size == i || size < 0 || size >= s->nb_inputs)
                             return AVERROR(EINVAL);
 
-                        if (!j)
+                        if (!j) {
+                            if (inw > INT_MAX - ctx->inputs[size]->h)
+                                return AVERROR(EINVAL);
                             inw += ctx->inputs[size]->h;
-                        else
+                        } else {
+                            if (inh > INT_MAX - ctx->inputs[size]->h)
+                                return AVERROR(EINVAL);
                             inh += ctx->inputs[size]->h;
+                        }
                     } else if (sscanf(arg3, "%d", &size) == 1) {
                         if (size < 0)
                             return AVERROR(EINVAL);
 
-                        if (!j)
+                        if (!j) {
+                            if (inw > INT_MAX - size)
+                                return AVERROR(EINVAL);
                             inw += size;
-                        else
+                        } else {
+                            if (inh > INT_MAX - size)
+                                return AVERROR(EINVAL);
                             inh += size;
+                        }
                     } else {
                         return AVERROR(EINVAL);
                     }
@@ -326,6 +408,8 @@ static int config_output(AVFilterLink *outlink)
             item->y[1] = item->y[2] = AV_CEIL_RSHIFT(inh, s->desc->log2_chroma_h);
             item->y[0] = item->y[3] = inh;
 
+            if (inlink->w > INT_MAX - inw || inlink->h > INT_MAX - inh)
+                return AVERROR(EINVAL);
             width  = FFMAX(width,  inlink->w + inw);
             height = FFMAX(height, inlink->h + inh);
         }
@@ -335,16 +419,16 @@ static int config_output(AVFilterLink *outlink)
 
     outlink->w          = width;
     outlink->h          = height;
-    outlink->frame_rate = frame_rate;
+    ol->frame_rate      = frame_rate;
     outlink->sample_aspect_ratio = sar;
 
     for (i = 1; i < s->nb_inputs; i++) {
-        AVFilterLink *inlink = ctx->inputs[i];
-        if (outlink->frame_rate.num != inlink->frame_rate.num ||
-            outlink->frame_rate.den != inlink->frame_rate.den) {
+        il = ff_filter_link(ctx->inputs[i]);
+        if (ol->frame_rate.num != il->frame_rate.num ||
+            ol->frame_rate.den != il->frame_rate.den) {
             av_log(ctx, AV_LOG_VERBOSE,
                     "Video inputs have different frame rates, output will be VFR\n");
-            outlink->frame_rate = av_make_q(1, 0);
+            ol->frame_rate = av_make_q(1, 0);
             break;
         }
     }
@@ -374,14 +458,10 @@ static int config_output(AVFilterLink *outlink)
 static av_cold void uninit(AVFilterContext *ctx)
 {
     StackContext *s = ctx->priv;
-    int i;
 
     ff_framesync_uninit(&s->fs);
     av_freep(&s->frames);
     av_freep(&s->items);
-
-    for (i = 0; i < ctx->nb_inputs; i++)
-        av_freep(&ctx->input_pads[i].name);
 }
 
 static int activate(AVFilterContext *ctx)
@@ -398,51 +478,46 @@ static const AVOption stack_options[] = {
     { NULL },
 };
 
+AVFILTER_DEFINE_CLASS_EXT(stack, "(h|v)stack", stack_options);
+
 static const AVFilterPad outputs[] = {
     {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_output,
     },
-    { NULL }
 };
 
 #if CONFIG_HSTACK_FILTER
 
-#define hstack_options stack_options
-AVFILTER_DEFINE_CLASS(hstack);
-
-AVFilter ff_vf_hstack = {
-    .name          = "hstack",
-    .description   = NULL_IF_CONFIG_SMALL("Stack video inputs horizontally."),
+const FFFilter ff_vf_hstack = {
+    .p.name        = "hstack",
+    .p.description = NULL_IF_CONFIG_SMALL("Stack video inputs horizontally."),
+    .p.priv_class  = &stack_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(StackContext),
-    .priv_class    = &hstack_class,
-    .query_formats = query_formats,
-    .outputs       = outputs,
+    FILTER_OUTPUTS(outputs),
+    FILTER_QUERY_FUNC2(query_formats),
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
-    .flags         = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS,
 };
 
 #endif /* CONFIG_HSTACK_FILTER */
 
 #if CONFIG_VSTACK_FILTER
 
-#define vstack_options stack_options
-AVFILTER_DEFINE_CLASS(vstack);
-
-AVFilter ff_vf_vstack = {
-    .name          = "vstack",
-    .description   = NULL_IF_CONFIG_SMALL("Stack video inputs vertically."),
+const FFFilter ff_vf_vstack = {
+    .p.name        = "vstack",
+    .p.description = NULL_IF_CONFIG_SMALL("Stack video inputs vertically."),
+    .p.priv_class  = &stack_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(StackContext),
-    .priv_class    = &vstack_class,
-    .query_formats = query_formats,
-    .outputs       = outputs,
+    FILTER_OUTPUTS(outputs),
+    FILTER_QUERY_FUNC2(query_formats),
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
-    .flags         = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS,
 };
 
 #endif /* CONFIG_VSTACK_FILTER */
@@ -452,6 +527,7 @@ AVFilter ff_vf_vstack = {
 static const AVOption xstack_options[] = {
     { "inputs", "set number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64=2}, 2, INT_MAX, .flags = FLAGS },
     { "layout", "set custom layout", OFFSET(layout), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, .flags = FLAGS },
+    { "grid", "set fixed size grid layout", OFFSET(nb_grid_columns), AV_OPT_TYPE_IMAGE_SIZE, {.str=NULL}, 0, 0, .flags = FLAGS },
     { "shortest", "force termination when the shortest input terminates", OFFSET(shortest), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, .flags = FLAGS },
     { "fill",  "set the color for unused pixels", OFFSET(fillcolor_str), AV_OPT_TYPE_STRING, {.str = "none"}, .flags = FLAGS },
     { NULL },
@@ -459,17 +535,17 @@ static const AVOption xstack_options[] = {
 
 AVFILTER_DEFINE_CLASS(xstack);
 
-AVFilter ff_vf_xstack = {
-    .name          = "xstack",
-    .description   = NULL_IF_CONFIG_SMALL("Stack video inputs into custom layout."),
+const FFFilter ff_vf_xstack = {
+    .p.name        = "xstack",
+    .p.description = NULL_IF_CONFIG_SMALL("Stack video inputs into custom layout."),
+    .p.priv_class  = &xstack_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(StackContext),
-    .priv_class    = &xstack_class,
-    .query_formats = query_formats,
-    .outputs       = outputs,
+    FILTER_OUTPUTS(outputs),
+    FILTER_QUERY_FUNC2(query_formats),
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
-    .flags         = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SLICE_THREADS,
 };
 
 #endif /* CONFIG_XSTACK_FILTER */

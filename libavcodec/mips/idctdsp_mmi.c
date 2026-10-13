@@ -26,7 +26,7 @@
 #include "libavutil/mips/mmiutils.h"
 
 void ff_put_pixels_clamped_mmi(const int16_t *block,
-        uint8_t *av_restrict pixels, ptrdiff_t line_size)
+        uint8_t *restrict pixels, ptrdiff_t line_size)
 {
     double ftmp[8];
 
@@ -83,7 +83,7 @@ void ff_put_pixels_clamped_mmi(const int16_t *block,
 }
 
 void ff_put_signed_pixels_clamped_mmi(const int16_t *block,
-    uint8_t *av_restrict pixels, ptrdiff_t line_size)
+    uint8_t *restrict pixels, ptrdiff_t line_size)
 {
     double ftmp[5];
 
@@ -142,19 +142,19 @@ void ff_put_signed_pixels_clamped_mmi(const int16_t *block,
           [pixels]"+&r"(pixels)
         : [block]"r"(block),
           [line_size]"r"((mips_reg)line_size),
-          [ff_pb_80]"f"(ff_pb_80)
+          [ff_pb_80]"f"(ff_pb_80.f)
         : "memory"
     );
 }
 
 void ff_add_pixels_clamped_mmi(const int16_t *block,
-        uint8_t *av_restrict pixels, ptrdiff_t line_size)
+        uint8_t *restrict pixels, ptrdiff_t line_size)
 {
     double ftmp[9];
     uint64_t tmp[1];
     __asm__ volatile (
         "li         %[tmp0],    0x04                           \n\t"
-        "xor        %[ftmp0],   %[ftmp0],   %[ftmp0]           \n\t"
+        "pxor       %[ftmp0],   %[ftmp0],   %[ftmp0]           \n\t"
         "1:                                                    \n\t"
         MMI_LDC1(%[ftmp5], %[pixels], 0x00)
         PTR_ADDU   "%[pixels],  %[pixels],  %[line_size]       \n\t"

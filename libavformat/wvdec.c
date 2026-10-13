@@ -23,25 +23,25 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "apetag.h"
 #include "id3v1.h"
 #include "wv.h"
 
-enum WV_FLAGS {
-    WV_MONO   = 0x0004,
-    WV_HYBRID = 0x0008,
-    WV_JOINT  = 0x0010,
-    WV_CROSSD = 0x0020,
-    WV_HSHAPE = 0x0040,
-    WV_FLOAT  = 0x0080,
-    WV_INT32  = 0x0100,
-    WV_HBR    = 0x0200,
-    WV_HBAL   = 0x0400,
-    WV_MCINIT = 0x0800,
-    WV_MCEND  = 0x1000,
-    WV_DSD    = 0x80000000,
-};
+#define WV_MONO   0x00000004U
+#define WV_HYBRID 0x00000008U
+#define WV_JOINT  0x00000010U
+#define WV_CROSSD 0x00000020U
+#define WV_HSHAPE 0x00000040U
+#define WV_FLOAT  0x00000080U
+#define WV_INT32  0x00000100U
+#define WV_HBR    0x00000200U
+#define WV_HBAL   0x00000400U
+#define WV_MCINIT 0x00000800U
+#define WV_MCEND  0x00001000U
+#define WV_DSD    0x80000000U
 
 static const int wv_rates[16] = {
      6000,  8000,  9600, 11025, 12000, 16000,  22050, 24000,
@@ -79,8 +79,9 @@ static int wv_read_block_header(AVFormatContext *ctx, AVIOContext *pb)
 {
     WVContext *wc = ctx->priv_data;
     int ret;
-    int rate, rate_x, bpp, chan;
+    int rate, bpp, chan;
     uint32_t chmask, flags;
+    unsigned rate_x;
 
     wc->pos = avio_tell(pb);
 
@@ -192,7 +193,7 @@ static int wv_read_block_header(AVFormatContext *ctx, AVIOContext *pb)
             if (id & 0x40)
                 avio_skip(pb, 1);
         }
-        if (rate == -1) {
+        if (rate == -1 || rate * (uint64_t)rate_x >= INT_MAX) {
             av_log(ctx, AV_LOG_ERROR,
                    "Cannot determine custom sampling rate\n");
             return AVERROR_INVALIDDATA;
@@ -255,10 +256,11 @@ static int wv_read_header(AVFormatContext *s)
     AV_WL16(st->codecpar->extradata, wc->header.version);
     st->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id              = AV_CODEC_ID_WAVPACK;
-    st->codecpar->channels              = wc->chan;
-    st->codecpar->channel_layout        = wc->chmask;
+    av_channel_layout_from_mask(&st->codecpar->ch_layout, wc->chmask);
     st->codecpar->sample_rate           = wc->rate;
     st->codecpar->bits_per_coded_sample = wc->bpp;
+    if (wc->header.flags & WV_DSD)
+        st->codecpar->format = AV_SAMPLE_FMT_DSD;
     avpriv_set_pts_info(st, 64, 1, wc->rate);
     st->start_time = 0;
     if (wc->header.total_samples != 0xFFFFFFFFu)
@@ -267,7 +269,7 @@ static int wv_read_header(AVFormatContext *s)
     if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         int64_t cur = avio_tell(s->pb);
         wc->apetag_start = ff_ape_parse_tag(s);
-        if (!av_dict_get(s->metadata, "", NULL, AV_DICT_IGNORE_SUFFIX))
+        if (av_dict_count(s->metadata) == 0)
             ff_id3v1_read(s);
         avio_seek(s->pb, cur, SEEK_SET);
     }
@@ -294,9 +296,9 @@ static int wv_read_packet(AVFormatContext *s, AVPacket *pkt)
     if ((ret = av_new_packet(pkt, wc->header.blocksize + WV_HEADER_SIZE)) < 0)
         return ret;
     memcpy(pkt->data, wc->block_header, WV_HEADER_SIZE);
-    ret = avio_read(s->pb, pkt->data + WV_HEADER_SIZE, wc->header.blocksize);
-    if (ret != wc->header.blocksize) {
-        return AVERROR(EIO);
+    ret = ffio_read_size(s->pb, pkt->data + WV_HEADER_SIZE, wc->header.blocksize);
+    if (ret < 0) {
+        return ret;
     }
     while (!(wc->header.flags & WV_FLAG_FINAL_BLOCK)) {
         if ((ret = wv_read_block_header(s, s->pb)) < 0) {
@@ -328,12 +330,12 @@ static int wv_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-AVInputFormat ff_wv_demuxer = {
-    .name           = "wv",
-    .long_name      = NULL_IF_CONFIG_SMALL("WavPack"),
+const FFInputFormat ff_wv_demuxer = {
+    .p.name         = "wv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("WavPack"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(WVContext),
     .read_probe     = wv_probe,
     .read_header    = wv_read_header,
     .read_packet    = wv_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

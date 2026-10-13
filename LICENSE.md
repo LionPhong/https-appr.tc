@@ -12,7 +12,6 @@ configure to activate them. In this case, FFmpeg's license changes to GPL v2+.
 
 Specifically, the GPL parts of FFmpeg are:
 
-- libpostproc
 - optional x86 optimization in the files
     - `libavcodec/x86/flac_dsp_gpl.asm`
     - `libavcodec/x86/idct_mmx.c`
@@ -45,7 +44,6 @@ Specifically, the GPL parts of FFmpeg are:
     - `vf_owdenoise.c`
     - `vf_perspective.c`
     - `vf_phase.c`
-    - `vf_pp.c`
     - `vf_pp7.c`
     - `vf_pullup.c`
     - `vf_repeatfields.c`
@@ -107,7 +105,7 @@ The following libraries are under LGPL version 3:
 When combining them with FFmpeg, use the configure option `--enable-version3` to
 upgrade FFmpeg to the LGPL v3.
 
-The VMAF, mbedTLS, RK MPI, OpenCORE and VisualOn libraries are under the Apache License
+The mbedTLS, RK MPI, OpenCORE, VisualOn and libastcenc libraries are under the Apache License
 2.0. That license is incompatible with the LGPL v2.1 and the GPL v2, but not with
 version 3 of those licenses. So to combine these libraries with FFmpeg, the
 license version needs to be upgraded by passing `--enable-version3` to configure.

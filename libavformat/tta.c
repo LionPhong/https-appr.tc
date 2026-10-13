@@ -26,6 +26,7 @@
 #include "apetag.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "id3v1.h"
 
@@ -50,36 +51,34 @@ static int tta_read_header(AVFormatContext *s)
 {
     TTAContext *c = s->priv_data;
     AVStream *st;
-    int i, channels, bps, samplerate;
-    int64_t framepos, start_offset;
-    uint32_t nb_samples, crc;
+    int64_t framepos;
+    uint8_t header[22];
 
     ff_id3v1_read(s);
 
-    start_offset = avio_tell(s->pb);
-    if (start_offset < 0)
-        return start_offset;
-    ffio_init_checksum(s->pb, ff_crcEDB88320_update, UINT32_MAX);
-    if (avio_rl32(s->pb) != AV_RL32("TTA1"))
+    int ret = ffio_read_size(s->pb, header, sizeof(header));
+    if (ret < 0)
+        return ret;
+
+    if (AV_RL32(header) != MKTAG('T', 'T', 'A', '1'))
         return AVERROR_INVALIDDATA;
 
-    avio_skip(s->pb, 2); // FIXME: flags
-    channels = avio_rl16(s->pb);
-    bps = avio_rl16(s->pb);
-    samplerate = avio_rl32(s->pb);
+    int channels   = AV_RL16(header +  6);
+    int bps        = AV_RL16(header +  8);
+    int samplerate = AV_RL32(header + 10);
     if(samplerate <= 0 || samplerate > 1000000){
         av_log(s, AV_LOG_ERROR, "nonsense samplerate\n");
         return AVERROR_INVALIDDATA;
     }
 
-    nb_samples = avio_rl32(s->pb);
+    uint32_t nb_samples = AV_RL32(header + 14);
     if (!nb_samples) {
         av_log(s, AV_LOG_ERROR, "invalid number of samples\n");
         return AVERROR_INVALIDDATA;
     }
 
-    crc = ffio_get_checksum(s->pb) ^ UINT32_MAX;
-    if (crc != avio_rl32(s->pb) && s->error_recognition & AV_EF_CRCCHECK) {
+    uint32_t crc = av_crc(av_crc_get_table(AV_CRC_32_IEEE_LE), UINT32_MAX, header, 18) ^ UINT32_MAX;
+    if (crc != AV_RL32(header + 18) && s->error_recognition & AV_EF_CRCCHECK) {
         av_log(s, AV_LOG_ERROR, "Header CRC error\n");
         return AVERROR_INVALIDDATA;
     }
@@ -91,7 +90,7 @@ static int tta_read_header(AVFormatContext *s)
     c->totalframes = nb_samples / c->frame_size + (c->last_frame_size < c->frame_size);
     c->currentframe = 0;
 
-    if(c->totalframes >= UINT_MAX/sizeof(uint32_t) || c->totalframes <= 0){
+    if(c->totalframes >= (INT_MAX - 4)/sizeof(uint32_t) || c->totalframes <= 0){
         av_log(s, AV_LOG_ERROR, "totalframes %d invalid\n", c->totalframes);
         return AVERROR_INVALIDDATA;
     }
@@ -104,22 +103,23 @@ static int tta_read_header(AVFormatContext *s)
     st->start_time = 0;
     st->duration = nb_samples;
 
+    ret = ff_alloc_extradata(st->codecpar, sizeof(header));
+    if (ret < 0)
+        return ret;
+    memcpy(st->codecpar->extradata, header, sizeof(header));
+
     framepos = avio_tell(s->pb);
     if (framepos < 0)
         return framepos;
     framepos += 4 * c->totalframes + 4;
 
-    if (ff_alloc_extradata(st->codecpar, avio_tell(s->pb) - start_offset))
-        return AVERROR(ENOMEM);
-
-    avio_seek(s->pb, start_offset, SEEK_SET);
-    avio_read(s->pb, st->codecpar->extradata, st->codecpar->extradata_size);
-
     ffio_init_checksum(s->pb, ff_crcEDB88320_update, UINT32_MAX);
-    for (i = 0; i < c->totalframes; i++) {
+    for (int i = 0; i < c->totalframes; i++) {
         uint32_t size = avio_rl32(s->pb);
         int r;
-        if ((r = av_add_index_entry(st, framepos, i * c->frame_size, size, 0,
+        if (avio_feof(s->pb))
+            return AVERROR_INVALIDDATA;
+        if ((r = av_add_index_entry(st, framepos, i * (int64_t)c->frame_size, size, 0,
                                     AVINDEX_KEYFRAME)) < 0)
             return r;
         framepos += size;
@@ -132,7 +132,7 @@ static int tta_read_header(AVFormatContext *s)
 
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id = AV_CODEC_ID_TTA;
-    st->codecpar->channels = channels;
+    st->codecpar->ch_layout.nb_channels = channels;
     st->codecpar->sample_rate = samplerate;
     st->codecpar->bits_per_coded_sample = bps;
 
@@ -149,21 +149,22 @@ static int tta_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     TTAContext *c = s->priv_data;
     AVStream *st = s->streams[0];
+    FFStream *const sti = ffstream(st);
     int size, ret;
 
     // FIXME!
     if (c->currentframe >= c->totalframes)
         return AVERROR_EOF;
 
-    if (st->nb_index_entries < c->totalframes) {
+    if (sti->nb_index_entries < c->totalframes) {
         av_log(s, AV_LOG_ERROR, "Index entry disappeared\n");
         return AVERROR_INVALIDDATA;
     }
 
-    size = st->index_entries[c->currentframe].size;
+    size = sti->index_entries[c->currentframe].size;
 
     ret = av_get_packet(s->pb, pkt, size);
-    pkt->dts = st->index_entries[c->currentframe++].timestamp;
+    pkt->dts = sti->index_entries[c->currentframe++].timestamp;
     pkt->duration = c->currentframe == c->totalframes ? c->last_frame_size :
                                                         c->frame_size;
     return ret;
@@ -176,7 +177,7 @@ static int tta_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
     int index = av_index_search_timestamp(st, timestamp, flags);
     if (index < 0)
         return -1;
-    if (avio_seek(s->pb, st->index_entries[index].pos, SEEK_SET) < 0)
+    if (avio_seek(s->pb, ffstream(st)->index_entries[index].pos, SEEK_SET) < 0)
         return -1;
 
     c->currentframe = index;
@@ -184,13 +185,14 @@ static int tta_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
     return 0;
 }
 
-AVInputFormat ff_tta_demuxer = {
-    .name           = "tta",
-    .long_name      = NULL_IF_CONFIG_SMALL("TTA (True Audio)"),
+const FFInputFormat ff_tta_demuxer = {
+    .p.name         = "tta",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("TTA (True Audio)"),
+    .p.extensions   = "tta",
     .priv_data_size = sizeof(TTAContext),
+    .flags_internal = FF_INFMT_FLAG_ID3V2_AUTO,
     .read_probe     = tta_probe,
     .read_header    = tta_read_header,
     .read_packet    = tta_read_packet,
     .read_seek      = tta_read_seek,
-    .extensions     = "tta",
 };

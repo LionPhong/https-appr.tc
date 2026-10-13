@@ -21,6 +21,7 @@
 
 #include "avformat.h"
 #include "internal.h"
+#include "mux.h"
 #include "libavutil/log.h"
 #include "libavutil/intreadwrite.h"
 
@@ -38,12 +39,6 @@ static int srt_write_header(AVFormatContext *avf)
 {
     SRTContext *srt = avf->priv_data;
 
-    if (avf->nb_streams != 1 ||
-        avf->streams[0]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-        av_log(avf, AV_LOG_ERROR,
-               "SRT supports only a single subtitles stream.\n");
-        return AVERROR(EINVAL);
-    }
     if (avf->streams[0]->codecpar->codec_id != AV_CODEC_ID_TEXT &&
         avf->streams[0]->codecpar->codec_id != AV_CODEC_ID_SUBRIP) {
         av_log(avf, AV_LOG_ERROR,
@@ -61,7 +56,8 @@ static int srt_write_packet(AVFormatContext *avf, AVPacket *pkt)
     SRTContext *srt = avf->priv_data;
 
     int64_t s = pkt->pts, e, d = pkt->duration;
-    int size, x1 = -1, y1 = -1, x2 = -1, y2 = -1;
+    size_t size;
+    int x1 = -1, y1 = -1, x2 = -1, y2 = -1;
     const uint8_t *p;
 
     p = av_packet_get_side_data(pkt, AV_PKT_DATA_SUBTITLE_POSITION, &size);
@@ -72,13 +68,6 @@ static int srt_write_packet(AVFormatContext *avf, AVPacket *pkt)
         y2 = AV_RL32(p + 12);
     }
 
-#if FF_API_CONVERGENCE_DURATION
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (d <= 0)
-        /* For backward compatibility, fallback to convergence_duration. */
-        d = pkt->convergence_duration;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     if (s == AV_NOPTS_VALUE || d < 0) {
         av_log(avf, AV_LOG_WARNING,
                "Insufficient timestamps in event number %d.\n", srt->index);
@@ -102,14 +91,17 @@ FF_ENABLE_DEPRECATION_WARNINGS
     return 0;
 }
 
-AVOutputFormat ff_srt_muxer = {
-    .name           = "srt",
-    .long_name      = NULL_IF_CONFIG_SMALL("SubRip subtitle"),
-    .mime_type      = "application/x-subrip",
-    .extensions     = "srt",
+const FFOutputFormat ff_srt_muxer = {
+    .p.name           = "srt",
+    .p.long_name      = NULL_IF_CONFIG_SMALL("SubRip subtitle"),
+    .p.mime_type      = "application/x-subrip",
+    .p.extensions     = "srt",
+    .p.flags          = AVFMT_VARIABLE_FPS | AVFMT_TS_NONSTRICT,
+    .p.video_codec    = AV_CODEC_ID_NONE,
+    .p.audio_codec    = AV_CODEC_ID_NONE,
+    .p.subtitle_codec = AV_CODEC_ID_SUBRIP,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH,
     .priv_data_size = sizeof(SRTContext),
     .write_header   = srt_write_header,
     .write_packet   = srt_write_packet,
-    .flags          = AVFMT_VARIABLE_FPS | AVFMT_TS_NONSTRICT,
-    .subtitle_codec = AV_CODEC_ID_SUBRIP,
 };

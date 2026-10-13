@@ -33,7 +33,9 @@ static inline uint64_t read_time(void)
     uint64_t cycle_counter;
     __asm__ volatile(
         "isb                   \t\n"
-        "mrs %0, pmccntr_el0       "
+        // cntvct_el0 has lower resolution than pmccntr_el0, but is usually
+        // accessible from user space by default.
+        "mrs %0, cntvct_el0        "
         : "=r"(cycle_counter) :: "memory" );
 
     return cycle_counter;

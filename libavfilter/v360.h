@@ -51,6 +51,11 @@ enum Projections {
     BARREL_SPLIT,
     TSPYRAMID,
     HEQUIRECTANGULAR,
+    EQUISOLID,
+    ORTHOGRAPHIC,
+    OCTAHEDRON,
+    CYLINDRICALEA,
+    GOPROMAX,
     NB_PROJECTIONS,
 };
 
@@ -62,6 +67,7 @@ enum InterpMethod {
     LANCZOS,
     SPLINE16,
     GAUSSIAN,
+    MITCHELL,
     NB_INTERP_METHODS,
 };
 
@@ -106,11 +112,18 @@ typedef struct XYRemap {
     float ker[4][4];
 } XYRemap;
 
+typedef struct SliceXYRemap {
+    int16_t *u[2], *v[2];
+    int16_t *ker[2];
+    uint8_t *mask;
+} SliceXYRemap;
+
 typedef struct V360Context {
     const AVClass *class;
     int in, out;
     int interp;
     int alpha;
+    int reset_rot;
     int width, height;
     char *in_forder;
     char *out_forder;
@@ -130,6 +143,7 @@ typedef struct V360Context {
     int fin_pad, fout_pad;
 
     float yaw, pitch, roll;
+    float h_offset, v_offset;
 
     int ih_flip, iv_flip;
     int h_flip, v_flip, d_flip;
@@ -140,32 +154,30 @@ typedef struct V360Context {
     float flat_range[2];
     float iflat_range[2];
 
-    float rot_mat[3][3];
+    float rot_quaternion[2][4];
 
-    float input_mirror_modifier[2];
     float output_mirror_modifier[3];
 
     int in_width, in_height;
     int out_width, out_height;
 
-    int pr_width[4], pr_height[4];
+    int pr_width[AV_VIDEO_MAX_PLANES], pr_height[AV_VIDEO_MAX_PLANES];
 
-    int in_offset_w[4], in_offset_h[4];
-    int out_offset_w[4], out_offset_h[4];
+    int in_offset_w[AV_VIDEO_MAX_PLANES], in_offset_h[AV_VIDEO_MAX_PLANES];
+    int out_offset_w[AV_VIDEO_MAX_PLANES], out_offset_h[AV_VIDEO_MAX_PLANES];
 
-    int planewidth[4], planeheight[4];
-    int inplanewidth[4], inplaneheight[4];
-    int uv_linesize[4];
+    int planewidth[AV_VIDEO_MAX_PLANES], planeheight[AV_VIDEO_MAX_PLANES];
+    int inplanewidth[AV_VIDEO_MAX_PLANES], inplaneheight[AV_VIDEO_MAX_PLANES];
+    int uv_linesize[AV_VIDEO_MAX_PLANES];
     int nb_planes;
     int nb_allocated;
     int elements;
     int mask_size;
     int max_value;
+    int nb_threads;
 
-    int16_t *u[2], *v[2];
-    int16_t *ker[2];
-    uint8_t *mask;
-    unsigned map[4];
+    SliceXYRemap *slice_remap;
+    unsigned map[AV_VIDEO_MAX_PLANES];
 
     int (*in_transform)(const struct V360Context *s,
                         const float *vec, int width, int height,

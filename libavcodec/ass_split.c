@@ -1,5 +1,5 @@
 /*
- * SSA/ASS spliting functions
+ * SSA/ASS splitting functions
  * Copyright (c) 2010  Aurelien Jacobs <aurel@gnuage.org>
  *
  * This file is part of FFmpeg.
@@ -19,7 +19,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avcodec.h"
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "libavutil/error.h"
+#include "libavutil/macros.h"
+#include "libavutil/mem.h"
 #include "ass_split.h"
 
 typedef enum {
@@ -371,12 +379,12 @@ static int ass_split(ASSSplitContext *ctx, const char *buf)
     return buf ? 0 : AVERROR_INVALIDDATA;
 }
 
-ASSSplitContext *ff_ass_split(const char *buf)
+av_cold ASSSplitContext *ff_ass_split(const char *buf)
 {
     ASSSplitContext *ctx = av_mallocz(sizeof(*ctx));
     if (!ctx)
         return NULL;
-    if (buf && !memcmp(buf, "\xef\xbb\xbf", 3)) // Skip UTF-8 BOM header
+    if (buf && !strncmp(buf, "\xef\xbb\xbf", 3)) // Skip UTF-8 BOM header
         buf += 3;
     ctx->current_section = -1;
     if (ass_split(ctx, buf) < 0) {
@@ -410,25 +418,6 @@ static void free_section(ASSSplitContext *ctx, const ASSSection *section)
         av_freep((uint8_t *)&ctx->ass + section->offset);
 }
 
-ASSDialog *ff_ass_split_dialog(ASSSplitContext *ctx, const char *buf,
-                               int cache, int *number)
-{
-    ASSDialog *dialog = NULL;
-    int i, count;
-    if (!cache)
-        for (i=0; i<FF_ARRAY_ELEMS(ass_sections); i++)
-            if (!strcmp(ass_sections[i].section, "Events")) {
-                free_section(ctx, &ass_sections[i]);
-                break;
-            }
-    count = ctx->ass.dialogs_count;
-    if (ass_split(ctx, buf) == 0)
-        dialog = ctx->ass.dialogs + count;
-    if (number)
-        *number = ctx->ass.dialogs_count - count;
-    return dialog;
-}
-
 void ff_ass_free_dialog(ASSDialog **dialogp)
 {
     ASSDialog *dialog = *dialogp;
@@ -441,7 +430,7 @@ void ff_ass_free_dialog(ASSDialog **dialogp)
     av_freep(dialogp);
 }
 
-ASSDialog *ff_ass_split_dialog2(ASSSplitContext *ctx, const char *buf)
+ASSDialog *ff_ass_split_dialog(ASSSplitContext *ctx, const char *buf)
 {
     int i;
     static const ASSFields fields[] = {
@@ -478,7 +467,7 @@ ASSDialog *ff_ass_split_dialog2(ASSSplitContext *ctx, const char *buf)
     return dialog;
 }
 
-void ff_ass_split_free(ASSSplitContext *ctx)
+av_cold void ff_ass_split_free(ASSSplitContext *ctx)
 {
     if (ctx) {
         int i;
@@ -513,7 +502,7 @@ int ff_ass_split_override_codes(const ASSCodesCallbacks *callbacks, void *priv,
             buf++;
             while (*buf == '\\') {
                 char style[2], c[2], sep[2], c_num[2] = "0", tmp[128] = {0};
-                unsigned int color = 0xFFFFFFFF;
+                unsigned int color = 0xFFFFFFFF, dur = 0;
                 int len, size = -1, an = -1, alpha = -1;
                 int x1, y1, x2, y2, t1 = -1, t2 = -1;
                 if (sscanf(buf, "\\%1[bisu]%1[01\\}]%n", style, c, &len) > 1) {
@@ -563,6 +552,11 @@ int ff_ass_split_override_codes(const ASSCodesCallbacks *callbacks, void *priv,
                 } else if (sscanf(buf, "\\org(%d,%d)%1[\\}]%n", &x1, &y1, sep, &len) > 2) {
                     if (callbacks->origin)
                         callbacks->origin(priv, x1, y1);
+                } else if (sscanf(buf, "\\kf%u%1[\\}]%n", &dur, sep, &len) > 1 ||
+                           sscanf(buf, "\\ko%u%1[\\}]%n", &dur, sep, &len) > 1 ||
+                           sscanf(buf, "\\%1[kK]%u%1[\\}]%n", c, &dur, sep, &len) > 2) {
+                    if (callbacks->karaoke)
+                        callbacks->karaoke(priv, dur);
                 } else {
                     len = strcspn(buf+1, "\\}") + 2;  /* skip unknown code */
                 }

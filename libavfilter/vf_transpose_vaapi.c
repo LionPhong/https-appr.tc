@@ -17,16 +17,14 @@
  */
 #include <string.h>
 
-#include "libavutil/avassert.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "transpose.h"
 #include "vaapi_vpp.h"
+#include "video.h"
 
 typedef struct TransposeVAAPIContext {
     VAAPIVPPContext vpp_ctx; // must be the first field
@@ -187,15 +185,17 @@ static av_cold int transpose_vaapi_init(AVFilterContext *avctx)
 
 static int transpose_vaapi_vpp_config_output(AVFilterLink *outlink)
 {
+    FilterLink *outl           = ff_filter_link(outlink);
     AVFilterContext *avctx     = outlink->src;
     VAAPIVPPContext *vpp_ctx   = avctx->priv;
     TransposeVAAPIContext *ctx = avctx->priv;
     AVFilterLink *inlink       = avctx->inputs[0];
+    FilterLink *inl            = ff_filter_link(inlink);
 
     if ((inlink->w >= inlink->h && ctx->passthrough == TRANSPOSE_PT_TYPE_LANDSCAPE) ||
         (inlink->w <= inlink->h && ctx->passthrough == TRANSPOSE_PT_TYPE_PORTRAIT)) {
-        outlink->hw_frames_ctx = av_buffer_ref(inlink->hw_frames_ctx);
-        if (!outlink->hw_frames_ctx)
+        outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
+        if (!outl->hw_frames_ctx)
             return AVERROR(ENOMEM);
         av_log(avctx, AV_LOG_VERBOSE,
                "w:%d h:%d -> w:%d h:%d (passthrough mode)\n",
@@ -233,7 +233,7 @@ static AVFrame *get_video_buffer(AVFilterLink *inlink, int w, int h)
 #define OFFSET(x) offsetof(TransposeVAAPIContext, x)
 #define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
 static const AVOption transpose_vaapi_options[] = {
-    { "dir", "set transpose direction", OFFSET(dir), AV_OPT_TYPE_INT, { .i64 = TRANSPOSE_CCLOCK_FLIP }, 0, 6, FLAGS, "dir" },
+    { "dir", "set transpose direction", OFFSET(dir), AV_OPT_TYPE_INT, { .i64 = TRANSPOSE_CCLOCK_FLIP }, 0, 6, FLAGS, .unit = "dir" },
         { "cclock_flip",   "rotate counter-clockwise with vertical flip", 0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK_FLIP }, .flags=FLAGS, .unit = "dir" },
         { "clock",         "rotate clockwise",                            0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CLOCK       }, .flags=FLAGS, .unit = "dir" },
         { "cclock",        "rotate counter-clockwise",                    0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK      }, .flags=FLAGS, .unit = "dir" },
@@ -243,10 +243,10 @@ static const AVOption transpose_vaapi_options[] = {
         { "vflip",         "flip vertically",                             0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_VFLIP       }, .flags=FLAGS, .unit = "dir" },
 
     { "passthrough", "do not apply transposition if the input matches the specified geometry",
-      OFFSET(passthrough), AV_OPT_TYPE_INT, {.i64=TRANSPOSE_PT_TYPE_NONE},  0, INT_MAX, FLAGS, "passthrough" },
-        { "none",      "always apply transposition",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_NONE},      INT_MIN, INT_MAX, FLAGS, "passthrough" },
-        { "portrait",  "preserve portrait geometry",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_PORTRAIT},  INT_MIN, INT_MAX, FLAGS, "passthrough" },
-        { "landscape", "preserve landscape geometry",  0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_LANDSCAPE}, INT_MIN, INT_MAX, FLAGS, "passthrough" },
+      OFFSET(passthrough), AV_OPT_TYPE_INT, {.i64=TRANSPOSE_PT_TYPE_NONE},  0, INT_MAX, FLAGS, .unit = "passthrough" },
+        { "none",      "always apply transposition",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_NONE},      INT_MIN, INT_MAX, FLAGS, .unit = "passthrough" },
+        { "portrait",  "preserve portrait geometry",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_PORTRAIT},  INT_MIN, INT_MAX, FLAGS, .unit = "passthrough" },
+        { "landscape", "preserve landscape geometry",  0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_LANDSCAPE}, INT_MIN, INT_MAX, FLAGS, .unit = "passthrough" },
 
     { NULL }
 };
@@ -259,10 +259,9 @@ static const AVFilterPad transpose_vaapi_inputs[] = {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = &transpose_vaapi_filter_frame,
-        .get_video_buffer = get_video_buffer,
+        .get_buffer.video = get_video_buffer,
         .config_props = &ff_vaapi_vpp_config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad transpose_vaapi_outputs[] = {
@@ -271,18 +270,17 @@ static const AVFilterPad transpose_vaapi_outputs[] = {
         .type = AVMEDIA_TYPE_VIDEO,
         .config_props = &transpose_vaapi_vpp_config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_transpose_vaapi = {
-    .name           = "transpose_vaapi",
-    .description    = NULL_IF_CONFIG_SMALL("VAAPI VPP for transpose"),
+const FFFilter ff_vf_transpose_vaapi = {
+    .p.name         = "transpose_vaapi",
+    .p.description  = NULL_IF_CONFIG_SMALL("VAAPI VPP for transpose"),
+    .p.priv_class   = &transpose_vaapi_class,
     .priv_size      = sizeof(TransposeVAAPIContext),
     .init           = &transpose_vaapi_init,
     .uninit         = &ff_vaapi_vpp_ctx_uninit,
-    .query_formats  = &ff_vaapi_vpp_query_formats,
-    .inputs         = transpose_vaapi_inputs,
-    .outputs        = transpose_vaapi_outputs,
-    .priv_class     = &transpose_vaapi_class,
+    FILTER_INPUTS(transpose_vaapi_inputs),
+    FILTER_OUTPUTS(transpose_vaapi_outputs),
+    FILTER_QUERY_FUNC2(&ff_vaapi_vpp_query_formats),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

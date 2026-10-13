@@ -36,11 +36,14 @@
 #include <stdint.h>
 #include <zlib.h>
 
+#include "libavutil/attributes_internal.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 #define BITMAPINFOHEADER_SIZE 0x28
 #define TDSF_HEADER_SIZE      0x56
@@ -53,6 +56,7 @@ typedef struct TDSCContext {
     GetByteContext gbc;
 
     AVFrame *refframe;          // full decoded frame (without cursor)
+    AVPacket *jpkt;             // encoded JPEG tile
     AVFrame *jpgframe;          // decoded JPEG tile
     uint8_t *tilebuffer;        // buffer containing tile data
 
@@ -80,6 +84,7 @@ static av_cold int tdsc_close(AVCodecContext *avctx)
 
     av_frame_free(&ctx->refframe);
     av_frame_free(&ctx->jpgframe);
+    av_packet_free(&ctx->jpkt);
     av_freep(&ctx->deflatebuffer);
     av_freep(&ctx->tilebuffer);
     av_freep(&ctx->cursor);
@@ -91,7 +96,6 @@ static av_cold int tdsc_close(AVCodecContext *avctx)
 static av_cold int tdsc_init(AVCodecContext *avctx)
 {
     TDSCContext *ctx = avctx->priv_data;
-    const AVCodec *codec;
     int ret;
 
     avctx->pix_fmt = AV_PIX_FMT_BGR24;
@@ -111,21 +115,20 @@ static av_cold int tdsc_init(AVCodecContext *avctx)
     /* Allocate reference and JPEG frame */
     ctx->refframe = av_frame_alloc();
     ctx->jpgframe = av_frame_alloc();
-    if (!ctx->refframe || !ctx->jpgframe)
+    ctx->jpkt     = av_packet_alloc();
+    if (!ctx->refframe || !ctx->jpgframe || !ctx->jpkt)
         return AVERROR(ENOMEM);
 
     /* Prepare everything needed for JPEG decoding */
-    codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-    if (!codec)
-        return AVERROR_BUG;
-    ctx->jpeg_avctx = avcodec_alloc_context3(codec);
+    EXTERN const FFCodec ff_mjpeg_decoder;
+    ctx->jpeg_avctx = avcodec_alloc_context3(&ff_mjpeg_decoder.p);
     if (!ctx->jpeg_avctx)
         return AVERROR(ENOMEM);
     ctx->jpeg_avctx->flags = avctx->flags;
     ctx->jpeg_avctx->flags2 = avctx->flags2;
-    ctx->jpeg_avctx->dct_algo = avctx->dct_algo;
     ctx->jpeg_avctx->idct_algo = avctx->idct_algo;
-    ret = ff_codec_open2_recursive(ctx->jpeg_avctx, codec, NULL);
+    ctx->jpeg_avctx->max_pixels = avctx->max_pixels;
+    ret = avcodec_open2(ctx->jpeg_avctx, NULL, NULL);
     if (ret < 0)
         return ret;
 
@@ -143,14 +146,23 @@ static void tdsc_paint_cursor(AVCodecContext *avctx, uint8_t *dst, int stride)
 {
     TDSCContext *ctx = avctx->priv_data;
     const uint8_t *cursor = ctx->cursor;
-    int x = ctx->cursor_x - ctx->cursor_hot_x;
-    int y = ctx->cursor_y - ctx->cursor_hot_y;
+    int x, y;
     int w = ctx->cursor_w;
     int h = ctx->cursor_h;
     int i, j;
 
     if (!ctx->cursor)
         return;
+
+    /* A cursor position outside the frame is invalid; skip drawing it.
+     * cursor_x/y come straight from the bitstream, so bound them before
+     * the (16 bit) hot spot shift to avoid overflowing the clip math. */
+    if ((unsigned)ctx->cursor_x >= ctx->width ||
+        (unsigned)ctx->cursor_y >= ctx->height)
+        return;
+
+    x = ctx->cursor_x - ctx->cursor_hot_x;
+    y = ctx->cursor_y - ctx->cursor_hot_y;
 
     if (x + w > ctx->width)
         w = ctx->width - x;
@@ -187,30 +199,28 @@ static void tdsc_paint_cursor(AVCodecContext *avctx, uint8_t *dst, int stride)
 static int tdsc_load_cursor(AVCodecContext *avctx)
 {
     TDSCContext *ctx  = avctx->priv_data;
-    int i, j, k, ret, cursor_fmt;
+    int i, j, k, ret, cursor_fmt, w, h;
     uint8_t *dst;
 
     ctx->cursor_hot_x = bytestream2_get_le16(&ctx->gbc);
     ctx->cursor_hot_y = bytestream2_get_le16(&ctx->gbc);
-    ctx->cursor_w     = bytestream2_get_le16(&ctx->gbc);
-    ctx->cursor_h     = bytestream2_get_le16(&ctx->gbc);
+    w                 = bytestream2_get_le16(&ctx->gbc);
+    h                 = bytestream2_get_le16(&ctx->gbc);
 
-    ctx->cursor_stride = FFALIGN(ctx->cursor_w, 32) * 4;
     cursor_fmt = bytestream2_get_le32(&ctx->gbc);
 
-    if (ctx->cursor_x >= avctx->width || ctx->cursor_y >= avctx->height) {
-        av_log(avctx, AV_LOG_ERROR,
-               "Invalid cursor position (%d.%d outside %dx%d).\n",
-               ctx->cursor_x, ctx->cursor_y, avctx->width, avctx->height);
+    if (cursor_fmt != CUR_FMT_MONO && cursor_fmt != CUR_FMT_BGRA &&
+        cursor_fmt != CUR_FMT_RGBA) {
+        avpriv_request_sample(avctx, "Cursor format %08x", cursor_fmt);
+        return AVERROR_PATCHWELCOME;
+    }
+    if (w < 1 || w > 256 || h < 1 || h > 256) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid cursor dimensions %dx%d.\n", w, h);
         return AVERROR_INVALIDDATA;
     }
-    if (ctx->cursor_w < 1 || ctx->cursor_w > 256 ||
-        ctx->cursor_h < 1 || ctx->cursor_h > 256) {
-        av_log(avctx, AV_LOG_ERROR,
-               "Invalid cursor dimensions %dx%d.\n",
-               ctx->cursor_w, ctx->cursor_h);
-        return AVERROR_INVALIDDATA;
-    }
+    ctx->cursor_w      = w;
+    ctx->cursor_h      = h;
+    ctx->cursor_stride = FFALIGN(w, 32) * 4;
     if (ctx->cursor_hot_x > ctx->cursor_w ||
         ctx->cursor_hot_y > ctx->cursor_h) {
         av_log(avctx, AV_LOG_WARNING, "Invalid hotspot position %d.%d.\n",
@@ -238,7 +248,6 @@ static int tdsc_load_cursor(AVCodecContext *avctx)
                     bits <<= 1;
                 }
             }
-            dst += ctx->cursor_stride - ctx->cursor_w * 4;
         }
 
         dst = ctx->cursor;
@@ -270,7 +279,6 @@ static int tdsc_load_cursor(AVCodecContext *avctx)
                     bits <<= 1;
                 }
             }
-            dst += ctx->cursor_stride - ctx->cursor_w * 4;
         }
         break;
     case CUR_FMT_BGRA:
@@ -302,9 +310,6 @@ static int tdsc_load_cursor(AVCodecContext *avctx)
             }
         }
         break;
-    default:
-        avpriv_request_sample(avctx, "Cursor format %08x", cursor_fmt);
-        return AVERROR_PATCHWELCOME;
     }
 
     return 0;
@@ -342,22 +347,22 @@ static int tdsc_decode_jpeg_tile(AVCodecContext *avctx, int tile_size,
                                  int x, int y, int w, int h)
 {
     TDSCContext *ctx = avctx->priv_data;
-    AVPacket jpkt;
     int ret;
 
     /* Prepare a packet and send to the MJPEG decoder */
-    av_init_packet(&jpkt);
-    jpkt.data = ctx->tilebuffer;
-    jpkt.size = tile_size;
+    av_packet_unref(ctx->jpkt);
+    ctx->jpkt->data = ctx->tilebuffer;
+    ctx->jpkt->size = tile_size;
 
-    ret = avcodec_send_packet(ctx->jpeg_avctx, &jpkt);
+    ret = avcodec_send_packet(ctx->jpeg_avctx, ctx->jpkt);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
         return ret;
     }
 
     ret = avcodec_receive_frame(ctx->jpeg_avctx, ctx->jpgframe);
-    if (ret < 0 || ctx->jpgframe->format != AV_PIX_FMT_YUVJ420P) {
+    if (ret < 0 || ctx->jpgframe->format != AV_PIX_FMT_YUVJ420P ||
+        w > ctx->jpgframe->width || h > ctx->jpgframe->height) {
         av_log(avctx, AV_LOG_ERROR,
                "JPEG decoding error (%d).\n", ret);
 
@@ -390,7 +395,7 @@ static int tdsc_decode_tiles(AVCodecContext *avctx, int number_tiles)
     for (i = 0; i < number_tiles; i++) {
         int tile_size;
         int tile_mode;
-        int x, y, w, h;
+        int x, y, x2, y2, w, h;
         int ret;
 
         if (bytestream2_get_bytes_left(&ctx->gbc) < 4 ||
@@ -401,27 +406,26 @@ static int tdsc_decode_tiles(AVCodecContext *avctx, int number_tiles)
         }
 
         tile_size = bytestream2_get_le32(&ctx->gbc);
-        if (bytestream2_get_bytes_left(&ctx->gbc) < tile_size)
+        if (bytestream2_get_bytes_left(&ctx->gbc) < tile_size + 24LL)
             return AVERROR_INVALIDDATA;
 
         tile_mode = bytestream2_get_le32(&ctx->gbc);
         bytestream2_skip(&ctx->gbc, 4); // unknown
         x = bytestream2_get_le32(&ctx->gbc);
         y = bytestream2_get_le32(&ctx->gbc);
-        w = bytestream2_get_le32(&ctx->gbc) - x;
-        h = bytestream2_get_le32(&ctx->gbc) - y;
+        x2 = bytestream2_get_le32(&ctx->gbc);
+        y2 = bytestream2_get_le32(&ctx->gbc);
 
-        if (x >= ctx->width || y >= ctx->height) {
+        if (x < 0 || y < 0 || x2 <= x || y2 <= y ||
+            x2 > ctx->width || y2 > ctx->height
+        ) {
             av_log(avctx, AV_LOG_ERROR,
-                   "Invalid tile position (%d.%d outside %dx%d).\n",
-                   x, y, ctx->width, ctx->height);
+                   "Invalid tile position (%d.%d %d.%d outside %dx%d).\n",
+                   x, y, x2, y2, ctx->width, ctx->height);
             return AVERROR_INVALIDDATA;
         }
-        if (x + w > ctx->width || y + h > ctx->height) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "Invalid tile size %dx%d\n", w, h);
-            return AVERROR_INVALIDDATA;
-        }
+        w = x2 - x;
+        h = y2 - y;
 
         ret = av_reallocp(&ctx->tilebuffer, tile_size);
         if (!ctx->tilebuffer)
@@ -435,6 +439,9 @@ static int tdsc_decode_tiles(AVCodecContext *avctx, int number_tiles)
             if (ret < 0)
                 return ret;
         } else if (tile_mode == MKTAG(' ','W','A','R')) {
+            if (3LL * w * h > tile_size)
+                return AVERROR_INVALIDDATA;
+
             /* Just copy the buffer to output */
             av_image_copy_plane(ctx->refframe->data[0] + x * 3 +
                                 ctx->refframe->linesize[0] * y,
@@ -479,11 +486,15 @@ static int tdsc_parse_tdsf(AVCodecContext *avctx, int number_tiles)
             return ret;
         init_refframe = 1;
     }
-    ctx->refframe->width  = ctx->width  = w;
-    ctx->refframe->height = ctx->height = h;
+    ctx->width  = w;
+    ctx->height = h;
 
     /* Allocate the reference frame if not already done or on size change */
     if (init_refframe) {
+        av_frame_unref(ctx->refframe);
+        ctx->refframe->format = avctx->pix_fmt;
+        ctx->refframe->width  = w;
+        ctx->refframe->height = h;
         ret = av_frame_get_buffer(ctx->refframe, 0);
         if (ret < 0)
             return ret;
@@ -520,26 +531,30 @@ static int tdsc_parse_dtsm(AVCodecContext *avctx)
     return 0;
 }
 
-static int tdsc_decode_frame(AVCodecContext *avctx, void *data,
+static int tdsc_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                              int *got_frame, AVPacket *avpkt)
 {
     TDSCContext *ctx = avctx->priv_data;
-    AVFrame *frame = data;
     int ret, tag_header, keyframe = 0;
     uLongf dlen;
 
     /* Resize deflate buffer on resolution change */
     if (ctx->width != avctx->width || ctx->height != avctx->height) {
-        ctx->deflatelen = avctx->width * avctx->height * (3 + 1);
-        ret = av_reallocp(&ctx->deflatebuffer, ctx->deflatelen);
-        if (ret < 0)
-            return ret;
+        int deflatelen = avctx->width * avctx->height * (3 + 1);
+        if (deflatelen != ctx->deflatelen) {
+            ctx->deflatelen =deflatelen;
+            ret = av_reallocp(&ctx->deflatebuffer, ctx->deflatelen);
+            if (ret < 0) {
+                ctx->deflatelen = 0;
+                return ret;
+            }
+        }
     }
     dlen = ctx->deflatelen;
 
     /* Frames are deflated, need to inflate them first */
     ret = uncompress(ctx->deflatebuffer, &dlen, avpkt->data, avpkt->size);
-    if (ret) {
+    if (ret != Z_OK) {
         av_log(avctx, AV_LOG_ERROR, "Deflate error %d.\n", ret);
         return AVERROR_UNKNOWN;
     }
@@ -606,7 +621,7 @@ static int tdsc_decode_frame(AVCodecContext *avctx, void *data,
     /* Frame is ready to be output */
     if (keyframe) {
         frame->pict_type = AV_PICTURE_TYPE_I;
-        frame->key_frame = 1;
+        frame->flags |= AV_FRAME_FLAG_KEY;
     } else {
         frame->pict_type = AV_PICTURE_TYPE_P;
     }
@@ -615,16 +630,15 @@ static int tdsc_decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
-AVCodec ff_tdsc_decoder = {
-    .name           = "tdsc",
-    .long_name      = NULL_IF_CONFIG_SMALL("TDSC"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TDSC,
+const FFCodec ff_tdsc_decoder = {
+    .p.name         = "tdsc",
+    CODEC_LONG_NAME("TDSC"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TDSC,
     .init           = tdsc_init,
-    .decode         = tdsc_decode_frame,
+    FF_CODEC_DECODE_CB(tdsc_decode_frame),
     .close          = tdsc_close,
     .priv_data_size = sizeof(TDSCContext),
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

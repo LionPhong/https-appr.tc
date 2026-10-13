@@ -19,26 +19,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "libavutil/file_open.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 
-#include "formats.h"
+#include "filters.h"
 #include "opencl.h"
-
-int ff_opencl_filter_query_formats(AVFilterContext *avctx)
-{
-    const static enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_OPENCL,
-        AV_PIX_FMT_NONE,
-    };
-    AVFilterFormats *formats;
-
-    formats = ff_make_format_list(pix_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-
-    return ff_set_common_formats(avctx, formats);
-}
 
 static int opencl_filter_set_device(AVFilterContext *avctx,
                                     AVBufferRef *device)
@@ -59,12 +45,13 @@ static int opencl_filter_set_device(AVFilterContext *avctx,
 
 int ff_opencl_filter_config_input(AVFilterLink *inlink)
 {
+    FilterLink            *l = ff_filter_link(inlink);
     AVFilterContext   *avctx = inlink->dst;
     OpenCLFilterContext *ctx = avctx->priv;
     AVHWFramesContext *input_frames;
     int err;
 
-    if (!inlink->hw_frames_ctx) {
+    if (!l->hw_frames_ctx) {
         av_log(avctx, AV_LOG_ERROR, "OpenCL filtering requires a "
                "hardware frames context on the input.\n");
         return AVERROR(EINVAL);
@@ -74,7 +61,7 @@ int ff_opencl_filter_config_input(AVFilterLink *inlink)
     if (avctx->inputs[0] != inlink)
         return 0;
 
-    input_frames = (AVHWFramesContext*)inlink->hw_frames_ctx->data;
+    input_frames = (AVHWFramesContext*)l->hw_frames_ctx->data;
     if (input_frames->format != AV_PIX_FMT_OPENCL)
         return AVERROR(EINVAL);
 
@@ -95,13 +82,14 @@ int ff_opencl_filter_config_input(AVFilterLink *inlink)
 
 int ff_opencl_filter_config_output(AVFilterLink *outlink)
 {
+    FilterLink            *l = ff_filter_link(outlink);
     AVFilterContext   *avctx = outlink->src;
     OpenCLFilterContext *ctx = avctx->priv;
     AVBufferRef       *output_frames_ref = NULL;
     AVHWFramesContext *output_frames;
     int err;
 
-    av_buffer_unref(&outlink->hw_frames_ctx);
+    av_buffer_unref(&l->hw_frames_ctx);
 
     if (!ctx->device_ref) {
         if (!avctx->hw_device_ctx) {
@@ -134,7 +122,7 @@ int ff_opencl_filter_config_output(AVFilterLink *outlink)
         goto fail;
     }
 
-    outlink->hw_frames_ctx = output_frames_ref;
+    l->hw_frames_ctx = output_frames_ref;
     outlink->w = ctx->output_width;
     outlink->h = ctx->output_height;
 
@@ -225,7 +213,7 @@ int ff_opencl_filter_load_program_from_file(AVFilterContext *avctx,
     const char *src_const;
     int err;
 
-    file = av_fopen_utf8(filename, "r");
+    file = avpriv_fopen_utf8(filename, "r");
     if (!file) {
         av_log(avctx, AV_LOG_ERROR, "Unable to open program "
                "source file \"%s\".\n", filename);
@@ -257,7 +245,7 @@ int ff_opencl_filter_load_program_from_file(AVFilterContext *avctx,
             goto fail;
         }
         pos += rb;
-        if (pos < len)
+        if (pos + 1 < len)
             break;
         len <<= 1;
         err = av_reallocp(&src, len);

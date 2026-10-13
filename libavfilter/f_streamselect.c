@@ -18,13 +18,13 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
 #include "audio.h"
 #include "filters.h"
 #include "formats.h"
 #include "framesync.h"
-#include "internal.h"
 #include "video.h"
 
 typedef struct StreamSelectContext {
@@ -48,7 +48,7 @@ static const AVOption streamselect_options[] = {
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(streamselect);
+AVFILTER_DEFINE_CLASS_EXT(streamselect, "(a)streamselect", streamselect_options);
 
 static int process_frame(FFFrameSync *fs)
 {
@@ -64,11 +64,12 @@ static int process_frame(FFFrameSync *fs)
 
     for (j = 0; j < ctx->nb_inputs; j++) {
         for (i = 0; i < s->nb_map; i++) {
+            FilterLink *outl = ff_filter_link(ctx->outputs[i]);
             if (s->map[i] == j) {
                 AVFrame *out;
 
                 if (s->is_audio && s->last_pts[j] == in[j]->pts &&
-                    ctx->outputs[i]->frame_count_in > 0)
+                    outl->frame_count_in > 0)
                     continue;
                 out = av_frame_clone(in[j]);
                 if (!out)
@@ -97,11 +98,13 @@ static int activate(AVFilterContext *ctx)
 
 static int config_output(AVFilterLink *outlink)
 {
+    FilterLink *outl     = ff_filter_link(outlink);
     AVFilterContext *ctx = outlink->src;
     StreamSelectContext *s = ctx->priv;
     const int outlink_idx = FF_OUTLINK_IDX(outlink);
     const int inlink_idx  = s->map[outlink_idx];
     AVFilterLink *inlink = ctx->inputs[inlink_idx];
+    FilterLink      *inl = ff_filter_link(inlink);
     FFFrameSyncIn *in;
     int i, ret;
 
@@ -114,12 +117,11 @@ static int config_output(AVFilterLink *outlink)
         outlink->w = inlink->w;
         outlink->h = inlink->h;
         outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
-        outlink->frame_rate = inlink->frame_rate;
+        outl->frame_rate = inl->frame_rate;
         break;
     case AVMEDIA_TYPE_AUDIO:
         outlink->sample_rate    = inlink->sample_rate;
-        outlink->channels       = inlink->channels;
-        outlink->channel_layout = inlink->channel_layout;
+        outlink->ch_layout.nb_channels       = inlink->ch_layout.nb_channels;
         break;
     }
 
@@ -167,16 +169,13 @@ static int parse_definition(AVFilterContext *ctx, int nb_pads, int is_input, int
         av_log(ctx, AV_LOG_DEBUG, "Add %s pad %s\n", padtype, pad.name);
 
         if (is_input) {
-            ret = ff_insert_inpad(ctx, i, &pad);
+            ret = ff_append_inpad_free_name(ctx, &pad);
         } else {
             pad.config_props  = config_output;
-            ret = ff_insert_outpad(ctx, i, &pad);
+            ret = ff_append_outpad_free_name(ctx, &pad);
         }
-
-        if (ret < 0) {
-            av_freep(&pad.name);
+        if (ret < 0)
             return ret;
-        }
     }
 
     return 0;
@@ -249,7 +248,7 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
 
         if (ret < 0)
             return ret;
-        return avfilter_config_links(ctx);
+        return 0;
     }
     return AVERROR(ENOSYS);
 }
@@ -295,63 +294,29 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->map);
     av_freep(&s->frames);
     ff_framesync_uninit(&s->fs);
-
-    for (int i = 0; i < ctx->nb_inputs; i++)
-        av_freep(&ctx->input_pads[i].name);
-
-    for (int i = 0; i < ctx->nb_outputs; i++)
-        av_freep(&ctx->output_pads[i].name);
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    AVFilterFormats *formats, *rates = NULL;
-    AVFilterChannelLayouts *layouts = NULL;
-    int ret, i;
-
-    for (i = 0; i < ctx->nb_inputs; i++) {
-        formats = ff_all_formats(ctx->inputs[i]->type);
-        if ((ret = ff_set_common_formats(ctx, formats)) < 0)
-            return ret;
-
-        if (ctx->inputs[i]->type == AVMEDIA_TYPE_AUDIO) {
-            rates = ff_all_samplerates();
-            if ((ret = ff_set_common_samplerates(ctx, rates)) < 0)
-                return ret;
-            layouts = ff_all_channel_counts();
-            if ((ret = ff_set_common_channel_layouts(ctx, layouts)) < 0)
-                return ret;
-        }
-    }
-
-    return 0;
-}
-
-AVFilter ff_vf_streamselect = {
-    .name            = "streamselect",
-    .description     = NULL_IF_CONFIG_SMALL("Select video streams"),
+const FFFilter ff_vf_streamselect = {
+    .p.name          = "streamselect",
+    .p.description   = NULL_IF_CONFIG_SMALL("Select video streams"),
+    .p.priv_class    = &streamselect_class,
+    .p.flags         = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_DYNAMIC_OUTPUTS,
     .init            = init,
-    .query_formats   = query_formats,
     .process_command = process_command,
     .uninit          = uninit,
     .activate        = activate,
     .priv_size       = sizeof(StreamSelectContext),
-    .priv_class      = &streamselect_class,
-    .flags           = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_DYNAMIC_OUTPUTS,
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_PARAMS,
 };
 
-#define astreamselect_options streamselect_options
-AVFILTER_DEFINE_CLASS(astreamselect);
-
-AVFilter ff_af_astreamselect = {
-    .name            = "astreamselect",
-    .description     = NULL_IF_CONFIG_SMALL("Select audio streams"),
+const FFFilter ff_af_astreamselect = {
+    .p.name          = "astreamselect",
+    .p.description   = NULL_IF_CONFIG_SMALL("Select audio streams"),
+    .p.priv_class    = &streamselect_class,
+    .p.flags         = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_DYNAMIC_OUTPUTS,
     .init            = init,
-    .query_formats   = query_formats,
     .process_command = process_command,
     .uninit          = uninit,
     .activate        = activate,
     .priv_size       = sizeof(StreamSelectContext),
-    .priv_class      = &astreamselect_class,
-    .flags           = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_DYNAMIC_OUTPUTS,
 };

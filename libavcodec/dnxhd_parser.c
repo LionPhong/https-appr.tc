@@ -26,6 +26,7 @@
 
 #include "parser.h"
 #include "dnxhddata.h"
+#include "parser_internal.h"
 
 typedef struct {
     ParseContext pc;
@@ -73,9 +74,9 @@ static int dnxhd_find_frame_end(DNXHDParserContext *dctx,
                 if (cid <= 0)
                     continue;
 
-                remaining = avpriv_dnxhd_get_frame_size(cid);
+                remaining = ff_dnxhd_get_frame_size(cid);
                 if (remaining <= 0) {
-                    remaining = avpriv_dnxhd_get_hr_frame_size(cid, dctx->w, dctx->h);
+                    remaining = ff_dnxhd_get_hr_frame_size(cid, dctx->w, dctx->h);
                     if (remaining <= 0)
                         continue;
                 }
@@ -138,9 +139,9 @@ static int dnxhd_parse(AVCodecParserContext *s,
     return next;
 }
 
-AVCodecParser ff_dnxhd_parser = {
-    .codec_ids      = { AV_CODEC_ID_DNXHD },
+const FFCodecParser ff_dnxhd_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_DNXHD),
     .priv_data_size = sizeof(DNXHDParserContext),
-    .parser_parse   = dnxhd_parse,
-    .parser_close   = ff_parse_close,
+    .parse          = dnxhd_parse,
+    .close          = ff_parse_close,
 };

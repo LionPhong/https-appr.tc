@@ -53,8 +53,6 @@
 /** Frequency in Hz for lower limit of noise substitution **/
 #define NOISE_LOW_LIMIT 4000
 
-#define sclip(x) av_clip(x,60,218)
-
 /* Reflects the cost to change codebooks */
 static inline int ff_pns_bits(SingleChannelElement *sce, int w, int g)
 {
@@ -71,9 +69,8 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
 {
     int start = 0, i, w, w2, g, recomprd;
     int destbits = avctx->bit_rate * 1024.0 / avctx->sample_rate
-        / ((avctx->flags & AV_CODEC_FLAG_QSCALE) ? 2.0f : avctx->channels)
+        / ((avctx->flags & AV_CODEC_FLAG_QSCALE) ? 2.0f : avctx->ch_layout.nb_channels)
         * (lambda / 120.f);
-    int refbits = destbits;
     int toomanybits, toofewbits;
     char nzs[128];
     uint8_t nextband[128];
@@ -103,7 +100,7 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
      */
     float sfoffs = av_clipf(log2f(120.0f / lambda) * 4.0f, -5, 10);
 
-    int fflag, minscaler, maxscaler, nminscaler;
+    int fflag, minscaler, nminscaler;
     int its  = 0;
     int maxits = 30;
     int allz = 0;
@@ -174,32 +171,8 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
     /** and zero out above cutoff frequency */
     {
         int wlen = 1024 / sce->ics.num_windows;
-        int bandwidth;
-
-        /**
-         * Scale, psy gives us constant quality, this LP only scales
-         * bitrate by lambda, so we save bits on subjectively unimportant HF
-         * rather than increase quantization noise. Adjust nominal bitrate
-         * to effective bitrate according to encoding parameters,
-         * AAC_CUTOFF_FROM_BITRATE is calibrated for effective bitrate.
-         */
-        float rate_bandwidth_multiplier = 1.5f;
-        int frame_bit_rate = (avctx->flags & AV_CODEC_FLAG_QSCALE)
-            ? (refbits * rate_bandwidth_multiplier * avctx->sample_rate / 1024)
-            : (avctx->bit_rate / avctx->channels);
-
-        /** Compensate for extensions that increase efficiency */
-        if (s->options.pns || s->options.intensity_stereo)
-            frame_bit_rate *= 1.15f;
-
-        if (avctx->cutoff > 0) {
-            bandwidth = avctx->cutoff;
-        } else {
-            bandwidth = FFMAX(3000, AAC_CUTOFF_FROM_BITRATE(frame_bit_rate, 1, avctx->sample_rate));
-            s->psy.cutoff = bandwidth;
-        }
-
-        cutoff = bandwidth * 2 * wlen / avctx->sample_rate;
+        /* the bandwidth is fixed at init and shared with the psy model */
+        cutoff = s->bandwidth * 2 * wlen / avctx->sample_rate;
         pns_start_pos = NOISE_LOW_LIMIT * 2 * wlen / avctx->sample_rate;
     }
 
@@ -291,7 +264,7 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
 
     if (!allz)
         return;
-    s->abs_pow34(s->scoefs, sce->coeffs, 1024);
+    s->aacdsp.abs_pow34(s->scoefs, sce->coeffs, 1024);
     ff_quantize_band_cost_cache_init(s);
 
     for (i = 0; i < sizeof(minsf) / sizeof(minsf[0]); ++i)
@@ -313,14 +286,14 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
 
     /**
      * Scale uplims to match rate distortion to quality
-     * bu applying noisy band depriorization and tonal band priorization.
+     * bu applying noisy band depriorization and tonal band prioritization.
      * Maxval-energy ratio gives us an idea of how noisy/tonal the band is.
      * If maxval^2 ~ energy, then that band is mostly noise, and we can relax
      * rate distortion requirements.
      */
     memcpy(euplims, uplims, sizeof(euplims));
     for (w = 0; w < sce->ics.num_windows; w += sce->ics.group_len[w]) {
-        /** psy already priorizes transients to some extent */
+        /** psy already prioritizes transients to some extent */
         float de_psy_factor = (sce->ics.num_windows > 1) ? 8.0f / sce->ics.group_len[w] : 1.0f;
         start = w*128;
         for (g = 0;  g < sce->ics.num_swb; g++) {
@@ -333,7 +306,7 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
                     nzslope * cleanup_factor);
                 energy2uplim *= de_psy_factor;
                 if (!(avctx->flags & AV_CODEC_FLAG_QSCALE)) {
-                    /** In ABR, we need to priorize less and let rate control do its thing */
+                    /** In ABR, we need to prioritize less and let rate control do its thing */
                     energy2uplim = sqrtf(energy2uplim);
                 }
                 energy2uplim = FFMAX(0.015625f, FFMIN(1.0f, energy2uplim));
@@ -347,7 +320,7 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
                     2.0f);
                 energy2uplim *= de_psy_factor;
                 if (!(avctx->flags & AV_CODEC_FLAG_QSCALE)) {
-                    /** In ABR, we need to priorize less and let rate control do its thing */
+                    /** In ABR, we need to prioritize less and let rate control do its thing */
                     energy2uplim = sqrtf(energy2uplim);
                 }
                 energy2uplim = FFMAX(0.015625f, FFMIN(1.0f, energy2uplim));
@@ -574,12 +547,10 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
         }
 
         minscaler = SCALE_MAX_POS;
-        maxscaler = 0;
         for (w = 0; w < sce->ics.num_windows; w += sce->ics.group_len[w]) {
             for (g = 0;  g < sce->ics.num_swb; g++) {
                 if (!sce->zeroes[w*16+g]) {
                     minscaler = FFMIN(minscaler, sce->sf_idx[w*16+g]);
-                    maxscaler = FFMAX(maxscaler, sce->sf_idx[w*16+g]);
                 }
             }
         }

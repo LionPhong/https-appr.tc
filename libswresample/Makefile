@@ -4,8 +4,10 @@ FFLIBS = avutil
 
 HEADERS = swresample.h                       \
           version.h                          \
+          version_major.h                    \
 
 OBJS = audioconvert.o                        \
+       dsd2pcm.o                             \
        dither.o                              \
        options.o                             \
        rematrix.o                            \
@@ -13,11 +15,16 @@ OBJS = audioconvert.o                        \
        resample_dsp.o                        \
        swresample.o                          \
        swresample_frame.o                    \
+       version.o                             \
 
 OBJS-$(CONFIG_LIBSOXR) += soxr_resample.o
-OBJS-$(CONFIG_SHARED)  += log2_tab.o
+
+# Objects duplicated from other libraries for shared builds
+SHLIBOBJS              += log2_tab.o reverse.o
 
 # Windows resource file
-SLIBOBJS-$(HAVE_GNU_WINDRES) += swresampleres.o
+SHLIBOBJS-$(HAVE_GNU_WINDRES) += swresampleres.o
 
-TESTPROGS = swresample
+TESTPROGS = rematrix \
+            swresample \
+            swresample_resample_realloc \

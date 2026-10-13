@@ -27,12 +27,18 @@
  * project, and ported by Arwa Arif for FFmpeg.
  */
 
-#include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
-#include "vf_pp7.h"
+#include "libavutil/video_enc_params.h"
+
+#include "avfilter.h"
+#include "filters.h"
+#include "qp_table.h"
+#include "vf_pp7dsp.h"
+#include "video.h"
 
 enum mode {
     MODE_HARD,
@@ -40,14 +46,31 @@ enum mode {
     MODE_MEDIUM
 };
 
+typedef struct PP7Context {
+    const AVClass *class;
+    int thres2[99][16];
+
+    int qp;
+    int mode;
+    enum AVVideoEncParamsType qscale_type;
+    int hsub;
+    int vsub;
+    int temp_stride;
+    uint8_t *src;
+
+    int (*requantize)(const struct PP7Context *p, const int16_t *src, int qp);
+
+    PP7DSPContext pp7dsp;
+} PP7Context;
+
 #define OFFSET(x) offsetof(PP7Context, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 static const AVOption pp7_options[] = {
     { "qp", "force a constant quantizer parameter", OFFSET(qp), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 64, FLAGS },
-    { "mode", "set thresholding mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64 = MODE_MEDIUM}, 0, 2, FLAGS, "mode" },
-        { "hard",   "hard thresholding",   0, AV_OPT_TYPE_CONST, {.i64 = MODE_HARD},   INT_MIN, INT_MAX, FLAGS, "mode" },
-        { "soft",   "soft thresholding",   0, AV_OPT_TYPE_CONST, {.i64 = MODE_SOFT},   INT_MIN, INT_MAX, FLAGS, "mode" },
-        { "medium", "medium thresholding", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_MEDIUM}, INT_MIN, INT_MAX, FLAGS, "mode" },
+    { "mode", "set thresholding mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64 = MODE_MEDIUM}, 0, 2, FLAGS, .unit = "mode" },
+        { "hard",   "hard thresholding",   0, AV_OPT_TYPE_CONST, {.i64 = MODE_HARD},   INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
+        { "soft",   "soft thresholding",   0, AV_OPT_TYPE_CONST, {.i64 = MODE_SOFT},   INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
+        { "medium", "medium thresholding", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_MEDIUM}, INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
     { NULL }
 };
 
@@ -91,7 +114,7 @@ static void init_thres2(PP7Context *p)
     }
 }
 
-static inline void dctA_c(int16_t *dst, uint8_t *src, int stride)
+static inline void dctA_c(int16_t *dst, const uint8_t *src, int stride)
 {
     int i;
 
@@ -114,30 +137,7 @@ static inline void dctA_c(int16_t *dst, uint8_t *src, int stride)
     }
 }
 
-static void dctB_c(int16_t *dst, int16_t *src)
-{
-    int i;
-
-    for (i = 0; i < 4; i++) {
-        int s0 = src[0 * 4] + src[6 * 4];
-        int s1 = src[1 * 4] + src[5 * 4];
-        int s2 = src[2 * 4] + src[4 * 4];
-        int s3 = src[3 * 4];
-        int s = s3 + s3;
-        s3 = s  - s0;
-        s0 = s  + s0;
-        s  = s2 + s1;
-        s2 = s2 - s1;
-        dst[0 * 4] = s0 + s;
-        dst[2 * 4] = s0 - s;
-        dst[1 * 4] = 2 * s3 +     s2;
-        dst[3 * 4] =     s3 - 2 * s2;
-        src++;
-        dst++;
-    }
-}
-
-static int hardthresh_c(PP7Context *p, int16_t *src, int qp)
+static int hardthresh_c(const PP7Context *p, const int16_t *src, int qp)
 {
     int i;
     int a;
@@ -153,7 +153,7 @@ static int hardthresh_c(PP7Context *p, int16_t *src, int qp)
     return (a + (1 << 11)) >> 12;
 }
 
-static int mediumthresh_c(PP7Context *p, int16_t *src, int qp)
+static int mediumthresh_c(const PP7Context *p, const int16_t *src, int qp)
 {
     int i;
     int a;
@@ -177,7 +177,7 @@ static int mediumthresh_c(PP7Context *p, int16_t *src, int qp)
     return (a + (1 << 11)) >> 12;
 }
 
-static int softthresh_c(PP7Context *p, int16_t *src, int qp)
+static int softthresh_c(const PP7Context *p, const int16_t *src, int qp)
 {
     int i;
     int a;
@@ -197,10 +197,10 @@ static int softthresh_c(PP7Context *p, int16_t *src, int qp)
     return (a + (1 << 11)) >> 12;
 }
 
-static void filter(PP7Context *p, uint8_t *dst, uint8_t *src,
+static void filter(PP7Context *p, uint8_t *dst, const uint8_t *src,
                    int dst_stride, int src_stride,
                    int width, int height,
-                   uint8_t *qp_store, int qp_stride, int is_luma)
+                   const uint8_t *qp_store, int qp_stride, int is_luma)
 {
     int x, y;
     const int stride = is_luma ? p->temp_stride : ((width + 16 + 15) & (~15));
@@ -226,10 +226,9 @@ static void filter(PP7Context *p, uint8_t *dst, uint8_t *src,
     for (y = 0; y < height; y++) {
         for (x = -8; x < 0; x += 4) {
             const int index = x + y * stride + (8 - 3) * (1 + stride) + 8; //FIXME silly offset
-            uint8_t *src  = p_src + index;
             int16_t *tp   = temp + 4 * x;
 
-            dctA_c(tp + 4 * 8, src, stride);
+            dctA_c(tp + 4 * 8, p_src + index, stride);
         }
         for (x = 0; x < width; ) {
             const int qps = 3 + is_luma;
@@ -244,14 +243,13 @@ static void filter(PP7Context *p, uint8_t *dst, uint8_t *src,
             }
             for (; x < end; x++) {
                 const int index = x + y * stride + (8 - 3) * (1 + stride) + 8; //FIXME silly offset
-                uint8_t *src = p_src + index;
                 int16_t *tp  = temp + 4 * x;
                 int v;
 
                 if ((x & 3) == 0)
-                    dctA_c(tp + 4 * 8, src, stride);
+                    dctA_c(tp + 4 * 8, p_src + index, stride);
 
-                p->dctB(block, tp);
+                p->pp7dsp.dctB(block, tp);
 
                 v = p->requantize(p, block, qp);
                 v = (v + dither[y & 7][x & 7]) >> 6;
@@ -263,23 +261,15 @@ static void filter(PP7Context *p, uint8_t *dst, uint8_t *src,
     }
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P,
-        AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_GBRP,
-        AV_PIX_FMT_GRAY8,    AV_PIX_FMT_NONE
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P,
+    AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_GBRP,
+    AV_PIX_FMT_GRAY8,    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -306,10 +296,7 @@ static int config_input(AVFilterLink *inlink)
         case 2: pp7->requantize = mediumthresh_c; break;
     }
 
-    pp7->dctB = dctB_c;
-
-    if (ARCH_X86)
-        ff_pp7_init_x86(pp7);
+    ff_pp7dsp_init(&pp7->pp7dsp);
 
     return 0;
 }
@@ -322,10 +309,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out = in;
 
     int qp_stride = 0;
-    uint8_t *qp_table = NULL;
+    int8_t *qp_table = NULL;
 
-    if (!pp7->qp)
-        qp_table = av_frame_get_qp_table(in, &qp_stride, &pp7->qscale_type);
+    if (!pp7->qp) {
+        int ret = ff_qp_table_extract(in, &qp_table, &qp_stride, NULL, &pp7->qscale_type);
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
+    }
 
     if (!ctx->is_disabled) {
         const int cw = AV_CEIL_RSHIFT(inlink->w, pp7->hsub);
@@ -340,6 +332,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             out = ff_get_video_buffer(outlink, aligned_w, aligned_h);
             if (!out) {
                 av_frame_free(&in);
+                av_freep(&qp_table);
                 return AVERROR(ENOMEM);
             }
             av_frame_copy_props(out, in);
@@ -355,7 +348,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                    cw,        ch,        qp_table, qp_stride, 0);
             filter(pp7, out->data[2], in->data[2], out->linesize[2], in->linesize[2],
                    cw,        ch,        qp_table, qp_stride, 0);
-            emms_c();
         }
     }
 
@@ -366,6 +358,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                 inlink->w, inlink->h);
         av_frame_free(&in);
     }
+    av_freep(&qp_table);
     return ff_filter_frame(outlink, out);
 }
 
@@ -382,25 +375,16 @@ static const AVFilterPad pp7_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad pp7_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_pp7 = {
-    .name            = "pp7",
-    .description     = NULL_IF_CONFIG_SMALL("Apply Postprocessing 7 filter."),
+const FFFilter ff_vf_pp7 = {
+    .p.name          = "pp7",
+    .p.description   = NULL_IF_CONFIG_SMALL("Apply Postprocessing 7 filter."),
+    .p.priv_class    = &pp7_class,
+    .p.flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size       = sizeof(PP7Context),
     .uninit          = uninit,
-    .query_formats   = query_formats,
-    .inputs          = pp7_inputs,
-    .outputs         = pp7_outputs,
-    .priv_class      = &pp7_class,
-    .flags           = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
+    FILTER_INPUTS(pp7_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

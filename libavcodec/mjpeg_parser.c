@@ -27,6 +27,7 @@
  */
 
 #include "parser.h"
+#include "parser_internal.h"
 
 typedef struct MJPEGParserContext{
     ParseContext pc;
@@ -80,10 +81,10 @@ static int find_frame_end(MJPEGParserContext *m, const uint8_t *buf, int buf_siz
                     pc->frame_start_found=0;
                     pc->state=0;
                     return i-3;
+                } else if((state>>16)==0xFFD9 && (state&0xFFFF)!=0xFFD8){
+                    state= 0xFFD900|(state&0xFF);
                 } else if(state<0xFFD00000 || state>0xFFD9FFFF){
                     m->size= (state&0xFFFF)-1;
-                    if (m->size >= 0x8000)
-                        m->size = 0;
                 }
             }
             if(m->size>0){
@@ -128,9 +129,9 @@ static int jpeg_parse(AVCodecParserContext *s,
 }
 
 
-AVCodecParser ff_mjpeg_parser = {
-    .codec_ids      = { AV_CODEC_ID_MJPEG, AV_CODEC_ID_JPEGLS },
+const FFCodecParser ff_mjpeg_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_MJPEG, AV_CODEC_ID_JPEGLS),
     .priv_data_size = sizeof(MJPEGParserContext),
-    .parser_parse   = jpeg_parse,
-    .parser_close   = ff_parse_close,
+    .parse          = jpeg_parse,
+    .close          = ff_parse_close,
 };

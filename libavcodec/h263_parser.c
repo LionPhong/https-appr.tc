@@ -25,9 +25,10 @@
  */
 
 #include "parser.h"
-#include "h263_parser.h"
+#include "parser_internal.h"
 
-int ff_h263_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size){
+static int h263_find_frame_end(ParseContext *pc, const uint8_t *buf, int buf_size)
+{
     int vop_found, i;
     uint32_t state;
 
@@ -73,7 +74,7 @@ static int h263_parse(AVCodecParserContext *s,
     if (s->flags & PARSER_FLAG_COMPLETE_FRAMES) {
         next = buf_size;
     } else {
-        next= ff_h263_find_frame_end(pc, buf, buf_size);
+        next = h263_find_frame_end(pc, buf, buf_size);
 
         if (ff_combine_frame(pc, next, &buf, &buf_size) < 0) {
             *poutbuf = NULL;
@@ -87,9 +88,9 @@ static int h263_parse(AVCodecParserContext *s,
     return next;
 }
 
-AVCodecParser ff_h263_parser = {
-    .codec_ids      = { AV_CODEC_ID_H263 },
+const FFCodecParser ff_h263_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_H263),
     .priv_data_size = sizeof(ParseContext),
-    .parser_parse   = h263_parse,
-    .parser_close   = ff_parse_close,
+    .parse          = h263_parse,
+    .close          = ff_parse_close,
 };

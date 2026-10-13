@@ -23,35 +23,17 @@
  * swap UV filter
  */
 
-#include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "libavutil/version.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
-
-typedef struct SwapUVContext {
-    const AVClass *class;
-} SwapUVContext;
-
-static const AVOption swapuv_options[] = {
-    { NULL }
-};
-
-AVFILTER_DEFINE_CLASS(swapuv);
 
 static void do_swap(AVFrame *frame)
 {
     FFSWAP(uint8_t*,     frame->data[1],     frame->data[2]);
     FFSWAP(int,          frame->linesize[1], frame->linesize[2]);
     FFSWAP(AVBufferRef*, frame->buf[1],      frame->buf[2]);
-
-#if FF_API_ERROR_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-    FFSWAP(uint64_t,     frame->error[1],    frame->error[2]);
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 }
 
 static AVFrame *get_video_buffer(AVFilterLink *link, int w, int h)
@@ -85,7 +67,9 @@ static int is_planar_yuv(const AVPixFmtDescriptor *desc)
     return 1;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     AVFilterFormats *formats = NULL;
     int fmt, ret;
@@ -96,34 +80,23 @@ static int query_formats(AVFilterContext *ctx)
             return ret;
     }
 
-    return ff_set_common_formats(ctx, formats);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
 static const AVFilterPad swapuv_inputs[] = {
     {
         .name             = "default",
         .type             = AVMEDIA_TYPE_VIDEO,
-        .get_video_buffer = get_video_buffer,
+        .get_buffer.video = get_video_buffer,
         .filter_frame     = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad swapuv_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_swapuv = {
-    .name          = "swapuv",
-    .description   = NULL_IF_CONFIG_SMALL("Swap U and V components."),
-    .query_formats = query_formats,
-    .priv_size     = sizeof(SwapUVContext),
-    .priv_class    = &swapuv_class,
-    .inputs        = swapuv_inputs,
-    .outputs       = swapuv_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+const FFFilter ff_vf_swapuv = {
+    .p.name        = "swapuv",
+    .p.description = NULL_IF_CONFIG_SMALL("Swap U and V components."),
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(swapuv_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
 };

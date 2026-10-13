@@ -28,7 +28,6 @@
 #include <string.h>
 #include "libavutil/avassert.h"
 #include "libavutil/intreadwrite.h"
-#include "libavcodec/avcodec.h"
 #include "internal.h"
 #include "rtp.h"
 #include "rtpdec.h"
@@ -104,6 +103,9 @@ static int qdm2_parse_config(PayloadContext *qdm, AVStream *st,
                 break;
             case 4: /* stream with extradata */
                 if (item_len < 30)
+                    return AVERROR_INVALIDDATA;
+
+                if (AV_RB32(p + 26) > sizeof(qdm->buf[0]))
                     return AVERROR_INVALIDDATA;
 
                 ret = ff_alloc_extradata(st->codecpar, 26 + item_len);
@@ -187,8 +189,9 @@ static int qdm2_parse_subpacket(PayloadContext *qdm, AVStream *st,
  */
 static int qdm2_restore_block(PayloadContext *qdm, AVStream *st, AVPacket *pkt)
 {
-    int to_copy, n, res, include_csum;
+    int to_copy, n, res;
     uint8_t *p, *csum_pos = NULL;
+    int include_csum = qdm->block_type == 2 || qdm->block_type == 4;
 
     /* create packet to hold subpkts into a superblock */
     av_assert0(qdm->cache > 0);
@@ -196,6 +199,11 @@ static int qdm2_restore_block(PayloadContext *qdm, AVStream *st, AVPacket *pkt)
         if (qdm->len[n] > 0)
             break;
     av_assert0(n < 0x80);
+
+    int min_size = 2 + (qdm->len[n] > 0xff) + 2*include_csum;
+
+    if (qdm->block_size < min_size)
+        return AVERROR_INVALIDDATA;
 
     if ((res = av_new_packet(pkt, qdm->block_size)) < 0)
         return res;
@@ -212,7 +220,7 @@ static int qdm2_restore_block(PayloadContext *qdm, AVStream *st, AVPacket *pkt)
         *p++ = qdm->block_type;
         *p++ = qdm->len[n];
     }
-    if ((include_csum = (qdm->block_type == 2 || qdm->block_type == 4))) {
+    if (include_csum) {
         csum_pos = p;
         p       += 2;
     }

@@ -23,6 +23,8 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "riff.h"
 
@@ -79,7 +81,7 @@ static int dxa_read_header(AVFormatContext *s)
     if(fps > 0){
         den = 1000;
         num = fps;
-    }else if (fps < 0){
+    }else if (fps < 0 && fps > INT_MIN){
         den = 100000;
         num = -fps;
     }else{
@@ -118,9 +120,14 @@ static int dxa_read_header(AVFormatContext *s)
             if(tag == MKTAG('d', 'a', 't', 'a')) break;
             avio_skip(pb, fsize);
         }
-        c->bpc = (fsize + c->frames - 1) / c->frames;
-        if(ast->codecpar->block_align)
-            c->bpc = ((c->bpc + ast->codecpar->block_align - 1) / ast->codecpar->block_align) * ast->codecpar->block_align;
+        c->bpc = (fsize + (int64_t)c->frames - 1) / c->frames;
+        if (c->bpc < 0)
+            return AVERROR_INVALIDDATA;
+        if(ast->codecpar->block_align) {
+            if (c->bpc > INT_MAX - ast->codecpar->block_align + 1)
+                return AVERROR_INVALIDDATA;
+            c->bpc = ((c->bpc - 1 + ast->codecpar->block_align) / ast->codecpar->block_align) * ast->codecpar->block_align;
+        }
         c->bytes_left = fsize;
         c->wavpos = avio_tell(pb);
         avio_seek(pb, c->vidpos, SEEK_SET);
@@ -143,7 +150,7 @@ static int dxa_read_header(AVFormatContext *s)
     c->readvid = !c->has_sound;
     c->vidpos  = avio_tell(pb);
     s->start_time = 0;
-    s->duration = (int64_t)c->frames * AV_TIME_BASE * num / den;
+    s->duration = av_rescale(c->frames, AV_TIME_BASE * (int64_t)num, den);
     av_log(s, AV_LOG_DEBUG, "%d frame(s)\n",c->frames);
 
     return 0;
@@ -164,7 +171,7 @@ static int dxa_read_packet(AVFormatContext *s, AVPacket *pkt)
         ret = av_get_packet(s->pb, pkt, size);
         pkt->stream_index = 1;
         if(ret != size)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         c->bytes_left -= size;
         c->wavpos = avio_tell(s->pb);
         return 0;
@@ -191,7 +198,8 @@ static int dxa_read_packet(AVFormatContext *s, AVPacket *pkt)
         case MKTAG('C', 'M', 'A', 'P'):
             pal_size = 768+4;
             memcpy(pal, buf, 4);
-            avio_read(s->pb, pal + 4, 768);
+            if ((ret = ffio_read_size(s->pb, pal + 4, 768)) < 0)
+                return ret;
             break;
         case MKTAG('F', 'R', 'A', 'M'):
             if ((ret = avio_read(s->pb, buf + 4, DXA_EXTRA_SIZE - 4)) != DXA_EXTRA_SIZE - 4) {
@@ -208,10 +216,9 @@ static int dxa_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (ret < 0)
                 return ret;
             memcpy(pkt->data + pal_size, buf, DXA_EXTRA_SIZE);
-            ret = avio_read(s->pb, pkt->data + DXA_EXTRA_SIZE + pal_size, size);
-            if(ret != size){
-                return AVERROR(EIO);
-            }
+            ret = ffio_read_size(s->pb, pkt->data + DXA_EXTRA_SIZE + pal_size, size);
+            if (ret < 0)
+                return ret;
             if(pal_size) memcpy(pkt->data, pal, pal_size);
             pkt->stream_index = 0;
             c->frames--;
@@ -226,9 +233,9 @@ static int dxa_read_packet(AVFormatContext *s, AVPacket *pkt)
     return AVERROR_EOF;
 }
 
-AVInputFormat ff_dxa_demuxer = {
-    .name           = "dxa",
-    .long_name      = NULL_IF_CONFIG_SMALL("DXA"),
+const FFInputFormat ff_dxa_demuxer = {
+    .p.name         = "dxa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("DXA"),
     .priv_data_size = sizeof(DXAContext),
     .read_probe     = dxa_probe,
     .read_header    = dxa_read_header,

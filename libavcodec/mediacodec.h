@@ -75,26 +75,30 @@ typedef struct MediaCodecBuffer AVMediaCodecBuffer;
 /**
  * Release a MediaCodec buffer and render it to the surface that is associated
  * with the decoder. This function should only be called once on a given
- * buffer, once released the underlying buffer returns to the codec, thus
- * subsequent calls to this function will have no effect.
+ * buffer: once released, the underlying buffer returns to the codec and the
+ * caller no longer owns it.
  *
  * @param buffer the buffer to render
  * @param render 1 to release and render the buffer to the surface or 0 to
  * discard the buffer
- * @return 0 on success, < 0 otherwise
+ * @return 0 on success, < 0 otherwise. AVERROR(ENOENT) if render is nonzero
+ * and the buffer was already released or invalidated by a codec flush.
  */
 int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render);
 
 /**
  * Release a MediaCodec buffer and render it at the given time to the surface
  * that is associated with the decoder. The timestamp must be within one second
- * of the current java/lang/System#nanoTime() (which is implemented using
- * CLOCK_MONOTONIC on Android). See the Android MediaCodec documentation
- * of android/media/MediaCodec#releaseOutputBuffer(int,long) for more details.
+ * of the current `java/lang/System#nanoTime()` (which is implemented using
+ * `CLOCK_MONOTONIC` on Android). See the Android MediaCodec documentation
+ * of [`android/media/MediaCodec#releaseOutputBuffer(int,long)`][0] for more details.
  *
  * @param buffer the buffer to render
  * @param time timestamp in nanoseconds of when to render the buffer
- * @return 0 on success, < 0 otherwise
+ * @return 0 on success, < 0 otherwise. AVERROR(ENOENT) if the buffer was
+ * already released or invalidated by a codec flush.
+ *
+ * [0]: https://developer.android.com/reference/android/media/MediaCodec#releaseOutputBuffer(int,%20long)
  */
 int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time);
 

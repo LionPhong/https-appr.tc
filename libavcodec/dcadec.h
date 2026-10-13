@@ -21,9 +21,11 @@
 #ifndef AVCODEC_DCADEC_H
 #define AVCODEC_DCADEC_H
 
-#include "libavutil/common.h"
+#include <stdint.h>
+
 #include "libavutil/crc.h"
 #include "libavutil/float_dsp.h"
+#include "libavutil/log.h"
 
 #include "avcodec.h"
 #include "get_bits.h"
@@ -42,6 +44,11 @@
 
 #define DCA_PACKET_RECOVERY     0x10    ///< Sync error recovery flag
 #define DCA_PACKET_RESIDUAL     0x20    ///< Core valid for residual decoding
+
+enum DCAOutputChannelOrder {
+    CHANNEL_ORDER_DEFAULT,
+    CHANNEL_ORDER_CODED,
+};
 
 typedef struct DCAContext {
     const AVClass   *class;       ///< class for AVOptions
@@ -63,6 +70,8 @@ typedef struct DCAContext {
 
     int     request_channel_layout; ///< Converted from avctx.request_channel_layout
     int     core_only;              ///< Core only decoding flag
+    int     output_channel_order;
+    AVChannelLayout downmix_layout;
 } DCAContext;
 
 int ff_dca_set_channel_layout(AVCodecContext *avctx, int *ch_remap, int dca_mask);
@@ -71,6 +80,9 @@ void ff_dca_downmix_to_stereo_fixed(DCADSPContext *dcadsp, int32_t **samples,
                                     int *coeff_l, int nsamples, int ch_mask);
 void ff_dca_downmix_to_stereo_float(AVFloatDSPContext *fdsp, float **samples,
                                     int *coeff_l, int nsamples, int ch_mask);
+int ff_dca_export_downmix_matrix(AVCodecContext *avctx, AVFrame *frame,
+                                 enum DCADownMixType downmix_type,
+                                 int output_mask, const int *coeff_l);
 
 static inline int ff_dca_check_crc(AVCodecContext *avctx, GetBitContext *s,
                                    int p1, int p2)

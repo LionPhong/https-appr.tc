@@ -27,8 +27,8 @@
 #include <float.h>  /* DBL_MAX */
 
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 #include "libavutil/avstring.h"
 #include "libavutil/common.h"
@@ -72,9 +72,12 @@ enum var_name {
     VARS_NB
 };
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    return ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(0));
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_draw_supported_pixel_formats(0));
 }
 
 enum EvalMode {
@@ -111,7 +114,11 @@ static int config_input(AVFilterLink *inlink)
     double var_values[VARS_NB], res;
     char *expr;
 
-    ff_draw_init(&s->draw, inlink->format, 0);
+    ret = ff_draw_init_from_link(&s->draw, inlink, 0);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFDrawContext\n");
+        return ret;
+    }
     ff_draw_color(&s->draw, &s->color, s->rgba_color);
 
     var_values[VAR_IN_W]  = var_values[VAR_IW] = inlink->w;
@@ -325,14 +332,19 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     PadContext *s = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     AVFrame *out;
-    int needs_copy;
+    int needs_copy, ret;
+
+    if (s->eval_mode == EVAL_MODE_INIT &&
+        (ret = ff_inlink_check_frame_params(inlink, in, 0)) < 0) {
+        av_frame_free(&in);
+        return ret;
+    }
+
     if(s->eval_mode == EVAL_MODE_FRAME && (
            in->width  != s->inlink_w
         || in->height != s->inlink_h
         || in->format != outlink->format
         || in->sample_aspect_ratio.den != outlink->sample_aspect_ratio.den || in->sample_aspect_ratio.num != outlink->sample_aspect_ratio.num)) {
-        int ret;
-
         inlink->dst->inputs[0]->format = in->format;
         inlink->dst->inputs[0]->w      = in->width;
         inlink->dst->inputs[0]->h      = in->height;
@@ -341,12 +353,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         inlink->dst->inputs[0]->sample_aspect_ratio.num = in->sample_aspect_ratio.num;
 
 
-        if ((ret = config_input(inlink)) < 0) {
+        if ((ret = config_input(inlink)) < 0 ||
+            (ret = config_output(outlink)) < 0) {
             s->inlink_w = -1;
-            return ret;
-        }
-        if ((ret = config_output(outlink)) < 0) {
-            s->inlink_w = -1;
+            av_frame_free(&in);
             return ret;
         }
     }
@@ -355,7 +365,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     if (needs_copy) {
         av_log(inlink->dst, AV_LOG_DEBUG, "Direct padding impossible allocating new frame\n");
-        out = ff_get_video_buffer(inlink->dst->outputs[0],
+        out = ff_get_video_buffer(outlink,
                                   FFMAX(inlink->w, s->w),
                                   FFMAX(inlink->h, s->h));
         if (!out) {
@@ -410,7 +420,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     if (in != out)
         av_frame_free(&in);
-    return ff_filter_frame(inlink->dst->outputs[0], out);
+    return ff_filter_frame(outlink, out);
 }
 
 #define OFFSET(x) offsetof(PadContext, x)
@@ -424,7 +434,7 @@ static const AVOption pad_options[] = {
     { "x",      "set the x offset expression for the input image position", OFFSET(x_expr), AV_OPT_TYPE_STRING, {.str = "0"}, 0, 0, FLAGS },
     { "y",      "set the y offset expression for the input image position", OFFSET(y_expr), AV_OPT_TYPE_STRING, {.str = "0"}, 0, 0, FLAGS },
     { "color",  "set the color of the padded area border", OFFSET(rgba_color), AV_OPT_TYPE_COLOR, {.str = "black"}, .flags = FLAGS },
-    { "eval",   "specify when to evaluate expressions",    OFFSET(eval_mode), AV_OPT_TYPE_INT, {.i64 = EVAL_MODE_INIT}, 0, EVAL_MODE_NB-1, FLAGS, "eval" },
+    { "eval",   "specify when to evaluate expressions",    OFFSET(eval_mode), AV_OPT_TYPE_INT, {.i64 = EVAL_MODE_INIT}, 0, EVAL_MODE_NB-1, FLAGS, .unit = "eval" },
          { "init",  "eval expressions once during initialization", 0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_INIT},  .flags = FLAGS, .unit = "eval" },
          { "frame", "eval expressions during initialization and per-frame", 0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_FRAME}, .flags = FLAGS, .unit = "eval" },
     { "aspect",  "pad to fit an aspect instead of a resolution", OFFSET(aspect), AV_OPT_TYPE_RATIONAL, {.dbl = 0}, 0, DBL_MAX, FLAGS },
@@ -438,10 +448,9 @@ static const AVFilterPad avfilter_vf_pad_inputs[] = {
         .name             = "default",
         .type             = AVMEDIA_TYPE_VIDEO,
         .config_props     = config_input,
-        .get_video_buffer = get_video_buffer,
+        .get_buffer.video = get_video_buffer,
         .filter_frame     = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad avfilter_vf_pad_outputs[] = {
@@ -450,15 +459,15 @@ static const AVFilterPad avfilter_vf_pad_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_pad = {
-    .name          = "pad",
-    .description   = NULL_IF_CONFIG_SMALL("Pad the input video."),
+const FFFilter ff_vf_pad = {
+    .p.name        = "pad",
+    .p.description = NULL_IF_CONFIG_SMALL("Pad the input video."),
+    .p.priv_class  = &pad_class,
     .priv_size     = sizeof(PadContext),
-    .priv_class    = &pad_class,
-    .query_formats = query_formats,
-    .inputs        = avfilter_vf_pad_inputs,
-    .outputs       = avfilter_vf_pad_outputs,
+    FILTER_INPUTS(avfilter_vf_pad_inputs),
+    FILTER_OUTPUTS(avfilter_vf_pad_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 };

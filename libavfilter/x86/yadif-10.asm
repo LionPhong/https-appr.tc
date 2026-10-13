@@ -48,15 +48,15 @@ SECTION .text
     pavgw     m5, m3
     pand      m4, [pw_1]
     psubusw   m5, m4
-    RSHIFT    m5, 2
+    psrldq    m5, 2
     mova      m4, m2
     psubusw   m2, m3
     psubusw   m3, m4
     PMAXUW    m2, m3
     mova      m3, m2
     mova      m4, m2
-    RSHIFT    m3, 2
-    RSHIFT    m4, 4
+    psrldq    m3, 2
+    psrldq    m4, 4
     paddw     m2, m3
     paddw     m2, m4
 %endmacro
@@ -153,7 +153,7 @@ SECTION .text
     psubusw      m3, m4
     PMAXUW       m2, m3
     mova         m3, m2
-    RSHIFT       m3, 4
+    psrldq       m3, 4
     paddw        m0, m2
     paddw        m0, m3
     psubw        m0, [pw_1]
@@ -249,7 +249,3 @@ INIT_XMM ssse3
 YADIF
 INIT_XMM sse2
 YADIF
-%if ARCH_X86_32
-INIT_MMX mmxext
-YADIF
-%endif

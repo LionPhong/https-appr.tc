@@ -19,10 +19,9 @@
  */
 
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct LumakeyContext {
@@ -44,8 +43,8 @@ static int do_lumakey_slice8(AVFilterContext *ctx, void *arg, int jobnr, int nb_
 {
     LumakeyContext *s = ctx->priv;
     AVFrame *frame = arg;
-    const int slice_start = (frame->height * jobnr) / nb_jobs;
-    const int slice_end = (frame->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(frame->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(frame->height, jobnr + 1, nb_jobs);
     uint8_t *alpha = frame->data[3] + slice_start * frame->linesize[3];
     const uint8_t *luma = frame->data[0] + slice_start * frame->linesize[0];
     const int so = s->so;
@@ -76,8 +75,8 @@ static int do_lumakey_slice16(AVFilterContext *ctx, void *arg, int jobnr, int nb
 {
     LumakeyContext *s = ctx->priv;
     AVFrame *frame = arg;
-    const int slice_start = (frame->height * jobnr) / nb_jobs;
-    const int slice_end = (frame->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(frame->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(frame->height, jobnr + 1, nb_jobs);
     uint16_t *alpha = (uint16_t *)(frame->data[3] + slice_start * frame->linesize[3]);
     const uint16_t *luma = (const uint16_t *)(frame->data[0] + slice_start * frame->linesize[0]);
     const int so = s->so;
@@ -135,33 +134,21 @@ static int filter_frame(AVFilterLink *link, AVFrame *frame)
     LumakeyContext *s = ctx->priv;
     int ret;
 
-    if (ret = av_frame_make_writable(frame))
-        return ret;
-
-    if (ret = ctx->internal->execute(ctx, s->do_lumakey_slice, frame, NULL, FFMIN(frame->height, ff_filter_get_nb_threads(ctx))))
+    if (ret = ff_filter_execute(ctx, s->do_lumakey_slice, frame, NULL,
+                                FFMIN(frame->height, ff_filter_get_nb_threads(ctx))))
         return ret;
 
     return ff_filter_frame(ctx->outputs[0], frame);
 }
 
-static av_cold int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pixel_fmts[] = {
-        AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA420P,
-        AV_PIX_FMT_YUVA444P9, AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA420P9,
-        AV_PIX_FMT_YUVA444P10, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA420P10,
-        AV_PIX_FMT_YUVA444P12, AV_PIX_FMT_YUVA422P12,
-        AV_PIX_FMT_YUVA444P16, AV_PIX_FMT_YUVA422P16, AV_PIX_FMT_YUVA420P16,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *formats;
-
-    formats = ff_make_format_list(pixel_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-
-    return ff_set_common_formats(ctx, formats);
-}
+static const enum AVPixelFormat pixel_fmts[] = {
+    AV_PIX_FMT_YUVA444P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUVA444P9, AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA420P9,
+    AV_PIX_FMT_YUVA444P10, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA420P10,
+    AV_PIX_FMT_YUVA444P12, AV_PIX_FMT_YUVA422P12,
+    AV_PIX_FMT_YUVA444P16, AV_PIX_FMT_YUVA422P16, AV_PIX_FMT_YUVA420P16,
+    AV_PIX_FMT_NONE
+};
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
                            char *res, int res_len, int flags)
@@ -179,18 +166,10 @@ static const AVFilterPad lumakey_inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
+        .flags        = AVFILTERPAD_FLAG_NEEDS_WRITABLE,
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
-};
-
-static const AVFilterPad lumakey_outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
 };
 
 #define OFFSET(x) offsetof(LumakeyContext, x)
@@ -205,14 +184,15 @@ static const AVOption lumakey_options[] = {
 
 AVFILTER_DEFINE_CLASS(lumakey);
 
-AVFilter ff_vf_lumakey = {
-    .name          = "lumakey",
-    .description   = NULL_IF_CONFIG_SMALL("Turns a certain luma into transparency."),
+const FFFilter ff_vf_lumakey = {
+    .p.name        = "lumakey",
+    .p.description = NULL_IF_CONFIG_SMALL("Turns a certain luma into transparency."),
+    .p.priv_class  = &lumakey_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(LumakeyContext),
-    .priv_class    = &lumakey_class,
-    .query_formats = query_formats,
-    .inputs        = lumakey_inputs,
-    .outputs       = lumakey_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(lumakey_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pixel_fmts),
     .process_command = process_command,
 };

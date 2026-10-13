@@ -24,13 +24,14 @@
 #ifndef AVCODEC_V4L2_CONTEXT_H
 #define AVCODEC_V4L2_CONTEXT_H
 
-#include <stdatomic.h>
+#include <stdint.h>
 #include <linux/videodev2.h>
 
-#include "libavcodec/avcodec.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/frame.h"
-#include "libavutil/buffer.h"
+#include "libavutil/rational.h"
+#include "codec_id.h"
+#include "packet.h"
 #include "v4l2_buffers.h"
 
 typedef struct V4L2Context {
@@ -123,7 +124,7 @@ int ff_v4l2_context_get_format(V4L2Context* ctx, int probe);
  * Releases a V4L2Context.
  *
  * @param[in] ctx A pointer to a V4L2Context.
- *               The caller is reponsible for freeing it.
+ *               The caller is responsible for freeing it.
  *               It must not be used after calling this function.
  */
 void ff_v4l2_context_release(V4L2Context* ctx);

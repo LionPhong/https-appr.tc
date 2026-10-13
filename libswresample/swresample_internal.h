@@ -27,6 +27,8 @@
 
 #define SWR_CH_MAX 64
 
+#define SQRT1_3      0.57735026918962576451  /* sqrt(1/3) */
+#define SQRT2_3      0.81649658092772603273  /* sqrt(2/3) */
 #define SQRT3_2      1.22474487139158904909  /* sqrt(3/2) */
 
 #define NS_TAPS 20
@@ -37,10 +39,10 @@ typedef int64_t integer;
 typedef int integer;
 #endif
 
-typedef void (mix_1_1_func_type)(void *out, const void *in, void *coeffp, integer index, integer len);
-typedef void (mix_2_1_func_type)(void *out, const void *in1, const void *in2, void *coeffp, integer index1, integer index2, integer len);
+typedef void (mix_1_1_func_type)(void *out, const void *in, const void *coeffp, integer index, integer len);
+typedef void (mix_2_1_func_type)(void *out, const void *in1, const void *in2, const void *coeffp, integer index1, integer index2, integer len);
 
-typedef void (mix_any_func_type)(uint8_t **out, const uint8_t **in1, void *coeffp, integer len);
+typedef void (mix_any_func_type)(uint8_t *const *out, const uint8_t *const *in1, const void *coeffp, integer len);
 
 typedef struct AudioData{
     uint8_t *ch[SWR_CH_MAX];    ///< samples buffer per channel
@@ -99,8 +101,9 @@ struct SwrContext {
     enum AVSampleFormat  in_sample_fmt;             ///< input sample format
     enum AVSampleFormat int_sample_fmt;             ///< internal sample format (AV_SAMPLE_FMT_FLTP or AV_SAMPLE_FMT_S16P)
     enum AVSampleFormat out_sample_fmt;             ///< output sample format
-    int64_t  in_ch_layout;                          ///< input channel layout
-    int64_t out_ch_layout;                          ///< output channel layout
+    AVChannelLayout used_ch_layout;                 ///< number of used input channels (mapped channel count if channel_map, otherwise in.ch_count)
+    AVChannelLayout  in_ch_layout;                  ///< input channel layout
+    AVChannelLayout out_ch_layout;                  ///< output channel layout
     int      in_sample_rate;                        ///< input sample rate
     int     out_sample_rate;                        ///< output sample rate
     int flags;                                      ///< miscellaneous flags such as SWR_FLAG_RESAMPLE
@@ -111,14 +114,11 @@ struct SwrContext {
     float rematrix_maxval;                          ///< maximum value for rematrixing output
     int matrix_encoding;                            /**< matrixed stereo encoding */
     const int *channel_map;                         ///< channel index (or -1 if muted channel) map
-    int used_ch_count;                              ///< number of used input channels (mapped channel count if channel_map, otherwise in.ch_count)
     int engine;
 
-    int user_in_ch_count;                           ///< User set input channel count
-    int user_out_ch_count;                          ///< User set output channel count
-    int user_used_ch_count;                         ///< User set used channel count
-    int64_t user_in_ch_layout;                      ///< User set input channel layout
-    int64_t user_out_ch_layout;                     ///< User set output channel layout
+    AVChannelLayout user_used_chlayout;             ///< User set used channel layout
+    AVChannelLayout user_in_chlayout;               ///< User set input channel layout
+    AVChannelLayout user_out_chlayout;              ///< User set output channel layout
     enum AVSampleFormat user_int_sample_fmt;        ///< User set internal sample format
     int user_dither_method;                         ///< User set dither method
 
@@ -169,12 +169,23 @@ struct SwrContext {
     struct Resampler const *resampler;              ///< resampler virtual function table
 
     double matrix[SWR_CH_MAX][SWR_CH_MAX];          ///< floating point rematrixing coefficients
-    float matrix_flt[SWR_CH_MAX][SWR_CH_MAX];       ///< single precision floating point rematrixing coefficients
+    union {
+        float matrix_flt[SWR_CH_MAX][SWR_CH_MAX];   ///< single precision floating point rematrixing coefficients
+                                                    ///< valid iff int_sample_fmt is AV_SAMPLE_FMT_FLTP
+        int32_t matrix32[SWR_CH_MAX][SWR_CH_MAX];   ///< 17.15 fixed point rematrixing coefficients
+                                                    ///< valid iff int_sample_fmt is != AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_DBLP
+    };
+    union {
+        int    i;
+        float  f;
+        double d;
+    } native_one;
     uint8_t *native_matrix;
-    uint8_t *native_one;
-    uint8_t *native_simd_one;
+    union {
+        int16_t i16[2];
+        float   f;
+    } native_simd_one;
     uint8_t *native_simd_matrix;
-    int32_t matrix32[SWR_CH_MAX][SWR_CH_MAX];       ///< 17.15 fixed point rematrixing coefficients
     uint8_t matrix_ch[SWR_CH_MAX][SWR_CH_MAX+1];    ///< Lists of input channels per output channel that have non zero rematrixing coefficients
     mix_1_1_func_type *mix_1_1_f;
     mix_1_1_func_type *mix_1_1_simd;
@@ -189,12 +200,15 @@ struct SwrContext {
 
 av_warn_unused_result
 int swri_realloc_audio(AudioData *a, int count);
+int swri_check_chlayout(struct SwrContext *s, const AVChannelLayout *chl, const char *name);
 
 void swri_noise_shaping_int16 (SwrContext *s, AudioData *dsts, const AudioData *srcs, const AudioData *noises, int count);
 void swri_noise_shaping_int32 (SwrContext *s, AudioData *dsts, const AudioData *srcs, const AudioData *noises, int count);
 void swri_noise_shaping_float (SwrContext *s, AudioData *dsts, const AudioData *srcs, const AudioData *noises, int count);
 void swri_noise_shaping_double(SwrContext *s, AudioData *dsts, const AudioData *srcs, const AudioData *noises, int count);
 
+av_warn_unused_result
+int swri_rematrix_build(SwrContext *s);
 av_warn_unused_result
 int swri_rematrix_init(SwrContext *s);
 void swri_rematrix_free(SwrContext *s);

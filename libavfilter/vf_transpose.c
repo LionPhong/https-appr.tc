@@ -35,8 +35,8 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 #include "transpose.h"
 
@@ -52,13 +52,15 @@ typedef struct TransContext {
     TransVtable vtables[4];
 } TransContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     AVFilterFormats *pix_fmts = NULL;
+    const AVPixFmtDescriptor *desc;
     int fmt, ret;
 
-    for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+    for (fmt = 0; desc = av_pix_fmt_desc_get(fmt); fmt++) {
         if (!(desc->flags & AV_PIX_FMT_FLAG_PAL ||
               desc->flags & AV_PIX_FMT_FLAG_HWACCEL ||
               desc->flags & AV_PIX_FMT_FLAG_BITSTREAM ||
@@ -68,7 +70,7 @@ static int query_formats(AVFilterContext *ctx)
     }
 
 
-    return ff_set_common_formats(ctx, pix_fmts);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, pix_fmts);
 }
 
 static inline void transpose_block_8_c(uint8_t *src, ptrdiff_t src_linesize,
@@ -235,13 +237,13 @@ static int config_props_output(AVFilterLink *outlink)
         }
     }
 
-    if (ARCH_X86) {
-        for (int i = 0; i < 4; i++) {
-            TransVtable *v = &s->vtables[i];
+#if ARCH_X86 && HAVE_X86ASM
+    for (int i = 0; i < 4; i++) {
+        TransVtable *v = &s->vtables[i];
 
-            ff_transpose_init_x86(v, s->pixsteps[i]);
-        }
+        ff_transpose_init_x86(v, s->pixsteps[i]);
     }
+#endif
 
     av_log(ctx, AV_LOG_VERBOSE,
            "w:%d h:%d dir:%d -> w:%d h:%d rotation:%s vflip:%d\n",
@@ -280,8 +282,8 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr,
         int inh     = AV_CEIL_RSHIFT(in->height, vsub);
         int outw    = AV_CEIL_RSHIFT(out->width,  hsub);
         int outh    = AV_CEIL_RSHIFT(out->height, vsub);
-        int start   = (outh *  jobnr   ) / nb_jobs;
-        int end     = (outh * (jobnr+1)) / nb_jobs;
+        int start   = ff_slice_pos(outh, jobnr, nb_jobs);
+        int end     = ff_slice_pos(outh, jobnr + 1, nb_jobs);
         uint8_t *dst, *src;
         int dstlinesize, srclinesize;
         int x, y;
@@ -328,6 +330,7 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr,
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
+    int err = 0;
     AVFilterContext *ctx = inlink->dst;
     TransContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
@@ -339,10 +342,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
-        av_frame_free(&in);
-        return AVERROR(ENOMEM);
+        err = AVERROR(ENOMEM);
+        goto fail;
     }
-    av_frame_copy_props(out, in);
+
+    err = av_frame_copy_props(out, in);
+    if (err < 0)
+        goto fail;
 
     if (in->sample_aspect_ratio.num == 0) {
         out->sample_aspect_ratio = in->sample_aspect_ratio;
@@ -352,26 +358,32 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     td.in = in, td.out = out;
-    ctx->internal->execute(ctx, filter_slice, &td, NULL, FFMIN(outlink->h, ff_filter_get_nb_threads(ctx)));
+    ff_filter_execute(ctx, filter_slice, &td, NULL,
+                      FFMIN(outlink->h, ff_filter_get_nb_threads(ctx)));
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
+
+fail:
+    av_frame_free(&in);
+    av_frame_free(&out);
+    return err;
 }
 
 #define OFFSET(x) offsetof(TransContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption transpose_options[] = {
-    { "dir", "set transpose direction", OFFSET(dir), AV_OPT_TYPE_INT, { .i64 = TRANSPOSE_CCLOCK_FLIP }, 0, 7, FLAGS, "dir" },
+    { "dir", "set transpose direction", OFFSET(dir), AV_OPT_TYPE_INT, { .i64 = TRANSPOSE_CCLOCK_FLIP }, 0, 7, FLAGS, .unit = "dir" },
         { "cclock_flip", "rotate counter-clockwise with vertical flip", 0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK_FLIP }, .flags=FLAGS, .unit = "dir" },
         { "clock",       "rotate clockwise",                            0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CLOCK       }, .flags=FLAGS, .unit = "dir" },
         { "cclock",      "rotate counter-clockwise",                    0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK      }, .flags=FLAGS, .unit = "dir" },
         { "clock_flip",  "rotate clockwise with vertical flip",         0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CLOCK_FLIP  }, .flags=FLAGS, .unit = "dir" },
 
     { "passthrough", "do not apply transposition if the input matches the specified geometry",
-      OFFSET(passthrough), AV_OPT_TYPE_INT, {.i64=TRANSPOSE_PT_TYPE_NONE},  0, INT_MAX, FLAGS, "passthrough" },
-        { "none",      "always apply transposition",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_NONE},      INT_MIN, INT_MAX, FLAGS, "passthrough" },
-        { "portrait",  "preserve portrait geometry",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_PORTRAIT},  INT_MIN, INT_MAX, FLAGS, "passthrough" },
-        { "landscape", "preserve landscape geometry",  0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_LANDSCAPE}, INT_MIN, INT_MAX, FLAGS, "passthrough" },
+      OFFSET(passthrough), AV_OPT_TYPE_INT, {.i64=TRANSPOSE_PT_TYPE_NONE},  0, INT_MAX, FLAGS, .unit = "passthrough" },
+        { "none",      "always apply transposition",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_NONE},      INT_MIN, INT_MAX, FLAGS, .unit = "passthrough" },
+        { "portrait",  "preserve portrait geometry",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_PORTRAIT},  INT_MIN, INT_MAX, FLAGS, .unit = "passthrough" },
+        { "landscape", "preserve landscape geometry",  0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_LANDSCAPE}, INT_MIN, INT_MAX, FLAGS, .unit = "passthrough" },
 
     { NULL }
 };
@@ -382,10 +394,9 @@ static const AVFilterPad avfilter_vf_transpose_inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .get_video_buffer = get_video_buffer,
+        .get_buffer.video = get_video_buffer,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad avfilter_vf_transpose_outputs[] = {
@@ -394,16 +405,15 @@ static const AVFilterPad avfilter_vf_transpose_outputs[] = {
         .config_props = config_props_output,
         .type         = AVMEDIA_TYPE_VIDEO,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_transpose = {
-    .name          = "transpose",
-    .description   = NULL_IF_CONFIG_SMALL("Transpose input video."),
+const FFFilter ff_vf_transpose = {
+    .p.name        = "transpose",
+    .p.description = NULL_IF_CONFIG_SMALL("Transpose input video."),
+    .p.priv_class  = &transpose_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(TransContext),
-    .priv_class    = &transpose_class,
-    .query_formats = query_formats,
-    .inputs        = avfilter_vf_transpose_inputs,
-    .outputs       = avfilter_vf_transpose_outputs,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(avfilter_vf_transpose_inputs),
+    FILTER_OUTPUTS(avfilter_vf_transpose_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };

@@ -26,18 +26,19 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
+#include "libavutil/attributes.h"
 #include "subtitles.h"
-#include "libavcodec/internal.h"
 #include "libavcodec/jacosub.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/intreadwrite.h"
 
 typedef struct {
+    FFDemuxSubtitlesQueue q;
     int shift;
     unsigned timeres;
-    FFDemuxSubtitlesQueue q;
 } JACOsubContext;
 
 static int timed_line(const char *ptr)
@@ -93,13 +94,6 @@ static int get_jss_cmd(char k)
     return -1;
 }
 
-static int jacosub_read_close(AVFormatContext *s)
-{
-    JACOsubContext *jacosub = s->priv_data;
-    ff_subtitles_queue_clean(&jacosub->q);
-    return 0;
-}
-
 static const char *read_ts(JACOsubContext *jacosub, const char *buf,
                            int64_t *start, int64_t *duration)
 {
@@ -125,33 +119,46 @@ static const char *read_ts(JACOsubContext *jacosub, const char *buf,
     return NULL;
 
 shift_and_ret:
-    ts_start64  = (ts_start + jacosub->shift) * 100LL / jacosub->timeres;
-    ts_end64    = (ts_end   + jacosub->shift) * 100LL / jacosub->timeres;
+    ts_start64  = (ts_start + (int64_t)jacosub->shift) * 100LL / jacosub->timeres;
+    ts_end64    = (ts_end   + (int64_t)jacosub->shift) * 100LL / jacosub->timeres;
     *start    = ts_start64;
     *duration = ts_end64 - ts_start64;
     return buf + len;
 }
 
-static int get_shift(int timeres, const char *buf)
+static int get_shift(unsigned timeres, const char *buf)
 {
     int sign = 1;
-    int a = 0, b = 0, c = 0, d = 0;
+    int h = 0, m = 0, s = 0, d = 0;
+    int64_t ret;
 #define SSEP "%*1[.:]"
-    int n = sscanf(buf, "%d"SSEP"%d"SSEP"%d"SSEP"%d", &a, &b, &c, &d);
+    int n = sscanf(buf, "%d"SSEP"%d"SSEP"%d"SSEP"%d", &h, &m, &s, &d);
 #undef SSEP
 
-    if (*buf == '-' || a < 0) {
+    if (h == INT_MIN)
+        return 0;
+
+    if (*buf == '-' || h < 0) {
         sign = -1;
-        a = FFABS(a);
+        h = FFABS(h);
     }
 
+    ret = 0;
     switch (n) {
-    case 4: return sign * ((a*3600 + b*60 + c) * timeres + d);
-    case 3: return sign * ((         a*60 + b) * timeres + c);
-    case 2: return sign * ((                a) * timeres + b);
+    case 1:        h = 0;               av_fallthrough; //clear all in case of a single parameter
+    case 2: s = m; m = h; h = 0;        av_fallthrough; //shift into second subsecondd
+    case 3: d = s; s = m; m = h; h = 0;                 //shift into minute second subsecond
     }
 
-    return 0;
+    ret = (int64_t)h*3600 + (int64_t)m*60 + s;
+    if (FFABS(ret) > (INT64_MAX - FFABS((int64_t)d)) / timeres)
+        return 0;
+    ret = sign * (ret * timeres + d);
+
+    if ((int)ret != ret)
+        ret = 0;
+
+    return ret;
 }
 
 static int jacosub_read_header(AVFormatContext *s)
@@ -189,8 +196,8 @@ static int jacosub_read_header(AVFormatContext *s)
 
             sub = ff_subtitles_queue_insert(&jacosub->q, line, len, merge_line);
             if (!sub) {
-                ret = AVERROR(ENOMEM);
-                goto fail;
+                av_bprint_finalize(&header, NULL);
+                return AVERROR(ENOMEM);
             }
             sub->pos = pos;
             merge_line = len > 1 && !strcmp(&line[len - 2], "\\\n");
@@ -222,56 +229,43 @@ static int jacosub_read_header(AVFormatContext *s)
             }
             av_bprintf(&header, "#S %s", p);
             break;
-        case 'T': // ...but must be placed after TIMERES
-            jacosub->timeres = strtol(p, NULL, 10);
-            if (!jacosub->timeres)
+        case 'T': { // ...but must be placed after TIMERES
+            int64_t timeres = strtol(p, NULL, 10);
+            if (timeres <= 0 || timeres > UINT32_MAX) {
                 jacosub->timeres = 30;
-            else
+            } else {
+                jacosub->timeres = timeres;
                 av_bprintf(&header, "#T %s", p);
+            }
             break;
+        }
         }
     }
 
     /* general/essential directives in the extradata */
     ret = ff_bprint_to_codecpar_extradata(st->codecpar, &header);
     if (ret < 0)
-        goto fail;
+        return ret;
 
     /* SHIFT and TIMERES affect the whole script so packet timing can only be
      * done in a second pass */
     for (i = 0; i < jacosub->q.nb_subs; i++) {
-        AVPacket *sub = &jacosub->q.subs[i];
+        AVPacket *sub = jacosub->q.subs[i];
         read_ts(jacosub, sub->data, &sub->pts, &sub->duration);
     }
     ff_subtitles_queue_finalize(s, &jacosub->q);
 
     return 0;
-fail:
-    jacosub_read_close(s);
-    return ret;
 }
 
-static int jacosub_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    JACOsubContext *jacosub = s->priv_data;
-    return ff_subtitles_queue_read_packet(&jacosub->q, pkt);
-}
-
-static int jacosub_read_seek(AVFormatContext *s, int stream_index,
-                             int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
-{
-    JACOsubContext *jacosub = s->priv_data;
-    return ff_subtitles_queue_seek(&jacosub->q, s, stream_index,
-                                   min_ts, ts, max_ts, flags);
-}
-
-AVInputFormat ff_jacosub_demuxer = {
-    .name           = "jacosub",
-    .long_name      = NULL_IF_CONFIG_SMALL("JACOsub subtitle format"),
+const FFInputFormat ff_jacosub_demuxer = {
+    .p.name         = "jacosub",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("JACOsub subtitle format"),
     .priv_data_size = sizeof(JACOsubContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = jacosub_probe,
     .read_header    = jacosub_read_header,
-    .read_packet    = jacosub_read_packet,
-    .read_seek2     = jacosub_read_seek,
-    .read_close     = jacosub_read_close,
+    .read_packet    = ff_subtitles_read_packet,
+    .read_seek2     = ff_subtitles_read_seek,
+    .read_close     = ff_subtitles_read_close,
 };

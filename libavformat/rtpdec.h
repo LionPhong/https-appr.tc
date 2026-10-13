@@ -23,7 +23,8 @@
 #ifndef AVFORMAT_RTPDEC_H
 #define AVFORMAT_RTPDEC_H
 
-#include "libavcodec/avcodec.h"
+#include "libavcodec/codec_id.h"
+#include "libavcodec/packet.h"
 #include "avformat.h"
 #include "rtp.h"
 #include "url.h"
@@ -44,8 +45,8 @@ RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
                                    int payload_type, int queue_size);
 void ff_rtp_parse_set_dynamic_protocol(RTPDemuxContext *s, PayloadContext *ctx,
                                        const RTPDynamicProtocolHandler *handler);
-void ff_rtp_parse_set_crypto(RTPDemuxContext *s, const char *suite,
-                             const char *params);
+int ff_rtp_parse_set_crypto(RTPDemuxContext *s, const char *suite,
+                            const char *params);
 int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
                         uint8_t **buf, int len);
 void ff_rtp_parse_close(RTPDemuxContext *s);
@@ -134,8 +135,6 @@ struct RTPDynamicProtocolHandler {
     /** Parse handler for this dynamic packet */
     DynamicPayloadPacketHandlerProc parse_packet;
     int (*need_keyframe)(PayloadContext *context);
-
-    struct RTPDynamicProtocolHandler *next;
 };
 
 typedef struct RTPPacket {
@@ -174,11 +173,11 @@ struct RTPDemuxContext {
     /*@}*/
 
     /* rtcp sender statistics receive */
-    uint64_t last_rtcp_ntp_time;
     int64_t last_rtcp_reception_time;
     uint64_t first_rtcp_ntp_time;
-    uint32_t last_rtcp_timestamp;
     int64_t rtcp_ts_offset;
+    AVRTCPSenderReport last_sr; ///< Last RTCP SR data
+    int pending_sr; ///< Indicates if there is a SR pending to be attached as sidedata
 
     /* rtcp sender statistics */
     unsigned int packet_count;
@@ -191,16 +190,6 @@ struct RTPDemuxContext {
     PayloadContext *dynamic_protocol_context;
 };
 
-/**
- * Iterate over all registered rtp dynamic protocol handlers.
- *
- * @param opaque a pointer where libavformat will store the iteration state. Must
- *               point to NULL to start the iteration.
- *
- * @return the next registered rtp dynamic protocol handler or NULL when the iteration is
- *         finished
- */
-const RTPDynamicProtocolHandler *ff_rtp_handler_iterate(void **opaque);
 /**
  * Find a registered rtp dynamic protocol handler with the specified name.
  *

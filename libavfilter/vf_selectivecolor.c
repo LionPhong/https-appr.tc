@@ -32,8 +32,7 @@
 #include "libavcodec/mathops.h" // for mid_pred(), which is a macro so no link dependency
 #include "avfilter.h"
 #include "drawutils.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define R 0
@@ -61,7 +60,7 @@ enum correction_method {
     NB_CORRECTION_METHODS,
 };
 
-static const char *color_names[NB_RANGES] = {
+static const char *const color_names[NB_RANGES] = {
     "red", "yellow", "green", "cyan", "blue", "magenta", "white", "neutral", "black"
 };
 
@@ -96,9 +95,9 @@ typedef struct SelectiveColorContext {
     { color_name"s", "adjust "color_name" regions", OFFSET(opt_cmyk_adjust[range]), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS }
 
 static const AVOption selectivecolor_options[] = {
-    { "correction_method", "select correction method", OFFSET(correction_method), AV_OPT_TYPE_INT, {.i64 = CORRECTION_METHOD_ABSOLUTE}, 0, NB_CORRECTION_METHODS-1, FLAGS, "correction_method" },
-        { "absolute", NULL, 0, AV_OPT_TYPE_CONST, {.i64=CORRECTION_METHOD_ABSOLUTE}, INT_MIN, INT_MAX, FLAGS, "correction_method" },
-        { "relative", NULL, 0, AV_OPT_TYPE_CONST, {.i64=CORRECTION_METHOD_RELATIVE}, INT_MIN, INT_MAX, FLAGS, "correction_method" },
+    { "correction_method", "select correction method", OFFSET(correction_method), AV_OPT_TYPE_INT, {.i64 = CORRECTION_METHOD_ABSOLUTE}, 0, NB_CORRECTION_METHODS-1, FLAGS, .unit = "correction_method" },
+        { "absolute", NULL, 0, AV_OPT_TYPE_CONST, {.i64=CORRECTION_METHOD_ABSOLUTE}, INT_MIN, INT_MAX, FLAGS, .unit = "correction_method" },
+        { "relative", NULL, 0, AV_OPT_TYPE_CONST, {.i64=CORRECTION_METHOD_RELATIVE}, INT_MIN, INT_MAX, FLAGS, .unit = "correction_method" },
     RANGE_OPTION("red",     RANGE_REDS),
     RANGE_OPTION("yellow",  RANGE_YELLOWS),
     RANGE_OPTION("green",   RANGE_GREENS),
@@ -147,8 +146,9 @@ static int get_blacks_scale##nbits(int r, int g, int b, int min_val, int max_val
 DECLARE_RANGE_SCALE_FUNCS(8)
 DECLARE_RANGE_SCALE_FUNCS(16)
 
-static int register_range(SelectiveColorContext *s, int range_id)
+static int register_range(AVFilterContext *ctx, int range_id)
 {
+    SelectiveColorContext *s = ctx->priv;
     const float *cmyk = s->cmyk_adjust[range_id];
 
     /* If the color range has user settings, register the color range
@@ -160,7 +160,7 @@ static int register_range(SelectiveColorContext *s, int range_id)
             cmyk[1] < -1.0 || cmyk[1] > 1.0 ||
             cmyk[2] < -1.0 || cmyk[2] > 1.0 ||
             cmyk[3] < -1.0 || cmyk[3] > 1.0) {
-            av_log(s, AV_LOG_ERROR, "Invalid %s adjustments (%g %g %g %g). "
+            av_log(ctx, AV_LOG_ERROR, "Invalid %s adjustments (%g %g %g %g). "
                    "Settings must be set in [-1;1] range\n",
                    color_names[range_id], cmyk[0], cmyk[1], cmyk[2], cmyk[3]);
             return AVERROR(EINVAL);
@@ -206,7 +206,7 @@ static int parse_psfile(AVFilterContext *ctx, const char *fname)
 
     READ16(version);
     if (version != 1)
-        av_log(s, AV_LOG_WARNING, "Unsupported selective color file version %d, "
+        av_log(ctx, AV_LOG_WARNING, "Unsupported selective color file version %d, "
                "the settings might not be loaded properly\n", version);
 
     READ16(s->correction_method);
@@ -215,7 +215,7 @@ static int parse_psfile(AVFilterContext *ctx, const char *fname)
     for (i = 0; i < FF_ARRAY_ELEMS(s->cmyk_adjust[0]); i++) {
         READ16(val);
         if (val)
-            av_log(s, AV_LOG_WARNING, "%c value of first CMYK entry is not 0 "
+            av_log(ctx, AV_LOG_WARNING, "%c value of first CMYK entry is not 0 "
                    "but %d\n", "CMYK"[i], val);
     }
 
@@ -223,9 +223,9 @@ static int parse_psfile(AVFilterContext *ctx, const char *fname)
         int k;
         for (k = 0; k < FF_ARRAY_ELEMS(s->cmyk_adjust[0]); k++) {
             READ16(val);
-            s->cmyk_adjust[i][k] = val / 100.;
+            s->cmyk_adjust[i][k] = val / 100.f;
         }
-        ret = register_range(s, i);
+        ret = register_range(ctx, i);
         if (ret < 0)
             goto end;
     }
@@ -266,51 +266,44 @@ static int config_input(AVFilterLink *inlink)
                 float *cmyk = s->cmyk_adjust[i];
 
                 sscanf(s->opt_cmyk_adjust[i], "%f %f %f %f", cmyk, cmyk+1, cmyk+2, cmyk+3);
-                ret = register_range(s, i);
+                ret = register_range(ctx, i);
                 if (ret < 0)
                     return ret;
             }
         }
     }
 
-    av_log(s, AV_LOG_VERBOSE, "Adjustments:%s\n", s->nb_process_ranges ? "" : " none");
+    av_log(ctx, AV_LOG_VERBOSE, "Adjustments:%s\n", s->nb_process_ranges ? "" : " none");
     for (i = 0; i < s->nb_process_ranges; i++) {
         const struct process_range *pr = &s->process_ranges[i];
         const float *cmyk = s->cmyk_adjust[pr->range_id];
 
-        av_log(s, AV_LOG_VERBOSE, "%8ss: C=%6g M=%6g Y=%6g K=%6g\n",
+        av_log(ctx, AV_LOG_VERBOSE, "%8ss: C=%6g M=%6g Y=%6g K=%6g\n",
                color_names[pr->range_id], cmyk[0], cmyk[1], cmyk[2], cmyk[3]);
     }
 
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_RGB24,  AV_PIX_FMT_BGR24,
-        AV_PIX_FMT_RGBA,   AV_PIX_FMT_BGRA,
-        AV_PIX_FMT_ARGB,   AV_PIX_FMT_ABGR,
-        AV_PIX_FMT_0RGB,   AV_PIX_FMT_0BGR,
-        AV_PIX_FMT_RGB0,   AV_PIX_FMT_BGR0,
-        AV_PIX_FMT_RGB48,  AV_PIX_FMT_BGR48,
-        AV_PIX_FMT_RGBA64, AV_PIX_FMT_BGRA64,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_RGB24,  AV_PIX_FMT_BGR24,
+    AV_PIX_FMT_RGBA,   AV_PIX_FMT_BGRA,
+    AV_PIX_FMT_ARGB,   AV_PIX_FMT_ABGR,
+    AV_PIX_FMT_0RGB,   AV_PIX_FMT_0BGR,
+    AV_PIX_FMT_RGB0,   AV_PIX_FMT_BGR0,
+    AV_PIX_FMT_RGB48,  AV_PIX_FMT_BGR48,
+    AV_PIX_FMT_RGBA64, AV_PIX_FMT_BGRA64,
+    AV_PIX_FMT_NONE
+};
 
 static inline int comp_adjust(int scale, float value, float adjust, float k, int correction_method)
 {
     const float min = -value;
-    const float max = 1. - value;
-    float res = (-1. - adjust) * k - adjust;
+    const float max = 1.f - value;
+    float res = (-1.f - adjust) * k - adjust;
     if (correction_method == CORRECTION_METHOD_RELATIVE)
         res *= max;
-    return lrint(av_clipf(res, min, max) * scale);
+    return lrintf(av_clipf(res, min, max) * scale);
 }
 
 #define DECLARE_SELECTIVE_COLOR_FUNC(nbits)                                                             \
@@ -323,29 +316,39 @@ static inline int selective_color_##nbits(AVFilterContext *ctx, ThreadData *td, 
     const SelectiveColorContext *s = ctx->priv;                                                         \
     const int height = in->height;                                                                      \
     const int width  = in->width;                                                                       \
-    const int slice_start = (height *  jobnr   ) / nb_jobs;                                             \
-    const int slice_end   = (height * (jobnr+1)) / nb_jobs;                                             \
-    const int dst_linesize = out->linesize[0];                                                          \
-    const int src_linesize =  in->linesize[0];                                                          \
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);                                       \
+    const int slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);                                   \
+    const int dst_linesize = out->linesize[0] / ((nbits + 7) / 8);                                      \
+    const int src_linesize =  in->linesize[0] / ((nbits + 7) / 8);                                      \
     const uint8_t roffset = s->rgba_map[R];                                                             \
     const uint8_t goffset = s->rgba_map[G];                                                             \
     const uint8_t boffset = s->rgba_map[B];                                                             \
     const uint8_t aoffset = s->rgba_map[A];                                                             \
+    uint##nbits##_t *dst = (uint##nbits##_t *)out->data[0] + slice_start * dst_linesize;                \
+    const uint##nbits##_t *src = (const uint##nbits##_t *)in->data[0] + slice_start * src_linesize;     \
+    const uint##nbits##_t *src_r = (const uint##nbits##_t *)src + roffset;                              \
+    const uint##nbits##_t *src_g = (const uint##nbits##_t *)src + goffset;                              \
+    const uint##nbits##_t *src_b = (const uint##nbits##_t *)src + boffset;                              \
+    const uint##nbits##_t *src_a = (const uint##nbits##_t *)src + aoffset;                              \
+    uint##nbits##_t *dst_r = (uint##nbits##_t *)dst + roffset;                                          \
+    uint##nbits##_t *dst_g = (uint##nbits##_t *)dst + goffset;                                          \
+    uint##nbits##_t *dst_b = (uint##nbits##_t *)dst + boffset;                                          \
+    uint##nbits##_t *dst_a = (uint##nbits##_t *)dst + aoffset;                                          \
+    const int mid = 1<<(nbits-1);                                                                       \
+    const int max = (1<<nbits)-1;                                                                       \
+    const float scale = 1.f / max;                                                                      \
                                                                                                         \
     for (y = slice_start; y < slice_end; y++) {                                                         \
-        uint##nbits##_t       *dst = (      uint##nbits##_t *)(out->data[0] + y * dst_linesize);        \
-        const uint##nbits##_t *src = (const uint##nbits##_t *)( in->data[0] + y * src_linesize);        \
-                                                                                                        \
         for (x = 0; x < width * s->step; x += s->step) {                                                \
-            const int r = src[x + roffset];                                                             \
-            const int g = src[x + goffset];                                                             \
-            const int b = src[x + boffset];                                                             \
+            const int r = src_r[x];                                                                     \
+            const int g = src_g[x];                                                                     \
+            const int b = src_b[x];                                                                     \
             const int min_color = FFMIN3(r, g, b);                                                      \
             const int max_color = FFMAX3(r, g, b);                                                      \
-            const int is_white   = (r > 1<<(nbits-1) && g > 1<<(nbits-1) && b > 1<<(nbits-1));          \
+            const int is_white   = (r > mid && g > mid && b > mid);                                     \
             const int is_neutral = (r || g || b) &&                                                     \
-                                   (r != (1<<nbits)-1 || g != (1<<nbits)-1 || b != (1<<nbits)-1);       \
-            const int is_black   = (r < 1<<(nbits-1) && g < 1<<(nbits-1) && b < 1<<(nbits-1));          \
+                                   (r != max || g != max || b != max);                                  \
+            const int is_black   = (r < mid && g < mid && b < mid);                                     \
             const uint32_t range_flag = (r == max_color) << RANGE_REDS                                  \
                                       | (r == min_color) << RANGE_CYANS                                 \
                                       | (g == max_color) << RANGE_GREENS                                \
@@ -356,9 +359,9 @@ static inline int selective_color_##nbits(AVFilterContext *ctx, ThreadData *td, 
                                       | is_neutral       << RANGE_NEUTRALS                              \
                                       | is_black         << RANGE_BLACKS;                               \
                                                                                                         \
-            const float rnorm = r * (1.f / ((1<<nbits)-1));                                             \
-            const float gnorm = g * (1.f / ((1<<nbits)-1));                                             \
-            const float bnorm = b * (1.f / ((1<<nbits)-1));                                             \
+            const float rnorm = r * scale;                                                              \
+            const float gnorm = g * scale;                                                              \
+            const float bnorm = b * scale;                                                              \
             int adjust_r = 0, adjust_g = 0, adjust_b = 0;                                               \
                                                                                                         \
             for (i = 0; i < s->nb_process_ranges; i++) {                                                \
@@ -382,13 +385,23 @@ static inline int selective_color_##nbits(AVFilterContext *ctx, ThreadData *td, 
             }                                                                                           \
                                                                                                         \
             if (!direct || adjust_r || adjust_g || adjust_b) {                                          \
-                dst[x + roffset] = av_clip_uint##nbits(r + adjust_r);                                   \
-                dst[x + goffset] = av_clip_uint##nbits(g + adjust_g);                                   \
-                dst[x + boffset] = av_clip_uint##nbits(b + adjust_b);                                   \
+                dst_r[x] = av_clip_uint##nbits(r + adjust_r);                                           \
+                dst_g[x] = av_clip_uint##nbits(g + adjust_g);                                           \
+                dst_b[x] = av_clip_uint##nbits(b + adjust_b);                                           \
                 if (!direct && s->step == 4)                                                            \
-                    dst[x + aoffset] = src[x + aoffset];                                                \
+                    dst_a[x] = src_a[x];                                                                \
             }                                                                                           \
         }                                                                                               \
+                                                                                                        \
+        src_r += src_linesize;                                                                          \
+        src_g += src_linesize;                                                                          \
+        src_b += src_linesize;                                                                          \
+        src_a += src_linesize;                                                                          \
+                                                                                                        \
+        dst_r += dst_linesize;                                                                          \
+        dst_g += dst_linesize;                                                                          \
+        dst_b += dst_linesize;                                                                          \
+        dst_a += dst_linesize;                                                                          \
     }                                                                                                   \
     return 0;                                                                                           \
 }
@@ -444,8 +457,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     td.in = in;
     td.out = out;
-    ctx->internal->execute(ctx, funcs[s->is_16bit][direct][s->correction_method],
-                           &td, NULL, FFMIN(inlink->h, ff_filter_get_nb_threads(ctx)));
+    ff_filter_execute(ctx, funcs[s->is_16bit][direct][s->correction_method],
+                      &td, NULL, FFMIN(inlink->h, ff_filter_get_nb_threads(ctx)));
 
     if (!direct)
         av_frame_free(&in);
@@ -459,24 +472,15 @@ static const AVFilterPad selectivecolor_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad selectivecolor_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_selectivecolor = {
-    .name          = "selectivecolor",
-    .description   = NULL_IF_CONFIG_SMALL("Apply CMYK adjustments to specific color ranges."),
+const FFFilter ff_vf_selectivecolor = {
+    .p.name        = "selectivecolor",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply CMYK adjustments to specific color ranges."),
+    .p.priv_class  = &selectivecolor_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(SelectiveColorContext),
-    .query_formats = query_formats,
-    .inputs        = selectivecolor_inputs,
-    .outputs       = selectivecolor_outputs,
-    .priv_class    = &selectivecolor_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(selectivecolor_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

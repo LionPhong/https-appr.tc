@@ -20,14 +20,15 @@
 #include "libavutil/eval.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 enum {
     X, Y, W, H,
     NB_PARAMS,
 };
-static const char *addroi_param_names[] = {
-    "x", "y", "w", "h",
+static const char addroi_param_names[] = {
+    'x', 'y', 'w', 'h',
 };
 
 enum {
@@ -38,6 +39,7 @@ enum {
 static const char *const addroi_var_names[] = {
     "iw",
     "ih",
+    NULL,
 };
 
 typedef struct AddROIContext {
@@ -74,12 +76,12 @@ static int addroi_config_input(AVFilterLink *inlink)
 
         val = av_expr_eval(ctx->region_expr[i], vars, NULL);
         if (val < 0.0) {
-            av_log(avctx, AV_LOG_WARNING, "Calculated value %g for %s is "
+            av_log(avctx, AV_LOG_WARNING, "Calculated value %g for %c is "
                    "less than zero - using zero instead.\n", val,
                    addroi_param_names[i]);
             val = 0.0;
         } else if (val > max_value) {
-            av_log(avctx, AV_LOG_WARNING, "Calculated value %g for %s is "
+            av_log(avctx, AV_LOG_WARNING, "Calculated value %g for %c is "
                    "greater than maximum allowed value %d - "
                    "using %d instead.\n", val, addroi_param_names[i],
                    max_value, max_value);
@@ -194,7 +196,7 @@ static av_cold int addroi_init(AVFilterContext *avctx)
                             0, avctx);
         if (err < 0) {
             av_log(ctx, AV_LOG_ERROR,
-                   "Error parsing %s expression '%s'.\n",
+                   "Error parsing %c expression '%s'.\n",
                    addroi_param_names[i], ctx->region_str[i]);
             return err;
         }
@@ -244,26 +246,19 @@ static const AVFilterPad addroi_inputs[] = {
         .config_props = addroi_config_input,
         .filter_frame = addroi_filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad addroi_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
+const FFFilter ff_vf_addroi = {
+    .p.name        = "addroi",
+    .p.description = NULL_IF_CONFIG_SMALL("Add region of interest to frame."),
+    .p.priv_class  = &addroi_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
 
-AVFilter ff_vf_addroi = {
-    .name        = "addroi",
-    .description = NULL_IF_CONFIG_SMALL("Add region of interest to frame."),
     .init        = addroi_init,
     .uninit      = addroi_uninit,
 
     .priv_size   = sizeof(AddROIContext),
-    .priv_class  = &addroi_class,
 
-    .inputs      = addroi_inputs,
-    .outputs     = addroi_outputs,
+    FILTER_INPUTS(addroi_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
 };

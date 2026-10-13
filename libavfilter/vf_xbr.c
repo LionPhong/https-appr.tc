@@ -29,9 +29,10 @@
  */
 
 #include "libavutil/opt.h"
-#include "libavutil/avassert.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "video.h"
 
 #define LB_MASK       0x00FEFEFE
 #define RED_BLUE_MASK 0x00FF00FF
@@ -218,8 +219,8 @@ static av_always_inline void xbr_filter(const ThreadData *td, int jobnr, int nb_
     const AVFrame *input = td->in;
     AVFrame *output = td->out;
     const uint32_t *r2y = td->rgbtoyuv;
-    const int slice_start = (input->height *  jobnr   ) / nb_jobs;
-    const int slice_end   = (input->height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(input->height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(input->height, jobnr + 1, nb_jobs);
     const int nl = output->linesize[0] >> 2;
     const int nl1 = nl + nl;
     const int nl2 = nl1 + nl;
@@ -341,18 +342,6 @@ static int config_output(AVFilterLink *outlink)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_0RGB32, AV_PIX_FMT_NONE,
-    };
-
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
-
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -371,7 +360,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     td.in = in;
     td.out = out;
     td.rgbtoyuv = s->rgbtoyuv;
-    ctx->internal->execute(ctx, s->func, &td, NULL, FFMIN(inlink->h, ff_filter_get_nb_threads(ctx)));
+    ff_filter_execute(ctx, s->func, &td, NULL,
+                      FFMIN(inlink->h, ff_filter_get_nb_threads(ctx)));
 
     out->width  = outlink->w;
     out->height = outlink->h;
@@ -413,7 +403,6 @@ static const AVFilterPad xbr_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad xbr_outputs[] = {
@@ -422,17 +411,16 @@ static const AVFilterPad xbr_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_xbr = {
-    .name          = "xbr",
-    .description   = NULL_IF_CONFIG_SMALL("Scale the input using xBR algorithm."),
-    .inputs        = xbr_inputs,
-    .outputs       = xbr_outputs,
-    .query_formats = query_formats,
+const FFFilter ff_vf_xbr = {
+    .p.name        = "xbr",
+    .p.description = NULL_IF_CONFIG_SMALL("Scale the input using xBR algorithm."),
+    .p.priv_class  = &xbr_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(xbr_inputs),
+    FILTER_OUTPUTS(xbr_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_0RGB32),
     .priv_size     = sizeof(XBRContext),
-    .priv_class    = &xbr_class,
     .init          = init,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
 };

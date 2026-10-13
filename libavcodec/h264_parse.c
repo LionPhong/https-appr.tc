@@ -16,13 +16,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "bytestream.h"
 #include "get_bits.h"
 #include "golomb.h"
 #include "h264.h"
-#include "h264dec.h"
+#include "h264pred.h"
 #include "h264_parse.h"
 #include "h264_ps.h"
+#include "h2645_parse.h"
+#include "mpegutils.h"
 
 int ff_h264_pred_weight_table(GetBitContext *gb, const SPS *sps,
                               const int *ref_count, int slice_type_nos,
@@ -35,7 +38,7 @@ int ff_h264_pred_weight_table(GetBitContext *gb, const SPS *sps,
     pwt->use_weight             = 0;
     pwt->use_weight_chroma      = 0;
 
-    pwt->luma_log2_weight_denom = get_ue_golomb(gb);
+    pwt->luma_log2_weight_denom = get_ue_golomb_31(gb);
     if (pwt->luma_log2_weight_denom > 7U) {
         av_log(logctx, AV_LOG_ERROR, "luma_log2_weight_denom %d is out of range\n", pwt->luma_log2_weight_denom);
         pwt->luma_log2_weight_denom = 0;
@@ -43,7 +46,7 @@ int ff_h264_pred_weight_table(GetBitContext *gb, const SPS *sps,
     luma_def = 1 << pwt->luma_log2_weight_denom;
 
     if (sps->chroma_format_idc) {
-        pwt->chroma_log2_weight_denom = get_ue_golomb(gb);
+        pwt->chroma_log2_weight_denom = get_ue_golomb_31(gb);
         if (pwt->chroma_log2_weight_denom > 7U) {
             av_log(logctx, AV_LOG_ERROR, "chroma_log2_weight_denom %d is out of range\n", pwt->chroma_log2_weight_denom);
             pwt->chroma_log2_weight_denom = 0;
@@ -365,9 +368,10 @@ static int decode_extradata_ps(const uint8_t *data, int size, H264ParamSets *ps,
                                int is_avc, void *logctx)
 {
     H2645Packet pkt = { 0 };
+    int flags = (H2645_FLAG_IS_NALFF * !!is_avc) | H2645_FLAG_SMALL_PADDING;
     int i, ret = 0;
 
-    ret = ff_h2645_packet_split(&pkt, data, size, logctx, is_avc, 2, AV_CODEC_ID_H264, 1, 0);
+    ret = ff_h2645_packet_split(&pkt, data, size, logctx, 2, AV_CODEC_ID_H264, flags);
     if (ret < 0) {
         ret = 0;
         goto fail;
@@ -466,7 +470,7 @@ int ff_h264_decode_extradata(const uint8_t *data, int size, H264ParamSets *ps,
     int ret;
 
     if (!data || size <= 0)
-        return -1;
+        return AVERROR(EINVAL);
 
     if (data[0] == 1) {
         int i, cnt, nalsize;
@@ -524,22 +528,22 @@ int ff_h264_decode_extradata(const uint8_t *data, int size, H264ParamSets *ps,
  *
  * @param sps SPS
  *
- * @return profile as defined by FF_PROFILE_H264_*
+ * @return profile as defined by AV_PROFILE_H264_*
  */
 int ff_h264_get_profile(const SPS *sps)
 {
     int profile = sps->profile_idc;
 
     switch (sps->profile_idc) {
-    case FF_PROFILE_H264_BASELINE:
+    case AV_PROFILE_H264_BASELINE:
         // constraint_set1_flag set to 1
-        profile |= (sps->constraint_set_flags & 1 << 1) ? FF_PROFILE_H264_CONSTRAINED : 0;
+        profile |= (sps->constraint_set_flags & 1 << 1) ? AV_PROFILE_H264_CONSTRAINED : 0;
         break;
-    case FF_PROFILE_H264_HIGH_10:
-    case FF_PROFILE_H264_HIGH_422:
-    case FF_PROFILE_H264_HIGH_444_PREDICTIVE:
+    case AV_PROFILE_H264_HIGH_10:
+    case AV_PROFILE_H264_HIGH_422:
+    case AV_PROFILE_H264_HIGH_444_PREDICTIVE:
         // constraint_set3_flag set to 1
-        profile |= (sps->constraint_set_flags & 1 << 3) ? FF_PROFILE_H264_INTRA : 0;
+        profile |= (sps->constraint_set_flags & 1 << 3) ? AV_PROFILE_H264_INTRA : 0;
         break;
     }
 

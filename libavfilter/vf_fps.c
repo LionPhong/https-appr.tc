@@ -30,11 +30,13 @@
 #include <stdint.h>
 
 #include "libavutil/avassert.h"
+#include "libavutil/eval.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
+#include "ccfifo.h"
 #include "filters.h"
-#include "internal.h"
+#include "video.h"
 
 enum EOFAction {
     EOF_ACTION_ROUND,
@@ -42,12 +44,35 @@ enum EOFAction {
     EOF_ACTION_NB
 };
 
+static const char *const var_names[] = {
+  "source_fps",
+  "ntsc",
+  "pal",
+  "film",
+  "ntsc_film",
+  NULL
+};
+
+enum var_name {
+  VAR_SOURCE_FPS,
+  VAR_FPS_NTSC,
+  VAR_FPS_PAL,
+  VAR_FPS_FILM,
+  VAR_FPS_NTSC_FILM,
+  VARS_NB
+};
+
+static const double ntsc_fps = 30000.0 / 1001.0;
+static const double pal_fps = 25.0;
+static const double film_fps = 24.0;
+static const double ntsc_film_fps = 24000.0 / 1001.0;
+
 typedef struct FPSContext {
     const AVClass *class;
 
     double start_time;      ///< pts, in seconds, of the expected first frame
 
-    AVRational framerate;   ///< target framerate
+    char *framerate;        ///< expression that defines the target framerate
     int rounding;           ///< AVRounding method for timestamps
     int eof_action;         ///< action performed for last frame in FIFO
 
@@ -58,9 +83,12 @@ typedef struct FPSContext {
     /* Runtime state */
     int      status;        ///< buffered input status
     int64_t  status_pts;    ///< buffered input status timestamp
+    int64_t  last_in_pts;   ///< last frame timestamp in input timebase
+    int      last_frame_trimmed; ///< last frame ends at or before start_time
 
     AVFrame *frames[2];     ///< buffered frames
     int      frames_count;  ///< number of buffered frames
+    CCFifo cc_fifo;       ///< closed captions
 
     int64_t  next_pts;      ///< pts of the next frame to output
 
@@ -76,17 +104,17 @@ typedef struct FPSContext {
 #define V AV_OPT_FLAG_VIDEO_PARAM
 #define F AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption fps_options[] = {
-    { "fps", "A string describing desired output framerate", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, { .str = "25" }, 0, INT_MAX, V|F },
+    { "fps", "A string describing desired output framerate", OFFSET(framerate), AV_OPT_TYPE_STRING, { .str = "25" }, 0, 0, V|F },
     { "start_time", "Assume the first PTS should be this value.", OFFSET(start_time), AV_OPT_TYPE_DOUBLE, { .dbl = DBL_MAX}, -DBL_MAX, DBL_MAX, V|F },
-    { "round", "set rounding method for timestamps", OFFSET(rounding), AV_OPT_TYPE_INT, { .i64 = AV_ROUND_NEAR_INF }, 0, 5, V|F, "round" },
-        { "zero", "round towards 0",                 0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_ZERO     }, 0, 0, V|F, "round" },
-        { "inf",  "round away from 0",               0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_INF      }, 0, 0, V|F, "round" },
-        { "down", "round towards -infty",            0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_DOWN     }, 0, 0, V|F, "round" },
-        { "up",   "round towards +infty",            0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_UP       }, 0, 0, V|F, "round" },
-        { "near", "round to nearest",                0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_NEAR_INF }, 0, 0, V|F, "round" },
-    { "eof_action", "action performed for last frame", OFFSET(eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_ROUND }, 0, EOF_ACTION_NB-1, V|F, "eof_action" },
-        { "round", "round similar to other frames",  0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_ROUND }, 0, 0, V|F, "eof_action" },
-        { "pass",  "pass through last frame",        0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_PASS  }, 0, 0, V|F, "eof_action" },
+    { "round", "set rounding method for timestamps", OFFSET(rounding), AV_OPT_TYPE_INT, { .i64 = AV_ROUND_NEAR_INF }, 0, 5, V|F, .unit = "round" },
+        { "zero", "round towards 0",                 0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_ZERO     }, 0, 0, V|F, .unit = "round" },
+        { "inf",  "round away from 0",               0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_INF      }, 0, 0, V|F, .unit = "round" },
+        { "down", "round towards -infty",            0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_DOWN     }, 0, 0, V|F, .unit = "round" },
+        { "up",   "round towards +infty",            0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_UP       }, 0, 0, V|F, .unit = "round" },
+        { "near", "round to nearest",                0, AV_OPT_TYPE_CONST, { .i64 = AV_ROUND_NEAR_INF }, 0, 0, V|F, .unit = "round" },
+    { "eof_action", "action performed for last frame", OFFSET(eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_ROUND }, 0, EOF_ACTION_NB-1, V|F, .unit = "eof_action" },
+        { "round", "round similar to other frames",  0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_ROUND }, 0, 0, V|F, .unit = "eof_action" },
+        { "pass",  "pass through last frame",        0, AV_OPT_TYPE_CONST, { .i64 = EOF_ACTION_PASS  }, 0, 0, V|F, .unit = "eof_action" },
     { NULL }
 };
 
@@ -99,7 +127,6 @@ static av_cold int init(AVFilterContext *ctx)
     s->status_pts   = AV_NOPTS_VALUE;
     s->next_pts     = AV_NOPTS_VALUE;
 
-    av_log(ctx, AV_LOG_VERBOSE, "fps=%d/%d\n", s->framerate.num, s->framerate.den);
     return 0;
 }
 
@@ -142,6 +169,7 @@ static av_cold void uninit(AVFilterContext *ctx)
         frame = shift_frame(ctx, s);
         av_frame_free(&frame);
     }
+    ff_ccfifo_uninit(&s->cc_fifo);
 
     av_log(ctx, AV_LOG_VERBOSE, "%d frames in, %d frames out; %d frames dropped, "
            "%d frames duplicated.\n", s->frames_in, s->frames_out, s->drop, s->dup);
@@ -151,10 +179,26 @@ static int config_props(AVFilterLink* outlink)
 {
     AVFilterContext *ctx    = outlink->src;
     AVFilterLink    *inlink = ctx->inputs[0];
+    FilterLink      *il     = ff_filter_link(inlink);
+    FilterLink      *ol     = ff_filter_link(outlink);
     FPSContext      *s      = ctx->priv;
 
-    outlink->time_base  = av_inv_q(s->framerate);
-    outlink->frame_rate = s->framerate;
+    double var_values[VARS_NB], res;
+    int ret;
+
+    var_values[VAR_SOURCE_FPS]    = av_q2d(il->frame_rate);
+    var_values[VAR_FPS_NTSC]      = ntsc_fps;
+    var_values[VAR_FPS_PAL]       = pal_fps;
+    var_values[VAR_FPS_FILM]      = film_fps;
+    var_values[VAR_FPS_NTSC_FILM] = ntsc_film_fps;
+    ret = av_expr_parse_and_eval(&res, s->framerate,
+                                 var_names, var_values,
+                                 NULL, NULL, NULL, NULL, NULL, 0, ctx);
+    if (ret < 0)
+        return ret;
+
+    ol->frame_rate      = av_d2q(res, INT_MAX);
+    outlink->time_base  = av_inv_q(ol->frame_rate);
 
     /* Calculate the input and output pts offsets for start_time */
     if (s->start_time != DBL_MAX && s->start_time != AV_NOPTS_VALUE) {
@@ -172,6 +216,14 @@ static int config_props(AVFilterLink* outlink)
         av_log(ctx, AV_LOG_VERBOSE, "Set first pts to (in:%"PRId64" out:%"PRId64") from start time %f\n",
                s->in_pts_off, s->out_pts_off, s->start_time);
     }
+
+    ret = ff_ccfifo_init(&s->cc_fifo, ol->frame_rate, ctx);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failure to setup CC FIFO queue\n");
+        return ret;
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE, "fps=%d/%d\n", ol->frame_rate.num, ol->frame_rate.den);
 
     return 0;
 }
@@ -195,7 +247,7 @@ static int read_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *inlink,
     /* Convert frame pts to output timebase.
      * The dance with offsets is required to match the rounding behaviour of the
      * previous version of the fps filter when using the start_time option. */
-    in_pts = frame->pts;
+    in_pts = s->last_in_pts = frame->pts;
     frame->pts = s->out_pts_off + av_rescale_q_rnd(in_pts - s->in_pts_off,
                                                    inlink->time_base, outlink->time_base,
                                                    s->rounding | AV_ROUND_PASS_MINMAX);
@@ -203,6 +255,7 @@ static int read_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *inlink,
     av_log(ctx, AV_LOG_DEBUG, "Read frame with in pts %"PRId64", out pts %"PRId64"\n",
            in_pts, frame->pts);
 
+    ff_ccfifo_extract(&s->cc_fifo, frame);
     s->frames[s->frames_count++] = frame;
     s->frames_in++;
 
@@ -213,6 +266,8 @@ static int read_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *inlink,
 static int write_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *outlink, int *again)
 {
     AVFrame *frame;
+    int eof_before_or_at_next;
+    int first_output_due;
 
     av_assert1(s->frames_count == 2 || (s->status && s->frames_count == 1));
 
@@ -231,13 +286,20 @@ static int write_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *outlin
         }
     }
 
+    eof_before_or_at_next = s->status && s->status_pts <= s->next_pts;
+    first_output_due      = !s->frames_out && !s->cur_frame_out &&
+                            !s->last_frame_trimmed &&
+                            s->frames[0]->pts == s->next_pts &&
+                            s->status_pts == s->next_pts;
+
     /* There are two conditions where we want to drop a frame:
      * - If we have two buffered frames and the second frame is acceptable
      *   as the next output frame, then drop the first buffered frame.
      * - If we have status (EOF) set, drop frames when we hit the
-     *   status timestamp. */
+     *   status timestamp, unless no frame has been output yet and the
+     *   buffered frame is due at the next output timestamp. */
     if ((s->frames_count == 2 && s->frames[1]->pts <= s->next_pts) ||
-        (s->status            && s->status_pts     <= s->next_pts)) {
+        (eof_before_or_at_next && !first_output_due)) {
 
         frame = shift_frame(ctx, s);
         av_frame_free(&frame);
@@ -250,8 +312,9 @@ static int write_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *outlin
         if (!frame)
             return AVERROR(ENOMEM);
         // Make sure Closed Captions will not be duplicated
-        av_frame_remove_side_data(s->frames[0], AV_FRAME_DATA_A53_CC);
+        ff_ccfifo_inject(&s->cc_fifo, frame);
         frame->pts = s->next_pts++;
+        frame->duration = 1;
 
         av_log(ctx, AV_LOG_DEBUG, "Writing frame with pts %"PRId64" to pts %"PRId64"\n",
                s->frames[0]->pts, frame->pts);
@@ -265,6 +328,14 @@ static int write_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *outlin
 static void update_eof_pts(AVFilterContext *ctx, FPSContext *s, AVFilterLink *inlink, AVFilterLink *outlink, int64_t status_pts)
 {
     int eof_rounding = (s->eof_action == EOF_ACTION_PASS) ? AV_ROUND_UP : s->rounding;
+
+    /* Check trimming before rounding can collapse a frame before start_time
+     * and the end of its interval onto the first output timestamp. A frame
+     * starting at start_time is still eligible even with zero duration. */
+    s->last_frame_trimmed = s->start_time != DBL_MAX &&
+                            s->start_time != AV_NOPTS_VALUE &&
+                            s->last_in_pts < s->in_pts_off &&
+                            status_pts <= s->in_pts_off;
     s->status_pts = av_rescale_q_rnd(status_pts, inlink->time_base, outlink->time_base,
                                      eof_rounding | AV_ROUND_PASS_MINMAX);
 
@@ -312,7 +383,7 @@ static int activate(AVFilterContext *ctx)
     if (s->frames_count > 0) {
         ret = write_frame(ctx, s, outlink, &again);
         /* Couldn't generate a frame, so schedule us to perform another step */
-        if (again)
+        if (again && ff_inoutlink_check_flow(inlink, outlink))
             ff_filter_set_ready(ctx, 100);
         return ret;
     }
@@ -326,31 +397,24 @@ static int activate(AVFilterContext *ctx)
     return FFERROR_NOT_READY;
 }
 
-static const AVFilterPad avfilter_vf_fps_inputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
 static const AVFilterPad avfilter_vf_fps_outputs[] = {
     {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_props,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_fps = {
-    .name        = "fps",
-    .description = NULL_IF_CONFIG_SMALL("Force constant framerate."),
+const FFFilter ff_vf_fps = {
+    .p.name        = "fps",
+    .p.description = NULL_IF_CONFIG_SMALL("Force constant framerate."),
+    .p.priv_class  = &fps_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .init        = init,
     .uninit      = uninit,
     .priv_size   = sizeof(FPSContext),
-    .priv_class  = &fps_class,
     .activate    = activate,
-    .inputs      = avfilter_vf_fps_inputs,
-    .outputs     = avfilter_vf_fps_outputs,
+    FILTER_INPUTS(ff_video_default_filterpad),
+    FILTER_OUTPUTS(avfilter_vf_fps_outputs),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_PARAMS,
 };

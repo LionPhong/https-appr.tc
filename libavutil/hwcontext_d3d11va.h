@@ -94,6 +94,24 @@ typedef struct AVD3D11VADeviceContext {
     void (*lock)(void *lock_ctx);
     void (*unlock)(void *lock_ctx);
     void *lock_ctx;
+    /**
+     * D3D11_TEXTURE2D_DESC.BindFlags to be applied to D3D11 resources allocated
+     * for frames using this device context.
+     *
+     * It applies globally to all AVD3D11VAFramesContext allocated from this device context,
+     * except that flags incompatible with the selected format may be removed during frames
+     * initialization.
+     * In particular, D3D11_BIND_SHADER_RESOURCE is removed for
+     * AV_PIX_FMT_YUV420P / DXGI_FORMAT_420_OPAQUE.
+     */
+    UINT BindFlags;
+    /**
+     * D3D11_TEXTURE2D_DESC.MiscFlags to be applied to D3D11 resources allocated
+     * for frames using this device context.
+     *
+     * It applies globally to all AVD3D11VAFramesContext allocated from this device context.
+     */
+    UINT MiscFlags;
 } AVD3D11VADeviceContext;
 
 /**
@@ -155,6 +173,9 @@ typedef struct AVD3D11VAFramesContext {
      * D3D11_TEXTURE2D_DESC.BindFlags used for texture creation. The user must
      * at least set D3D11_BIND_DECODER if the frames context is to be used for
      * video decoding.
+     * Please note that flags incompatible with the selected format may be removed
+     * during frames initialization. In particular, D3D11_BIND_SHADER_RESOURCE is
+     * removed for AV_PIX_FMT_YUV420P / DXGI_FORMAT_420_OPAQUE.
      * This field is ignored/invalid if a user-allocated texture is provided.
      */
     UINT BindFlags;
@@ -164,6 +185,15 @@ typedef struct AVD3D11VAFramesContext {
      * This field is ignored/invalid if a user-allocated texture is provided.
      */
     UINT MiscFlags;
+
+    /**
+     * In case if texture structure member above is not NULL contains the same texture
+     * pointer for all elements and different indexes into the array texture.
+     * In case if texture structure member above is NULL, all elements contains
+     * pointers to separate non-array textures and 0 indexes.
+     * This field is ignored/invalid if a user-allocated texture is provided.
+    */
+    AVD3D11FrameDescriptor *texture_infos;
 } AVD3D11VAFramesContext;
 
 #endif /* AVUTIL_HWCONTEXT_D3D11VA_H */

@@ -18,16 +18,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/avstring.h"
 
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "opencl.h"
 #include "opencl_source.h"
 #include "video.h"
@@ -41,7 +42,7 @@ typedef struct NeighborOpenCLContext {
 
     char *matrix_str[4];
 
-    cl_float threshold[4];
+    cl_float threshold[AV_VIDEO_MAX_PLANES];
     cl_int coordinates;
     cl_mem coord;
 
@@ -54,7 +55,7 @@ static int neighbor_opencl_init(AVFilterContext *avctx)
     cl_int cle;
     int err;
 
-    err = ff_opencl_filter_load_program(avctx, &ff_opencl_source_neighbor, 1);
+    err = ff_opencl_filter_load_program(avctx, &ff_source_neighbor_cl, 1);
     if (err < 0)
         goto fail;
 
@@ -68,6 +69,9 @@ static int neighbor_opencl_init(AVFilterContext *avctx)
         kernel_name = "erosion_global";
     } else if (!strcmp(avctx->filter->name, "dilation_opencl")){
         kernel_name = "dilation_global";
+    } else {
+        err = AVERROR_BUG;
+        goto fail;
     }
     ctx->kernel = clCreateKernel(ctx->ocf.program, kernel_name, &cle);
     CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create "
@@ -92,7 +96,7 @@ static int neighbor_opencl_make_filter_params(AVFilterContext *avctx)
     cl_int cle;
     int i;
 
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < AV_VIDEO_MAX_PLANES; i++) {
         ctx->threshold[i] /= 255.0;
     }
 
@@ -181,8 +185,7 @@ static int neighbor_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
             if (err < 0)
                 goto fail;
 
-            av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d "
-                   "(%"SIZE_SPECIFIER"x%"SIZE_SPECIFIER").\n",
+            av_log(avctx, AV_LOG_DEBUG, "Run kernel on plane %d (%zux%zu).\n",
                    p, global_work[0], global_work[1]);
 
             cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
@@ -246,7 +249,6 @@ static const AVFilterPad neighbor_opencl_inputs[] = {
         .filter_frame = &neighbor_opencl_filter_frame,
         .config_props = &ff_opencl_filter_config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad neighbor_opencl_outputs[] = {
@@ -255,7 +257,6 @@ static const AVFilterPad neighbor_opencl_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = &ff_opencl_filter_config_output,
     },
-    { NULL }
 };
 
 #define OFFSET(x) offsetof(NeighborOpenCLContext, x)
@@ -274,16 +275,16 @@ static const AVOption erosion_opencl_options[] = {
 
 AVFILTER_DEFINE_CLASS(erosion_opencl);
 
-AVFilter ff_vf_erosion_opencl = {
-    .name           = "erosion_opencl",
-    .description    = NULL_IF_CONFIG_SMALL("Apply erosion effect"),
+const FFFilter ff_vf_erosion_opencl = {
+    .p.name         = "erosion_opencl",
+    .p.description  = NULL_IF_CONFIG_SMALL("Apply erosion effect"),
+    .p.priv_class   = &erosion_opencl_class,
     .priv_size      = sizeof(NeighborOpenCLContext),
-    .priv_class     = &erosion_opencl_class,
     .init           = &ff_opencl_filter_init,
     .uninit         = &neighbor_opencl_uninit,
-    .query_formats  = &ff_opencl_filter_query_formats,
-    .inputs         = neighbor_opencl_inputs,
-    .outputs        = neighbor_opencl_outputs,
+    FILTER_INPUTS(neighbor_opencl_inputs),
+    FILTER_OUTPUTS(neighbor_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
@@ -302,16 +303,17 @@ static const AVOption dilation_opencl_options[] = {
 
 AVFILTER_DEFINE_CLASS(dilation_opencl);
 
-AVFilter ff_vf_dilation_opencl = {
-    .name           = "dilation_opencl",
-    .description    = NULL_IF_CONFIG_SMALL("Apply dilation effect"),
+const FFFilter ff_vf_dilation_opencl = {
+    .p.name         = "dilation_opencl",
+    .p.description  = NULL_IF_CONFIG_SMALL("Apply dilation effect"),
+    .p.priv_class   = &dilation_opencl_class,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
     .priv_size      = sizeof(NeighborOpenCLContext),
-    .priv_class     = &dilation_opencl_class,
     .init           = &ff_opencl_filter_init,
     .uninit         = &neighbor_opencl_uninit,
-    .query_formats  = &ff_opencl_filter_query_formats,
-    .inputs         = neighbor_opencl_inputs,
-    .outputs        = neighbor_opencl_outputs,
+    FILTER_INPUTS(neighbor_opencl_inputs),
+    FILTER_OUTPUTS(neighbor_opencl_outputs),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 

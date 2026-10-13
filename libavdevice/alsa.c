@@ -28,10 +28,13 @@
  * @author Nicolas George ( nicolas george normalesup org )
  */
 
+#include "config_components.h"
+
 #include <alsa/asoundlib.h>
 #include "avdevice.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 
 #include "alsa.h"
 
@@ -124,7 +127,90 @@ switch(format) {\
     case FORMAT_F32: s->reorder_func = alsa_reorder_f32_out_ ##layout;   break;\
 }
 
-static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout, int out)
+static const struct {
+    unsigned int   pos;
+    enum AVChannel ch;
+} alsa_chmap_table[] = {
+    { SND_CHMAP_MONO,    AV_CHAN_FRONT_CENTER         },
+    { SND_CHMAP_FL,      AV_CHAN_FRONT_LEFT           },
+    { SND_CHMAP_FR,      AV_CHAN_FRONT_RIGHT          },
+    { SND_CHMAP_RL,      AV_CHAN_BACK_LEFT            },
+    { SND_CHMAP_RR,      AV_CHAN_BACK_RIGHT           },
+    { SND_CHMAP_FC,      AV_CHAN_FRONT_CENTER         },
+    { SND_CHMAP_LFE,     AV_CHAN_LOW_FREQUENCY        },
+    { SND_CHMAP_SL,      AV_CHAN_SIDE_LEFT            },
+    { SND_CHMAP_SR,      AV_CHAN_SIDE_RIGHT           },
+    { SND_CHMAP_RC,      AV_CHAN_BACK_CENTER          },
+    { SND_CHMAP_FLC,     AV_CHAN_FRONT_LEFT_OF_CENTER },
+    { SND_CHMAP_FRC,     AV_CHAN_FRONT_RIGHT_OF_CENTER},
+    { SND_CHMAP_FLW,     AV_CHAN_WIDE_LEFT            },
+    { SND_CHMAP_FRW,     AV_CHAN_WIDE_RIGHT           },
+    { SND_CHMAP_TC,      AV_CHAN_TOP_CENTER           },
+    { SND_CHMAP_TFL,     AV_CHAN_TOP_FRONT_LEFT       },
+    { SND_CHMAP_TFR,     AV_CHAN_TOP_FRONT_RIGHT      },
+    { SND_CHMAP_TFC,     AV_CHAN_TOP_FRONT_CENTER     },
+    { SND_CHMAP_TRL,     AV_CHAN_TOP_BACK_LEFT        },
+    { SND_CHMAP_TRR,     AV_CHAN_TOP_BACK_RIGHT       },
+    { SND_CHMAP_TRC,     AV_CHAN_TOP_BACK_CENTER      },
+    { SND_CHMAP_TSL,     AV_CHAN_TOP_SIDE_LEFT        },
+    { SND_CHMAP_TSR,     AV_CHAN_TOP_SIDE_RIGHT       },
+    { SND_CHMAP_LLFE,    AV_CHAN_LOW_FREQUENCY        },
+    { SND_CHMAP_RLFE,    AV_CHAN_LOW_FREQUENCY_2      },
+    { SND_CHMAP_BC,      AV_CHAN_BOTTOM_FRONT_CENTER  },
+    { SND_CHMAP_BLC,     AV_CHAN_BOTTOM_FRONT_LEFT    },
+    { SND_CHMAP_BRC,     AV_CHAN_BOTTOM_FRONT_RIGHT   },
+    { SND_CHMAP_UNKNOWN, AV_CHAN_UNKNOWN              },
+    { SND_CHMAP_NA,      AV_CHAN_UNUSED               },
+};
+
+static enum AVChannel alsa_chmap_pos_to_av_chan(unsigned int pos)
+{
+    for (unsigned i = 0; i < FF_ARRAY_ELEMS(alsa_chmap_table); i++)
+        if (alsa_chmap_table[i].pos == pos)
+            return alsa_chmap_table[i].ch;
+    return AV_CHAN_NONE;
+}
+
+static int alsa_get_chmap(AVFormatContext *ctx, snd_pcm_t *h, AVChannelLayout *layout)
+{
+    snd_pcm_chmap_t *chmap = snd_pcm_get_chmap(h);
+    int ret = 0;
+
+    if (!chmap)
+        return 0;
+
+    if (layout->nb_channels != chmap->channels) {
+        av_log(ctx, AV_LOG_ERROR, "Inconsistent channel layout requested!\n");
+        ret = AVERROR(EINVAL);
+        goto out;
+    }
+
+    av_channel_layout_uninit(layout);
+    ret = av_channel_layout_custom_init(layout, chmap->channels);
+    if (ret < 0)
+        goto out;
+
+    for (unsigned i = 0; i < chmap->channels; i++) {
+        enum AVChannel ch = alsa_chmap_pos_to_av_chan(chmap->pos[i] &
+                                                      SND_CHMAP_POSITION_MASK);
+        if (ch == AV_CHAN_NONE) {
+            av_log(ctx, AV_LOG_WARNING,
+                   "unknown ALSA channel position %u.\n",
+                   chmap->pos[i] & SND_CHMAP_POSITION_MASK);
+            continue;
+        }
+        layout->u.map[i].id = ch;
+    }
+    ret = av_channel_layout_retype(layout, 0,
+                                   AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
+
+out:
+    free(chmap);
+    return ret;
+}
+
+static av_cold int find_reorder_func(AlsaData *s, int codec_id,
+                                     const AVChannelLayout *layout, int out)
 {
     int format;
 
@@ -133,7 +219,8 @@ static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout,
         return AVERROR(ENOSYS);
 
     /* reordering is not needed for QUAD or 2_2 layout */
-    if (layout == AV_CH_LAYOUT_QUAD || layout == AV_CH_LAYOUT_2_2)
+    if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_QUAD) ||
+        !av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_2_2))
         return 0;
 
     switch (codec_id) {
@@ -154,11 +241,13 @@ static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout,
     default:                 return AVERROR(ENOSYS);
     }
 
-    if      (layout == AV_CH_LAYOUT_5POINT0_BACK || layout == AV_CH_LAYOUT_5POINT0)
+    if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0_BACK) ||
+        !av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0))
         PICK_REORDER(50)
-    else if (layout == AV_CH_LAYOUT_5POINT1_BACK || layout == AV_CH_LAYOUT_5POINT1)
+    else if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1_BACK) ||
+             !av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1))
         PICK_REORDER(51)
-    else if (layout == AV_CH_LAYOUT_7POINT1)
+    else if (!av_channel_layout_compare(layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_7POINT1))
         PICK_REORDER(71)
 
     return s->reorder_func ? 0 : AVERROR(ENOSYS);
@@ -166,7 +255,7 @@ static av_cold int find_reorder_func(AlsaData *s, int codec_id, uint64_t layout,
 
 av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
                          unsigned int *sample_rate,
-                         int channels, enum AVCodecID *codec_id)
+                         AVChannelLayout *layout, enum AVCodecID *codec_id)
 {
     AlsaData *s = ctx->priv_data;
     const char *audio_device;
@@ -175,7 +264,6 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
     snd_pcm_t *h;
     snd_pcm_hw_params_t *hw_params;
     snd_pcm_uframes_t buffer_size, period_size;
-    uint64_t layout = ctx->streams[0]->codecpar->channel_layout;
 
     if (ctx->url[0] == 0) audio_device = "default";
     else                  audio_device = ctx->url;
@@ -187,8 +275,6 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
         av_log(ctx, AV_LOG_ERROR, "sample format 0x%04x is not supported\n", *codec_id);
         return AVERROR(ENOSYS);
     }
-    s->frame_size = av_get_bits_per_sample(*codec_id) / 8 * channels;
-
     if (ctx->flags & AVFMT_FLAG_NONBLOCK) {
         flags = SND_PCM_NONBLOCK;
     }
@@ -234,12 +320,32 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
         goto fail;
     }
 
-    res = snd_pcm_hw_params_set_channels(h, hw_params, channels);
+    // For output streams, the stream should already have a layout.
+    // Adding this check for clarity.
+    if (mode == SND_PCM_STREAM_CAPTURE && layout->nb_channels == 0) {
+        unsigned int channels = 2;
+        if (snd_pcm_hw_params_test_channels(h, hw_params, channels) < 0) {
+            res = snd_pcm_hw_params_get_channels_min(hw_params, &channels);
+            if (res < 0) {
+                av_log(ctx, AV_LOG_ERROR, "cannot get minimum channel count (%s)\n",
+                       snd_strerror(res));
+                goto fail;
+            }
+            av_log(ctx, AV_LOG_VERBOSE,
+                   "stereo not supported, falling back to %u channel(s)\n", channels);
+        }
+        layout->order       = AV_CHANNEL_ORDER_UNSPEC;
+        layout->nb_channels = channels;
+    }
+
+    res = snd_pcm_hw_params_set_channels(h, hw_params, layout->nb_channels);
     if (res < 0) {
         av_log(ctx, AV_LOG_ERROR, "cannot set channel count to %d (%s)\n",
-               channels, snd_strerror(res));
+               layout->nb_channels, snd_strerror(res));
         goto fail;
     }
+
+    s->frame_size = av_get_bits_per_sample(*codec_id) / 8 * layout->nb_channels;
 
     snd_pcm_hw_params_get_buffer_size_max(hw_params, &buffer_size);
     buffer_size = FFMIN(buffer_size, ALSA_BUFFER_SIZE_MAX);
@@ -271,10 +377,22 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
 
     snd_pcm_hw_params_free(hw_params);
 
-    if (channels > 2 && layout) {
+    // TODO: when support for channel layout gets more widespread in alsa
+    // drivers, this might be used to supersede the re-ordering function
+    // below.
+    if (mode == SND_PCM_STREAM_CAPTURE &&
+        layout->order == AV_CHANNEL_ORDER_UNSPEC) {
+        res = alsa_get_chmap(ctx, h, layout);
+        if (res < 0)
+            goto fail1;
+    }
+
+    if (layout->nb_channels > 2 && layout->order != AV_CHANNEL_ORDER_UNSPEC) {
+        // See comment above. find_reorder_func is currently only implemented in
+        // playback mode.
         if (find_reorder_func(s, *codec_id, layout, mode == SND_PCM_STREAM_PLAYBACK) < 0) {
             char name[128];
-            av_get_channel_layout_string(name, sizeof(name), channels, layout);
+            av_channel_layout_describe(layout, name, sizeof(name));
             av_log(ctx, AV_LOG_WARNING, "ALSA channel layout unknown or unimplemented for %s %s.\n",
                    name, mode == SND_PCM_STREAM_PLAYBACK ? "playback" : "capture");
         }
@@ -285,6 +403,10 @@ av_cold int ff_alsa_open(AVFormatContext *ctx, snd_pcm_stream_t mode,
                 goto fail1;
         }
     }
+
+    s->pkt = av_packet_alloc();
+    if (!s->pkt)
+        goto fail1;
 
     s->h = h;
     return 0;
@@ -308,6 +430,7 @@ av_cold int ff_alsa_close(AVFormatContext *s1)
     if (CONFIG_ALSA_INDEV)
         ff_timefilter_destroy(s->timefilter);
     snd_pcm_close(s->h);
+    av_packet_free(&s->pkt);
     return 0;
 }
 
@@ -324,10 +447,12 @@ int ff_alsa_xrun_recover(AVFormatContext *s1, int err)
 
             return AVERROR(EIO);
         }
+#ifdef ESTRPIPE
     } else if (err == -ESTRPIPE) {
         av_log(s1, AV_LOG_ERROR, "-ESTRPIPE... Unsupported!\n");
 
         return -1;
+#endif
     }
     return err;
 }
@@ -370,8 +495,10 @@ int ff_alsa_get_device_list(AVDeviceInfoList *device_list, snd_pcm_stream_t stre
                 ret = AVERROR(ENOMEM);
                 goto fail;
             }
-            new_device->device_name = av_strdup(name);
-            if ((tmp = strrchr(descr, '\n')) && tmp[1])
+            new_device->device_name = av_strdup(name ? name : "");
+            if (!descr)
+                new_device->device_description = av_strdup("");
+            else if ((tmp = strrchr(descr, '\n')) && tmp[1])
                 new_device->device_description = av_strdup(&tmp[1]);
             else
                 new_device->device_description = av_strdup(descr);

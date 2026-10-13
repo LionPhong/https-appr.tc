@@ -28,8 +28,6 @@
 /* Based upon some commented-out C code from mpeg2dec (idct_mmx.c
  * written by Aaron Holtzman <aholtzma@ess.engr.uvic.ca>). */
 
-#include "simple_idct.h"
-
 #include "bit_depth_template.c"
 
 #undef W1
@@ -62,9 +60,9 @@
 #define MUL(a, b)    MUL16(a, b)
 #define MAC(a, b, c) MAC16(a, b, c)
 
-#elif BIT_DEPTH == 10 || BIT_DEPTH == 12
+#elif BIT_DEPTH == 10 || BIT_DEPTH == 12 || BIT_DEPTH == 16
 
-# if BIT_DEPTH == 10
+# if BIT_DEPTH == 10 || BIT_DEPTH == 16
 #define W1 22725 // 90901
 #define W2 21407 //  85627
 #define W3 19265 //  77062
@@ -73,7 +71,17 @@
 #define W6  8867 //  35468
 #define W7  4520 //  18081
 
-#   ifdef EXTRA_SHIFT
+#   if BIT_DEPTH == 16
+/* 16-bit output from 16-bit coefficients. The rows keep two more
+ * fractional bits than 16-bit intermediates could hold, and the columns
+ * are shifted by as little as the 32-bit sums of a 16-bit result allow */
+#    if IN_IDCT_DEPTH != 32
+#error "The 16-bit iDCT needs 32-bit intermediates"
+#    endif
+#define ROW_SHIFT 13
+#define COL_SHIFT 15
+#define DC_SHIFT  1
+#   elif defined(EXTRA_SHIFT)
 #define ROW_SHIFT 13
 #define COL_SHIFT 18
 #define DC_SHIFT  1
@@ -261,6 +269,25 @@ static inline void FUNC6(idctRowCondDC)(idctin *row, int extra_shift)
 #ifdef EXTRA_SHIFT
 static inline void FUNC(idctSparseCol_extrashift)(int16_t *col)
 #else
+static inline void FUNC6(idctSparseCol)(idctin *col)
+#endif
+{
+    unsigned a0, a1, a2, a3, b0, b1, b2, b3;
+
+    IDCT_COLS;
+
+    col[0 ] = ((int)(a0 + b0) >> COL_SHIFT);
+    col[8 ] = ((int)(a1 + b1) >> COL_SHIFT);
+    col[16] = ((int)(a2 + b2) >> COL_SHIFT);
+    col[24] = ((int)(a3 + b3) >> COL_SHIFT);
+    col[32] = ((int)(a3 - b3) >> COL_SHIFT);
+    col[40] = ((int)(a2 - b2) >> COL_SHIFT);
+    col[48] = ((int)(a1 - b1) >> COL_SHIFT);
+    col[56] = ((int)(a0 - b0) >> COL_SHIFT);
+}
+
+#ifndef PRORES_ONLY
+#ifndef EXTRA_SHIFT
 static inline void FUNC6(idctSparseColPut)(pixel *dest, ptrdiff_t line_size,
                                           idctin *col)
 {
@@ -309,24 +336,6 @@ static inline void FUNC6(idctSparseColAdd)(pixel *dest, ptrdiff_t line_size,
     dest[0] = av_clip_pixel(dest[0] + ((int)(a0 - b0) >> COL_SHIFT));
 }
 
-static inline void FUNC6(idctSparseCol)(idctin *col)
-#endif
-{
-    unsigned a0, a1, a2, a3, b0, b1, b2, b3;
-
-    IDCT_COLS;
-
-    col[0 ] = ((int)(a0 + b0) >> COL_SHIFT);
-    col[8 ] = ((int)(a1 + b1) >> COL_SHIFT);
-    col[16] = ((int)(a2 + b2) >> COL_SHIFT);
-    col[24] = ((int)(a3 + b3) >> COL_SHIFT);
-    col[32] = ((int)(a3 - b3) >> COL_SHIFT);
-    col[40] = ((int)(a2 - b2) >> COL_SHIFT);
-    col[48] = ((int)(a1 - b1) >> COL_SHIFT);
-    col[56] = ((int)(a0 - b0) >> COL_SHIFT);
-}
-
-#ifndef EXTRA_SHIFT
 void FUNC6(ff_simple_idct_put)(uint8_t *dest_, ptrdiff_t line_size, int16_t *block_)
 {
     idctin *block = (idctin *)block_;
@@ -369,3 +378,4 @@ void FUNC6(ff_simple_idct)(int16_t *block)
 }
 #endif
 #endif
+#endif /* PRORES_ONLY */

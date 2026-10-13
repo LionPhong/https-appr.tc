@@ -19,7 +19,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/crc.h"
+#include "libavutil/mem.h"
 
 #define BITSTREAM_READER_LE
 #include "libavcodec/tak.h"
@@ -27,12 +29,12 @@
 #include "apetag.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "rawdec.h"
 
 typedef struct TAKDemuxContext {
-    AVClass *class;
-    int     raw_packet_size;
+    FFRawDemuxerContext rawctx;
     int     mlast_frame;
     int64_t data_end;
 } TAKDemuxContext;
@@ -65,7 +67,7 @@ static int tak_read_header(AVFormatContext *s)
 
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id   = AV_CODEC_ID_TAK;
-    st->need_parsing         = AVSTREAM_PARSE_FULL_RAW;
+    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL_RAW;
 
     tc->mlast_frame = 0;
     if (avio_rl32(pb) != MKTAG('t', 'B', 'a', 'K')) {
@@ -84,6 +86,7 @@ static int tak_read_header(AVFormatContext *s)
         case TAK_METADATA_STREAMINFO:
             if (st->codecpar->extradata)
                 return AVERROR_INVALIDDATA;
+            av_fallthrough;
         case TAK_METADATA_LAST_FRAME:
         case TAK_METADATA_ENCODER:
             if (size <= 3)
@@ -95,9 +98,10 @@ static int tak_read_header(AVFormatContext *s)
             memset(buffer + size - 3, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
             ffio_init_checksum(pb, tak_check_crc, 0xCE04B7U);
-            if (avio_read(pb, buffer, size - 3) != size - 3) {
+            ret = ffio_read_size(pb, buffer, size - 3);
+            if (ret < 0) {
                 av_freep(&buffer);
-                return AVERROR(EIO);
+                return ret;
             }
             if (ffio_get_checksum(s->pb) != avio_rb24(pb)) {
                 av_log(s, AV_LOG_ERROR, "%d metadata block CRC error.\n", type);
@@ -110,22 +114,22 @@ static int tak_read_header(AVFormatContext *s)
             break;
         case TAK_METADATA_MD5: {
             uint8_t md5[16];
-            int i;
+            char md5_hex[2 * sizeof(md5) + 1];
 
             if (size != 19)
                 return AVERROR_INVALIDDATA;
             ffio_init_checksum(pb, tak_check_crc, 0xCE04B7U);
-            avio_read(pb, md5, 16);
+            ret = ffio_read_size(pb, md5, 16);
+            if (ret < 0)
+                return ret;
             if (ffio_get_checksum(s->pb) != avio_rb24(pb)) {
                 av_log(s, AV_LOG_ERROR, "MD5 metadata block CRC error.\n");
                 if (s->error_recognition & AV_EF_EXPLODE)
                     return AVERROR_INVALIDDATA;
             }
 
-            av_log(s, AV_LOG_VERBOSE, "MD5=");
-            for (i = 0; i < 16; i++)
-                av_log(s, AV_LOG_VERBOSE, "%02x", md5[i]);
-            av_log(s, AV_LOG_VERBOSE, "\n");
+            ff_data_to_hex(md5_hex, md5, sizeof(md5), 1);
+            av_log(s, AV_LOG_VERBOSE, "MD5=%s\n", md5_hex);
             break;
         }
         case TAK_METADATA_END: {
@@ -139,10 +143,11 @@ static int tak_read_header(AVFormatContext *s)
             tc->data_end += curpos;
             return 0;
         }
-        default:
-            ret = avio_skip(pb, size);
-            if (ret < 0)
-                return ret;
+        default: {
+            int64_t ret64 = avio_skip(pb, size);
+            if (ret64 < 0)
+                return ret64;
+        }
         }
 
         if (type == TAK_METADATA_STREAMINFO) {
@@ -155,9 +160,13 @@ static int tak_read_header(AVFormatContext *s)
                 st->duration = ti.samples;
             st->codecpar->bits_per_coded_sample = ti.bps;
             if (ti.ch_layout)
-                st->codecpar->channel_layout = ti.ch_layout;
+                av_channel_layout_from_mask(&st->codecpar->ch_layout, ti.ch_layout);
+            else {
+                av_channel_layout_uninit(&st->codecpar->ch_layout);
+                st->codecpar->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
+                st->codecpar->ch_layout.nb_channels = ti.channels;
+            }
             st->codecpar->sample_rate           = ti.sample_rate;
-            st->codecpar->channels              = ti.channels;
             st->start_time                   = 0;
             avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
             st->codecpar->extradata             = buffer;
@@ -174,9 +183,8 @@ static int tak_read_header(AVFormatContext *s)
                               get_bits(&gb, TAK_LAST_FRAME_SIZE_BITS);
             av_freep(&buffer);
         } else if (type == TAK_METADATA_ENCODER) {
-            init_get_bits8(&gb, buffer, size - 3);
             av_log(s, AV_LOG_VERBOSE, "encoder version: %0X\n",
-                   get_bits_long(&gb, TAK_ENCODER_VERSION_BITS));
+                   AV_RL24(buffer));
             av_freep(&buffer);
         }
     }
@@ -213,16 +221,15 @@ static int raw_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-FF_RAW_DEMUXER_CLASS(tak)
-AVInputFormat ff_tak_demuxer = {
-    .name           = "tak",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw TAK"),
+const FFInputFormat ff_tak_demuxer = {
+    .p.name         = "tak",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw TAK"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.extensions   = "tak",
+    .p.priv_class   = &ff_raw_demuxer_class,
     .priv_data_size = sizeof(TAKDemuxContext),
     .read_probe     = tak_probe,
     .read_header    = tak_read_header,
     .read_packet    = raw_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .extensions     = "tak",
     .raw_codec_id   = AV_CODEC_ID_TAK,
-    .priv_class     = &tak_demuxer_class,
 };

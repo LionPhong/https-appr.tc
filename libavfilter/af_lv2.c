@@ -27,14 +27,16 @@
 #include <lilv/lilv.h>
 #include <lv2/lv2plug.in/ns/ext/atom/atom.h>
 #include <lv2/lv2plug.in/ns/ext/buf-size/buf-size.h>
+#include <lv2/lv2plug.in/ns/ext/options/options.h>
 
-#include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
 
 typedef struct URITable {
     char    **uris;
@@ -64,15 +66,19 @@ typedef struct LV2Context {
     LV2_Feature        map_feature;
     LV2_URID_Unmap     unmap;
     LV2_Feature        unmap_feature;
+    int32_t            max_block_length;
+    LV2_Options_Option host_options[2];
+    LV2_Feature        options_feature;
     LV2_Atom_Sequence  seq_in[2];
     LV2_Atom_Sequence *seq_out;
-    const LV2_Feature *features[5];
+    const LV2_Feature *features[7];
 
     float *mins;
     float *maxes;
     float *controls;
 
     LilvInstance *instance;
+    int           instance_activated;
 
     LilvNode  *atom_AtomPort;
     LilvNode  *atom_Sequence;
@@ -165,8 +171,9 @@ static const char *uri_table_unmap(LV2_URID_Map_Handle handle, LV2_URID urid)
     return NULL;
 }
 
-static void connect_ports(LV2Context *s, AVFrame *in, AVFrame *out)
+static void connect_ports(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
 {
+    LV2Context *s = ctx->priv;
     int ich = 0, och = 0, i;
 
     for (i = 0; i < s->nb_ports; i++) {
@@ -179,7 +186,7 @@ static void connect_ports(LV2Context *s, AVFrame *in, AVFrame *out)
             } else if (lilv_port_is_a(s->plugin, port, s->lv2_OutputPort)) {
                 lilv_instance_connect_port(s->instance, i, out->extended_data[och++]);
             } else {
-                av_log(s, AV_LOG_WARNING, "port %d neither input nor output, skipping\n", i);
+                av_log(ctx, AV_LOG_WARNING, "port %d neither input nor output, skipping\n", i);
             }
         } else if (lilv_port_is_a(s->plugin, port, s->atom_AtomPort)) {
             if (lilv_port_is_a(s->plugin, port, s->lv2_InputPort)) {
@@ -216,7 +223,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         av_frame_copy_props(out, in);
     }
 
-    connect_ports(s, in, out);
+    connect_ports(ctx, in, out);
 
     lilv_instance_run(s->instance, in->nb_samples);
 
@@ -244,7 +251,7 @@ static int request_frame(AVFilterLink *outlink)
     if (!out)
         return AVERROR(ENOMEM);
 
-    connect_ports(s, out, out);
+    connect_ports(ctx, out, out);
 
     lilv_instance_run(s->instance, out->nb_samples);
 
@@ -282,6 +289,8 @@ static int config_output(AVFilterLink *outlink)
     s->features[2] = &buf_size_features[0];
     s->features[3] = &buf_size_features[1];
     s->features[4] = &buf_size_features[2];
+    s->features[5] = &s->options_feature;
+    s->features[6] = NULL;
 
     if (ctx->nb_inputs) {
         AVFilterLink *inlink = ctx->inputs[0];
@@ -289,18 +298,44 @@ static int config_output(AVFilterLink *outlink)
         outlink->format      = inlink->format;
         outlink->sample_rate = sample_rate = inlink->sample_rate;
         if (s->nb_inputs == s->nb_outputs) {
-            outlink->channel_layout = inlink->channel_layout;
-            outlink->channels = inlink->channels;
+            int ret;
+            if ((ret = av_channel_layout_copy(&outlink->ch_layout, &inlink->ch_layout)) < 0)
+                return ret;
         }
 
+        if (lilv_plugin_has_feature(s->plugin, s->powerOf2BlockLength) ||
+            lilv_plugin_has_feature(s->plugin, s->fixedBlockLength) ||
+            lilv_plugin_has_feature(s->plugin, s->boundedBlockLength)) {
+            FilterLink *inl = ff_filter_link(inlink);
+
+            inl->min_samples = inl->max_samples = 4096;
+            s->max_block_length = inl->max_samples;
+        }
     } else {
         outlink->sample_rate = sample_rate = s->sample_rate;
         outlink->time_base   = (AVRational){1, s->sample_rate};
+        s->max_block_length = s->nb_samples;
     }
+
+    int nb_options = 0;
+    if (s->max_block_length) {
+        s->host_options[nb_options++] = (LV2_Options_Option) {
+            LV2_OPTIONS_INSTANCE, 0,
+            uri_table_map(&s->uri_table, LV2_BUF_SIZE__maxBlockLength),
+            sizeof(s->max_block_length),
+            uri_table_map(&s->uri_table, LV2_ATOM__Int),
+            &s->max_block_length
+        };
+    }
+    s->host_options[nb_options] = (LV2_Options_Option) {
+        LV2_OPTIONS_INSTANCE, 0, 0, 0, 0, NULL
+    };
+    s->options_feature.URI  = LV2_OPTIONS__options;
+    s->options_feature.data = s->host_options;
 
     s->instance = lilv_plugin_instantiate(s->plugin, sample_rate, s->features);
     if (!s->instance) {
-        av_log(s, AV_LOG_ERROR, "Failed to instantiate <%s>\n", lilv_node_as_uri(lilv_plugin_get_uri(s->plugin)));
+        av_log(ctx, AV_LOG_ERROR, "Failed to instantiate <%s>\n", lilv_node_as_uri(lilv_plugin_get_uri(s->plugin)));
         return AVERROR(EINVAL);
     }
 
@@ -368,21 +403,15 @@ static int config_output(AVFilterLink *outlink)
         port = lilv_plugin_get_port_by_symbol(s->plugin, sym);
         lilv_node_free(sym);
         if (!port) {
-            av_log(s, AV_LOG_WARNING, "Unknown option: <%s>\n", str);
+            av_log(ctx, AV_LOG_WARNING, "Unknown option: <%s>\n", str);
         } else {
             index = lilv_port_get_index(s->plugin, port);
             s->controls[index] = val;
         }
     }
 
-    if (s->nb_inputs &&
-        (lilv_plugin_has_feature(s->plugin, s->powerOf2BlockLength) ||
-         lilv_plugin_has_feature(s->plugin, s->fixedBlockLength) ||
-         lilv_plugin_has_feature(s->plugin, s->boundedBlockLength))) {
-        AVFilterLink *inlink = ctx->inputs[0];
-
-        inlink->partial_buf_size = inlink->min_samples = inlink->max_samples = 4096;
-    }
+    lilv_instance_activate(s->instance);
+    s->instance_activated = 1;
 
     return 0;
 }
@@ -394,7 +423,7 @@ static av_cold int init(AVFilterContext *ctx)
     const LilvPlugin *plugin;
     AVFilterPad pad = { NULL };
     LilvNode *uri;
-    int i;
+    int i, ret;
 
     s->world = lilv_world_new();
     if (!s->world)
@@ -402,7 +431,7 @@ static av_cold int init(AVFilterContext *ctx)
 
     uri = lilv_new_uri(s->world, s->plugin_uri);
     if (!uri) {
-        av_log(s, AV_LOG_ERROR, "Invalid plugin URI <%s>\n", s->plugin_uri);
+        av_log(ctx, AV_LOG_ERROR, "Invalid plugin URI <%s>\n", s->plugin_uri);
         return AVERROR(EINVAL);
     }
 
@@ -412,7 +441,7 @@ static av_cold int init(AVFilterContext *ctx)
     lilv_node_free(uri);
 
     if (!plugin) {
-        av_log(s, AV_LOG_ERROR, "Plugin <%s> not found\n", s->plugin_uri);
+        av_log(ctx, AV_LOG_ERROR, "Plugin <%s> not found\n", s->plugin_uri);
         return AVERROR(EINVAL);
     }
 
@@ -465,89 +494,93 @@ static av_cold int init(AVFilterContext *ctx)
             return AVERROR(ENOMEM);
 
         pad.filter_frame = filter_frame;
-        if (ff_insert_inpad(ctx, ctx->nb_inputs, &pad) < 0) {
-            av_freep(&pad.name);
-            return AVERROR(ENOMEM);
-        }
+        if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
+            return ret;
     }
 
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    LV2Context *s = ctx->priv;
-    AVFilterFormats *formats;
+    const LV2Context *s = ctx->priv;
     AVFilterChannelLayouts *layouts;
-    AVFilterLink *outlink = ctx->outputs[0];
     static const enum AVSampleFormat sample_fmts[] = {
         AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE };
-    int ret;
-
-    formats = ff_make_format_list(sample_fmts);
-    if (!formats)
-        return AVERROR(ENOMEM);
-    ret = ff_set_common_formats(ctx, formats);
+    int ret = ff_set_sample_formats_from_list2(ctx, cfg_in, cfg_out, sample_fmts);
     if (ret < 0)
         return ret;
 
-    if (s->nb_inputs) {
-        formats = ff_all_samplerates();
-        if (!formats)
-            return AVERROR(ENOMEM);
-
-        ret = ff_set_common_samplerates(ctx, formats);
-        if (ret < 0)
-            return ret;
-    } else {
+    if (!s->nb_inputs) {
         int sample_rates[] = { s->sample_rate, -1 };
 
-        ret = ff_set_common_samplerates(ctx, ff_make_format_list(sample_rates));
+        ret = ff_set_common_samplerates_from_list2(ctx, cfg_in, cfg_out, sample_rates);
         if (ret < 0)
             return ret;
     }
 
     if (s->nb_inputs == 2 && s->nb_outputs == 2) {
         layouts = NULL;
-        ret = ff_add_channel_layout(&layouts, AV_CH_LAYOUT_STEREO);
+        ret = ff_add_channel_layout(&layouts, &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO);
         if (ret < 0)
             return ret;
-        ret = ff_set_common_channel_layouts(ctx, layouts);
+        ret = ff_set_common_channel_layouts2(ctx, cfg_in, cfg_out, layouts);
         if (ret < 0)
             return ret;
     } else {
         if (s->nb_inputs >= 1) {
-            AVFilterLink *inlink = ctx->inputs[0];
-            uint64_t inlayout = FF_COUNT2LAYOUT(s->nb_inputs);
+            AVChannelLayout inlayout = FF_COUNT2LAYOUT(s->nb_inputs);
 
             layouts = NULL;
-            ret = ff_add_channel_layout(&layouts, inlayout);
+            ret = ff_add_channel_layout(&layouts, &inlayout);
             if (ret < 0)
                 return ret;
-            ret = ff_channel_layouts_ref(layouts, &inlink->out_channel_layouts);
+            ret = ff_channel_layouts_ref(layouts, &cfg_in[0]->channel_layouts);
             if (ret < 0)
                 return ret;
 
             if (!s->nb_outputs) {
-                ret = ff_channel_layouts_ref(layouts, &outlink->in_channel_layouts);
+                ret = ff_channel_layouts_ref(layouts, &cfg_out[0]->channel_layouts);
                 if (ret < 0)
                     return ret;
             }
         }
 
         if (s->nb_outputs >= 1) {
-            uint64_t outlayout = FF_COUNT2LAYOUT(s->nb_outputs);
+            AVChannelLayout outlayout = FF_COUNT2LAYOUT(s->nb_outputs);
 
             layouts = NULL;
-            ret = ff_add_channel_layout(&layouts, outlayout);
+            ret = ff_add_channel_layout(&layouts, &outlayout);
             if (ret < 0)
                 return ret;
-            ret = ff_channel_layouts_ref(layouts, &outlink->in_channel_layouts);
+            ret = ff_channel_layouts_ref(layouts, &cfg_out[0]->channel_layouts);
             if (ret < 0)
                 return ret;
         }
     }
 
+    return 0;
+}
+
+static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
+                           char *res, int res_len, int flags)
+{
+    LV2Context *s = ctx->priv;
+    const LilvPort *port;
+    LilvNode *sym;
+    int index;
+
+    sym  = lilv_new_string(s->world, cmd);
+    port = lilv_plugin_get_port_by_symbol(s->plugin, sym);
+    lilv_node_free(sym);
+    if (!port) {
+        av_log(ctx, AV_LOG_WARNING, "Unknown option: <%s>\n", cmd);
+    } else {
+        index = lilv_port_get_index(s->plugin, port);
+        s->controls[index] = atof(args);
+    }
     return 0;
 }
 
@@ -555,6 +588,8 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     LV2Context *s = ctx->priv;
 
+    if (s->instance_activated)
+        lilv_instance_deactivate(s->instance);
     lilv_node_free(s->powerOf2BlockLength);
     lilv_node_free(s->fixedBlockLength);
     lilv_node_free(s->boundedBlockLength);
@@ -573,9 +608,6 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->maxes);
     av_freep(&s->controls);
     av_freep(&s->seq_out);
-
-    if (ctx->nb_inputs)
-        av_freep(&ctx->input_pads[0].name);
 }
 
 static const AVFilterPad lv2_outputs[] = {
@@ -585,18 +617,17 @@ static const AVFilterPad lv2_outputs[] = {
         .config_props  = config_output,
         .request_frame = request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_af_lv2 = {
-    .name          = "lv2",
-    .description   = NULL_IF_CONFIG_SMALL("Apply LV2 effect."),
+const FFFilter ff_af_lv2 = {
+    .p.name        = "lv2",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply LV2 effect."),
+    .p.priv_class  = &lv2_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size     = sizeof(LV2Context),
-    .priv_class    = &lv2_class,
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = 0,
-    .outputs       = lv2_outputs,
-    .flags         = AVFILTER_FLAG_DYNAMIC_INPUTS,
+    .process_command = process_command,
+    FILTER_OUTPUTS(lv2_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
 };

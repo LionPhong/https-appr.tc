@@ -23,16 +23,16 @@
  * video crop filter
  */
 
+#include <math.h>
 #include <stdio.h>
 
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 #include "libavutil/eval.h"
 #include "libavutil/avstring.h"
 #include "libavutil/internal.h"
-#include "libavutil/libm.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
@@ -50,7 +50,6 @@ static const char *const var_names[] = {
     "x",
     "y",
     "n",            ///< number of frame
-    "pos",          ///< position in the file
     "t",            ///< timestamp expressed in seconds
     NULL
 };
@@ -68,7 +67,6 @@ enum var_name {
     VAR_X,
     VAR_Y,
     VAR_N,
-    VAR_POS,
     VAR_T,
     VAR_VARS_NB
 };
@@ -79,6 +77,7 @@ typedef struct CropContext {
     int  y;             ///< y offset of the non-cropped area with respect to the input area
     int  w;             ///< width of the cropped area
     int  h;             ///< height of the cropped area
+    int in_w, in_h;     ///< input size the cropped area was computed for
 
     AVRational out_sar; ///< output sample aspect ratio
     int keep_aspect;    ///< keep display aspect ratio when cropping
@@ -91,15 +90,14 @@ typedef struct CropContext {
     double var_values[VAR_VARS_NB];
 } CropContext;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    AVFilterFormats *formats = NULL;
-    int ret;
+    int reject_flags = AV_PIX_FMT_FLAG_BITSTREAM | FF_PIX_FMT_FLAG_SW_FLAT_SUB;
 
-    ret = ff_formats_pixdesc_filter(&formats, 0, AV_PIX_FMT_FLAG_BITSTREAM | FF_PIX_FMT_FLAG_SW_FLAT_SUB);
-    if (ret < 0)
-        return ret;
-    return ff_set_common_formats(ctx, formats);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_formats_pixdesc_filter(0, reject_flags));
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -127,7 +125,7 @@ static inline int normalize_double(int *n, double d)
     return ret;
 }
 
-static int config_input(AVFilterLink *link)
+static int config_crop_area(AVFilterLink *link)
 {
     AVFilterContext *ctx = link->dst;
     CropContext *s = ctx->priv;
@@ -143,13 +141,10 @@ static int config_input(AVFilterLink *link)
     s->var_values[VAR_DAR]   = s->var_values[VAR_A] * s->var_values[VAR_SAR];
     s->var_values[VAR_HSUB]  = 1<<pix_desc->log2_chroma_w;
     s->var_values[VAR_VSUB]  = 1<<pix_desc->log2_chroma_h;
-    s->var_values[VAR_X]     = NAN;
-    s->var_values[VAR_Y]     = NAN;
     s->var_values[VAR_OUT_W] = s->var_values[VAR_OW] = NAN;
     s->var_values[VAR_OUT_H] = s->var_values[VAR_OH] = NAN;
     s->var_values[VAR_N]     = 0;
     s->var_values[VAR_T]     = NAN;
-    s->var_values[VAR_POS]   = NAN;
 
     av_image_fill_max_pixsteps(s->max_step, NULL, pix_desc);
 
@@ -191,20 +186,11 @@ static int config_input(AVFilterLink *link)
         s->h &= ~((1 << s->vsub) - 1);
     }
 
-    av_expr_free(s->x_pexpr);
-    av_expr_free(s->y_pexpr);
-    s->x_pexpr = s->y_pexpr = NULL;
-    if ((ret = av_expr_parse(&s->x_pexpr, s->x_expr, var_names,
-                             NULL, NULL, NULL, NULL, 0, ctx)) < 0 ||
-        (ret = av_expr_parse(&s->y_pexpr, s->y_expr, var_names,
-                             NULL, NULL, NULL, NULL, 0, ctx)) < 0)
-        return AVERROR(EINVAL);
-
     if (s->keep_aspect) {
         AVRational dar = av_mul_q(link->sample_aspect_ratio,
                                   (AVRational){ link->w, link->h });
         av_reduce(&s->out_sar.num, &s->out_sar.den,
-                  dar.num * s->h, dar.den * s->w, INT_MAX);
+                  (int64_t)dar.num * s->h, (int64_t)dar.den * s->w, INT_MAX);
     } else
         s->out_sar = link->sample_aspect_ratio;
 
@@ -227,11 +213,31 @@ static int config_input(AVFilterLink *link)
         s->x &= ~((1 << s->hsub) - 1);
         s->y &= ~((1 << s->vsub) - 1);
     }
+    s->in_w = link->w;
+    s->in_h = link->h;
     return 0;
 
 fail_expr:
     av_log(ctx, AV_LOG_ERROR, "Error when evaluating the expression '%s'\n", expr);
     return ret;
+}
+
+static int config_input(AVFilterLink *link)
+{
+    CropContext *s = link->dst->priv;
+
+    s->var_values[VAR_X] = NAN;
+    s->var_values[VAR_Y] = NAN;
+    av_expr_free(s->x_pexpr);
+    av_expr_free(s->y_pexpr);
+    s->x_pexpr = s->y_pexpr = NULL;
+    if (av_expr_parse(&s->x_pexpr, s->x_expr, var_names,
+                      NULL, NULL, NULL, NULL, 0, link->dst) < 0 ||
+        av_expr_parse(&s->y_pexpr, s->y_expr, var_names,
+                      NULL, NULL, NULL, NULL, 0, link->dst) < 0)
+        return AVERROR(EINVAL);
+
+    return config_crop_area(link);
 }
 
 static int config_output(AVFilterLink *link)
@@ -253,16 +259,26 @@ static int config_output(AVFilterLink *link)
 
 static int filter_frame(AVFilterLink *link, AVFrame *frame)
 {
+    FilterLink        *l = ff_filter_link(link);
     AVFilterContext *ctx = link->dst;
     CropContext *s = ctx->priv;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(link->format);
-    int i;
+    int i, ret;
 
-    s->var_values[VAR_N] = link->frame_count_out;
+    if (frame->width != s->in_w || frame->height != s->in_h) {
+        link->w = frame->width;
+        link->h = frame->height;
+        if ((ret = config_crop_area(link)) < 0 ||
+            (ret = config_output(ctx->outputs[0])) < 0) {
+            s->in_w = -1;
+            av_frame_free(&frame);
+            return ret;
+        }
+    }
+
+    s->var_values[VAR_N] = l->frame_count_out;
     s->var_values[VAR_T] = frame->pts == AV_NOPTS_VALUE ?
         NAN : frame->pts * av_q2d(link->time_base);
-    s->var_values[VAR_POS] = frame->pkt_pos == -1 ?
-        NAN : frame->pkt_pos;
     s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, NULL);
     s->var_values[VAR_Y] = av_expr_eval(s->y_pexpr, s->var_values, NULL);
     /* It is necessary if x is expressed from y  */
@@ -284,8 +300,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *frame)
         s->y &= ~((1 << s->vsub) - 1);
     }
 
-    av_log(ctx, AV_LOG_TRACE, "n:%d t:%f pos:%f x:%d y:%d x+w:%d y+h:%d\n",
-            (int)s->var_values[VAR_N], s->var_values[VAR_T], s->var_values[VAR_POS],
+    av_log(ctx, AV_LOG_TRACE, "n:%d t:%f x:%d y:%d x+w:%d y+h:%d\n",
+            (int)s->var_values[VAR_N], s->var_values[VAR_T],
             s->x, s->y, s->x+s->w, s->y+s->h);
 
     if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
@@ -300,7 +316,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *frame)
         frame->data[0] += s->y * frame->linesize[0];
         frame->data[0] += s->x * s->max_step[0];
 
-        if (!(desc->flags & AV_PIX_FMT_FLAG_PAL || desc->flags & FF_PSEUDOPAL)) {
+        if (!(desc->flags & AV_PIX_FMT_FLAG_PAL)) {
             for (i = 1; i < 3; i ++) {
                 if (frame->data[i]) {
                     frame->data[i] += (s->y >> s->vsub) * frame->linesize[i];
@@ -380,7 +396,6 @@ static const AVFilterPad avfilter_vf_crop_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
 static const AVFilterPad avfilter_vf_crop_outputs[] = {
@@ -389,17 +404,17 @@ static const AVFilterPad avfilter_vf_crop_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_crop = {
-    .name            = "crop",
-    .description     = NULL_IF_CONFIG_SMALL("Crop the input video."),
+const FFFilter ff_vf_crop = {
+    .p.name          = "crop",
+    .p.description   = NULL_IF_CONFIG_SMALL("Crop the input video."),
+    .p.priv_class    = &crop_class,
     .priv_size       = sizeof(CropContext),
-    .priv_class      = &crop_class,
-    .query_formats   = query_formats,
     .uninit          = uninit,
-    .inputs          = avfilter_vf_crop_inputs,
-    .outputs         = avfilter_vf_crop_outputs,
+    FILTER_INPUTS(avfilter_vf_crop_inputs),
+    FILTER_OUTPUTS(avfilter_vf_crop_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_SIZE,
 };

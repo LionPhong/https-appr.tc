@@ -24,6 +24,7 @@
 #include "libavutil/common.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem_internal.h"
 
 #define W 64
 #define H 64
@@ -52,8 +53,8 @@ static const unsigned bpp_mask[] = { 0xffffffff, 0x03ff03ff, 0x0fff0fff };
 
 static void check_yuv2yuv(void)
 {
-    declare_func(void, uint8_t *dst[3], ptrdiff_t dst_stride[3],
-                 uint8_t *src[3], ptrdiff_t src_stride[3],
+    declare_func(void, uint8_t *dst[3], const ptrdiff_t dst_stride[3],
+                 uint8_t *src[3], const ptrdiff_t src_stride[3],
                  int w, int h, const int16_t coeff[3][3][8],
                  const int16_t off[2][8]);
     ColorSpaceDSPContext dsp;
@@ -121,7 +122,7 @@ static void check_yuv2yuv(void)
 static void check_yuv2rgb(void)
 {
     declare_func(void, int16_t *dst[3], ptrdiff_t dst_stride,
-                 uint8_t *src[3], ptrdiff_t src_stride[3],
+                 uint8_t *src[3], const ptrdiff_t src_stride[3],
                  int w, int h, const int16_t coeff[3][3][8],
                  const int16_t off[8]);
     ColorSpaceDSPContext dsp;
@@ -197,7 +198,7 @@ static void check_yuv2rgb(void)
 
 static void check_rgb2yuv(void)
 {
-    declare_func(void, uint8_t *dst[3], ptrdiff_t dst_stride[3],
+    declare_func(void, uint8_t *dst[3], const ptrdiff_t dst_stride[3],
                  int16_t *src[3], ptrdiff_t src_stride,
                  int w, int h, const int16_t coeff[3][3][8],
                  const int16_t off[8]);

@@ -25,7 +25,6 @@
 #include "config.h"
 
 #include "libavutil/common.h"
-#include "libavutil/x86/asm.h"
 
 #if HAVE_INLINE_ASM
 
@@ -35,12 +34,20 @@
 static av_always_inline av_const int MULL(int a, int b, unsigned shift)
 {
     int rt, dummy;
+    if (__builtin_constant_p(shift))
     __asm__ (
         "imull %3               \n\t"
         "shrdl %4, %%edx, %%eax \n\t"
         :"=a"(rt), "=d"(dummy)
-        :"a"(a), "rm"(b), "ci"((uint8_t)shift)
+        :"a"(a), "rm"(b), "i"(shift & 0x1F)
     );
+    else
+        __asm__ (
+            "imull %3               \n\t"
+            "shrdl %4, %%edx, %%eax \n\t"
+            :"=a"(rt), "=d"(dummy)
+            :"a"(a), "rm"(b), "c"((uint8_t)shift)
+        );
     return rt;
 }
 
@@ -90,7 +97,7 @@ static inline av_const int mid_pred(int a, int b, int c)
     return i;
 }
 
-#if HAVE_6REGS
+#if HAVE_X86_6REGS
 #define COPY3_IF_LT(x, y, a, b, c, d)\
 __asm__ volatile(\
     "cmpl  %0, %3       \n\t"\
@@ -100,7 +107,7 @@ __asm__ volatile(\
     : "+&r" (x), "+&r" (a), "+r" (c)\
     : "r" (y), "r" (b), "r" (d)\
 );
-#endif /* HAVE_6REGS */
+#endif /* HAVE_X86_6REGS */
 
 #endif /* HAVE_I686 */
 
@@ -113,19 +120,31 @@ __asm__ volatile(\
 // avoid +32 for shift optimization (gcc should do that ...)
 #define NEG_SSR32 NEG_SSR32
 static inline  int32_t NEG_SSR32( int32_t a, int8_t s){
+    if (__builtin_constant_p(s))
     __asm__ ("sarl %1, %0\n\t"
          : "+r" (a)
-         : "ic" ((uint8_t)(-s))
+         : "i" (-s & 0x1F)
     );
+    else
+        __asm__ ("sarl %1, %0\n\t"
+               : "+r" (a)
+               : "c" ((uint8_t)(-s))
+        );
     return a;
 }
 
 #define NEG_USR32 NEG_USR32
 static inline uint32_t NEG_USR32(uint32_t a, int8_t s){
+    if (__builtin_constant_p(s))
     __asm__ ("shrl %1, %0\n\t"
          : "+r" (a)
-         : "ic" ((uint8_t)(-s))
+         : "i" (-s & 0x1F)
     );
+    else
+        __asm__ ("shrl %1, %0\n\t"
+               : "+r" (a)
+               : "c" ((uint8_t)(-s))
+        );
     return a;
 }
 

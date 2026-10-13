@@ -19,15 +19,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavcodec/flac.h"
+#include "packet_internal.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "flacenc.h"
 #include "id3v2.h"
 #include "internal.h"
+#include "mux.h"
+#include "version.h"
 #include "vorbiscomment.h"
 
 
@@ -38,7 +42,7 @@ typedef struct FlacMuxerContext {
     int audio_stream_idx;
     int waiting_pics;
     /* audio packets are queued here until we get all the attached pictures */
-    AVPacketList *queue, *queue_end;
+    PacketList queue;
 
     /* updated streaminfo sent by the encoder at the end */
     uint8_t streaminfo[FLAC_STREAMINFO_SIZE];
@@ -60,11 +64,13 @@ static int flac_write_block_comment(AVIOContext *pb, AVDictionary **m,
                                     int last_block, int bitexact)
 {
     const char *vendor = bitexact ? "ffmpeg" : LIBAVFORMAT_IDENT;
-    int64_t len;
+    int len;
 
     ff_metadata_conv(m, ff_vorbiscomment_metadata_conv, NULL);
 
     len = ff_vorbiscomment_length(*m, vendor, NULL, 0);
+    if (len < 0)
+        return len;
     if (len >= ((1<<24) - 4))
         return AVERROR(EINVAL);
 
@@ -236,9 +242,9 @@ static int flac_init(struct AVFormatContext *s)
     }
 
     /* add the channel layout tag */
-    if (par->channel_layout &&
-        !(par->channel_layout & ~0x3ffffULL) &&
-        !ff_flac_is_native_layout(par->channel_layout)) {
+    if (par->ch_layout.order == AV_CHANNEL_ORDER_NATIVE &&
+        !(par->ch_layout.u.mask & ~0x3ffffULL) &&
+        !ff_flac_is_native_layout(par->ch_layout.u.mask)) {
         AVDictionaryEntry *chmask = av_dict_get(s->metadata, "WAVEFORMATEXTENSIBLE_CHANNEL_MASK",
                                                 NULL, 0);
 
@@ -247,7 +253,7 @@ static int flac_init(struct AVFormatContext *s)
                    "already present, this muxer will not overwrite it.\n");
         } else {
             uint8_t buf[32];
-            snprintf(buf, sizeof(buf), "0x%"PRIx64, par->channel_layout);
+            snprintf(buf, sizeof(buf), "0x%"PRIx64, par->ch_layout.u.mask);
             av_dict_set(&s->metadata, "WAVEFORMATEXTENSIBLE_CHANNEL_MASK", buf, 0);
         }
     }
@@ -279,7 +285,7 @@ static int flac_write_audio_packet(struct AVFormatContext *s, AVPacket *pkt)
 {
     FlacMuxerContext *c = s->priv_data;
     uint8_t *streaminfo;
-    int streaminfo_size;
+    size_t streaminfo_size;
 
     /* check for updated streaminfo */
     streaminfo = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
@@ -297,18 +303,18 @@ static int flac_write_audio_packet(struct AVFormatContext *s, AVPacket *pkt)
 static int flac_queue_flush(AVFormatContext *s)
 {
     FlacMuxerContext *c = s->priv_data;
-    AVPacket pkt;
+    AVPacket *const pkt = ffformatcontext(s)->pkt;
     int ret, write = 1;
 
     ret = flac_finish_header(s);
     if (ret < 0)
         write = 0;
 
-    while (c->queue) {
-        ff_packet_list_get(&c->queue, &c->queue_end, &pkt);
-        if (write && (ret = flac_write_audio_packet(s, &pkt)) < 0)
+    while (c->queue.head) {
+        ff_packet_list_get(&c->queue, pkt);
+        if (write && (ret = flac_write_audio_packet(s, pkt)) < 0)
             write = 0;
-        av_packet_unref(&pkt);
+        av_packet_unref(pkt);
     }
     return ret;
 }
@@ -345,7 +351,9 @@ static void flac_deinit(struct AVFormatContext *s)
 {
     FlacMuxerContext *c = s->priv_data;
 
-    ff_packet_list_free(&c->queue, &c->queue_end);
+    ff_packet_list_free(&c->queue);
+    for (unsigned i = 0; i < s->nb_streams; i++)
+        av_packet_free((AVPacket **)&s->streams[i]->priv_data);
 }
 
 static int flac_write_packet(struct AVFormatContext *s, AVPacket *pkt)
@@ -356,7 +364,7 @@ static int flac_write_packet(struct AVFormatContext *s, AVPacket *pkt)
     if (pkt->stream_index == c->audio_stream_idx) {
         if (c->waiting_pics) {
             /* buffer audio packets until we get all the pictures */
-            ret = ff_packet_list_put(&c->queue, &c->queue_end, pkt, FF_PACKETLIST_FLAG_REF_PACKET);
+            ret = ff_packet_list_put(&c->queue, pkt, NULL, 0);
             if (ret < 0) {
                 av_log(s, AV_LOG_ERROR, "Out of memory in packet queue; skipping attached pictures\n");
                 c->waiting_pics = 0;
@@ -408,19 +416,19 @@ static const AVClass flac_muxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVOutputFormat ff_flac_muxer = {
-    .name              = "flac",
-    .long_name         = NULL_IF_CONFIG_SMALL("raw FLAC"),
+const FFOutputFormat ff_flac_muxer = {
+    .p.name            = "flac",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("raw FLAC"),
     .priv_data_size    = sizeof(FlacMuxerContext),
-    .mime_type         = "audio/x-flac",
-    .extensions        = "flac",
-    .audio_codec       = AV_CODEC_ID_FLAC,
-    .video_codec       = AV_CODEC_ID_PNG,
+    .p.mime_type       = "audio/x-flac",
+    .p.extensions      = "flac",
+    .p.audio_codec     = AV_CODEC_ID_FLAC,
+    .p.video_codec     = AV_CODEC_ID_PNG,
     .init              = flac_init,
     .write_header      = flac_write_header,
     .write_packet      = flac_write_packet,
     .write_trailer     = flac_write_trailer,
     .deinit            = flac_deinit,
-    .flags             = AVFMT_NOTIMESTAMPS,
-    .priv_class        = &flac_muxer_class,
+    .p.flags           = AVFMT_NOTIMESTAMPS,
+    .p.priv_class      = &flac_muxer_class,
 };

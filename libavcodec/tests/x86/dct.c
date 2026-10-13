@@ -17,14 +17,18 @@
  */
 
 #include "config.h"
+#include "config_components.h"
+
+#include "libavutil/cpu.h"
+#include "libavutil/mem_internal.h"
 
 #include "libavcodec/x86/fdct.h"
 #include "libavcodec/x86/xvididct.h"
 #include "libavcodec/x86/simple_idct.h"
 
-#if (CONFIG_PRORES_DECODER || CONFIG_PRORES_LGPL_DECODER) && ARCH_X86_64 && HAVE_X86ASM
-void ff_prores_idct_put_10_sse2(uint16_t *dst, int linesize,
-                                int16_t *block, int16_t *qmat);
+#if CONFIG_PRORES_DECODER && ARCH_X86_64 && HAVE_X86ASM
+void ff_prores_idct_put_10_sse2(uint16_t *dst, ptrdiff_t linesize,
+                                int16_t *block, const int16_t *qmat);
 
 #define PR_WRAP(INSN) \
 static void ff_prores_idct_put_10_##INSN##_wrap(int16_t *dst){ \
@@ -46,20 +50,14 @@ static void ff_prores_idct_put_10_##INSN##_wrap(int16_t *dst){ \
 PR_WRAP(sse2)
 
 # if HAVE_AVX_EXTERNAL
-void ff_prores_idct_put_10_avx(uint16_t *dst, int linesize,
-                               int16_t *block, int16_t *qmat);
+void ff_prores_idct_put_10_avx(uint16_t *dst, ptrdiff_t linesize,
+                               int16_t *block, const int16_t *qmat);
 PR_WRAP(avx)
 # endif
 
 #endif
 
 static const struct algo fdct_tab_arch[] = {
-#if HAVE_MMX_INLINE
-    { "MMX",    ff_fdct_mmx,    FF_IDCT_PERM_NONE, AV_CPU_FLAG_MMX },
-#endif
-#if HAVE_MMXEXT_INLINE
-    { "MMXEXT", ff_fdct_mmxext, FF_IDCT_PERM_NONE, AV_CPU_FLAG_MMXEXT },
-#endif
 #if HAVE_SSE2_INLINE
     { "SSE2",   ff_fdct_sse2,   FF_IDCT_PERM_NONE, AV_CPU_FLAG_SSE2 },
 #endif
@@ -67,19 +65,12 @@ static const struct algo fdct_tab_arch[] = {
 };
 
 static const struct algo idct_tab_arch[] = {
-#if HAVE_MMX_EXTERNAL
-    { "SIMPLE-MMX",  ff_simple_idct_mmx,  FF_IDCT_PERM_SIMPLE, AV_CPU_FLAG_MMX },
-#endif
 #if CONFIG_MPEG4_DECODER && HAVE_X86ASM
-#if ARCH_X86_32
-    { "XVID-MMX",    ff_xvid_idct_mmx,    FF_IDCT_PERM_NONE,   AV_CPU_FLAG_MMX,    1 },
-    { "XVID-MMXEXT", ff_xvid_idct_mmxext, FF_IDCT_PERM_NONE,   AV_CPU_FLAG_MMXEXT, 1 },
-#endif
 #if HAVE_SSE2_EXTERNAL
     { "XVID-SSE2",   ff_xvid_idct_sse2,   FF_IDCT_PERM_SSE2,   AV_CPU_FLAG_SSE2,   1 },
 #endif
 #endif /* CONFIG_MPEG4_DECODER && HAVE_X86ASM */
-#if (CONFIG_PRORES_DECODER || CONFIG_PRORES_LGPL_DECODER) && ARCH_X86_64 && HAVE_X86ASM
+#if CONFIG_PRORES_DECODER && ARCH_X86_64 && HAVE_X86ASM
     { "PR-SSE2",     ff_prores_idct_put_10_sse2_wrap, FF_IDCT_PERM_TRANSPOSE, AV_CPU_FLAG_SSE2, 1 },
 # if HAVE_AVX_EXTERNAL
     { "PR-AVX",      ff_prores_idct_put_10_avx_wrap, FF_IDCT_PERM_TRANSPOSE, AV_CPU_FLAG_AVX, 1 },
@@ -96,6 +87,10 @@ static const struct algo idct_tab_arch[] = {
     { "SIMPLE8-AVX",    ff_simple_idct8_avx,   FF_IDCT_PERM_TRANSPOSE, AV_CPU_FLAG_AVX},
     { "SIMPLE10-AVX",   ff_simple_idct10_avx,  FF_IDCT_PERM_TRANSPOSE, AV_CPU_FLAG_AVX},
     { "SIMPLE12-AVX",   ff_simple_idct12_avx,  FF_IDCT_PERM_TRANSPOSE, AV_CPU_FLAG_AVX,  1 },
+#endif
+#else
+#if HAVE_SSE2_EXTERNAL
+    { "SIMPLE-SSE2",   ff_simple_idct_sse2,  FF_IDCT_PERM_SIMPLE, AV_CPU_FLAG_SSE2},
 #endif
 #endif
 #endif

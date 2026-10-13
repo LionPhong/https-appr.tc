@@ -18,14 +18,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/common.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct ShuffleFramesContext {
@@ -145,25 +145,17 @@ static const AVFilterPad shuffleframes_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = filter_frame,
     },
-    { NULL },
 };
 
-static const AVFilterPad shuffleframes_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL },
-};
-
-AVFilter ff_vf_shuffleframes = {
-    .name          = "shuffleframes",
-    .description   = NULL_IF_CONFIG_SMALL("Shuffle video frames."),
+const FFFilter ff_vf_shuffleframes = {
+    .p.name        = "shuffleframes",
+    .p.description = NULL_IF_CONFIG_SMALL("Shuffle video frames."),
+    .p.priv_class  = &shuffleframes_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(ShuffleFramesContext),
-    .priv_class    = &shuffleframes_class,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = shuffleframes_inputs,
-    .outputs       = shuffleframes_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(shuffleframes_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_PARAMS,
 };

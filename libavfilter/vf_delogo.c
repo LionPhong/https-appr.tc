@@ -33,8 +33,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/eval.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 static const char * const var_names[] = {
     "x",
@@ -225,20 +224,12 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_expr_free(s->h_pexpr);    s->h_pexpr = NULL;
 }
 
-
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVA420P, AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_NONE
-    };
-    AVFilterFormats *fmts_list = ff_make_format_list(pix_fmts);
-    if (!fmts_list)
-        return AVERROR(ENOMEM);
-    return ff_set_common_formats(ctx, fmts_list);
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVA420P, AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
 
 static av_cold int init(AVFilterContext *ctx)
 {
@@ -257,8 +248,8 @@ static av_cold int init(AVFilterContext *ctx)
     s->h = av_expr_eval(s->h_pexpr, s->var_values, s);
 
 #define CHECK_UNSET_OPT(opt)                                            \
-    if (s->opt == -1) {                                            \
-        av_log(s, AV_LOG_ERROR, "Option %s was not set.\n", #opt); \
+    if (s->opt == -1) {                                                 \
+        av_log(ctx, AV_LOG_ERROR, "Option %s was not set.\n", #opt);    \
         return AVERROR(EINVAL);                                         \
     }
     CHECK_UNSET_OPT(x);
@@ -281,12 +272,13 @@ static av_cold int init(AVFilterContext *ctx)
 
 static int config_input(AVFilterLink *inlink)
 {
-    DelogoContext *s = inlink->dst->priv;
+    AVFilterContext *ctx = inlink->dst;
+    DelogoContext *s = ctx->priv;
 
     /* Check whether the logo area fits in the frame */
     if (s->x + (s->band - 1) < 0 || s->x + s->w - (s->band*2 - 2) > inlink->w ||
         s->y + (s->band - 1) < 0 || s->y + s->h - (s->band*2 - 2) > inlink->h) {
-        av_log(s, AV_LOG_ERROR, "Logo area is outside of the frame.\n");
+        av_log(ctx, AV_LOG_ERROR, "Logo area is outside of the frame.\n");
         return AVERROR(EINVAL);
     }
 
@@ -295,7 +287,9 @@ static int config_input(AVFilterLink *inlink)
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
-    DelogoContext *s = inlink->dst->priv;
+    FilterLink *inl = ff_filter_link(inlink);
+    AVFilterContext *ctx = inlink->dst;
+    DelogoContext *s = ctx->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     AVFrame *out;
@@ -306,7 +300,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVRational sar;
     int ret;
 
-    s->var_values[VAR_N] = inlink->frame_count_out;
+    s->var_values[VAR_N] = inl->frame_count_out;
     s->var_values[VAR_T] = TS2T(in->pts, inlink->time_base);
     s->x = av_expr_eval(s->x_pexpr, s->var_values, s);
     s->y = av_expr_eval(s->y_pexpr, s->var_values, s);
@@ -315,7 +309,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     if (s->x + (s->band - 1) <= 0 || s->x + s->w - (s->band*2 - 2) > inlink->w ||
         s->y + (s->band - 1) <= 0 || s->y + s->h - (s->band*2 - 2) > inlink->h) {
-        av_log(s, AV_LOG_WARNING, "Logo area is outside of the frame,"
+        av_log(ctx, AV_LOG_WARNING, "Logo area is outside of the frame,"
                " auto set the area inside of the frame\n");
     }
 
@@ -387,26 +381,17 @@ static const AVFilterPad avfilter_vf_delogo_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad avfilter_vf_delogo_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_delogo = {
-    .name          = "delogo",
-    .description   = NULL_IF_CONFIG_SMALL("Remove logo from input video."),
+const FFFilter ff_vf_delogo = {
+    .p.name        = "delogo",
+    .p.description = NULL_IF_CONFIG_SMALL("Remove logo from input video."),
+    .p.priv_class  = &delogo_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(DelogoContext),
-    .priv_class    = &delogo_class,
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = avfilter_vf_delogo_inputs,
-    .outputs       = avfilter_vf_delogo_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_INPUTS(avfilter_vf_delogo_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

@@ -18,15 +18,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "libavutil/eval.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "drawutils.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 #include "framesync.h"
 
@@ -79,12 +81,13 @@ typedef struct ThreadData {
 
 #define OFFSET(x) offsetof(LUT2Context, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+#define TFLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption options[] = {
-    { "c0", "set component #0 expression", OFFSET(comp_expr_str[0]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
-    { "c1", "set component #1 expression", OFFSET(comp_expr_str[1]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
-    { "c2", "set component #2 expression", OFFSET(comp_expr_str[2]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
-    { "c3", "set component #3 expression", OFFSET(comp_expr_str[3]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
+    { "c0", "set component #0 expression", OFFSET(comp_expr_str[0]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
+    { "c1", "set component #1 expression", OFFSET(comp_expr_str[1]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
+    { "c2", "set component #2 expression", OFFSET(comp_expr_str[2]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
+    { "c3", "set component #3 expression", OFFSET(comp_expr_str[3]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
     { "d",  "set output depth",            OFFSET(odepth),            AV_OPT_TYPE_INT,    { .i64 =  0  }, 0, 16, .flags = FLAGS },
     { NULL }
 };
@@ -137,9 +140,11 @@ static av_cold void uninit(AVFilterContext *ctx)
     AV_PIX_FMT_YUVA420P16, AV_PIX_FMT_YUVA422P16, AV_PIX_FMT_YUVA444P16, \
     AV_PIX_FMT_GBRP16, AV_PIX_FMT_GBRAP16, AV_PIX_FMT_GRAY16,
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    LUT2Context *s = ctx->priv;
+    const LUT2Context *s = ctx->priv;
     static const enum AVPixelFormat all_pix_fmts[] = {
         BIT8_FMTS
         BIT9_FMTS
@@ -175,9 +180,9 @@ static int query_formats(AVFilterContext *ctx)
     int ret;
 
     if (s->tlut2 || !s->odepth)
-        return ff_set_common_formats(ctx, ff_make_format_list(all_pix_fmts));
+        return ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out, all_pix_fmts);
 
-    ret = ff_formats_ref(ff_make_format_list(all_pix_fmts), &ctx->inputs[0]->out_formats);
+    ret = ff_formats_ref(ff_make_pixel_format_list(all_pix_fmts), &cfg_in[0]->formats);
     if (ret < 0)
         return ret;
 
@@ -188,11 +193,10 @@ static int query_formats(AVFilterContext *ctx)
     case 12: pix_fmts = bit12_pix_fmts; break;
     case 14: pix_fmts = bit14_pix_fmts; break;
     case 16: pix_fmts = bit16_pix_fmts; break;
-    default: av_log(ctx, AV_LOG_ERROR, "Unsupported output bit depth %d.\n", s->odepth);
-             return AVERROR(EINVAL);
+    default: av_assert0(0);
     }
 
-    return ff_formats_ref(ff_make_format_list(pix_fmts), &ctx->outputs[0]->in_formats);
+    return ff_formats_ref(ff_make_pixel_format_list(pix_fmts), &cfg_out[0]->formats);
 }
 
 static int config_inputx(AVFilterLink *inlink)
@@ -255,8 +259,8 @@ static int lut2_##zname##_##xname##_##yname(AVFilterContext *ctx,               
     int p, y, x;                                                                 \
                                                                                  \
     for (p = 0; p < s->nb_planes; p++) {                                         \
-        const int slice_start = (s->heightx[p] * jobnr) / nb_jobs;               \
-        const int slice_end = (s->heightx[p] * (jobnr+1)) / nb_jobs;             \
+        const int slice_start = ff_slice_pos(s->heightx[p], jobnr, nb_jobs);     \
+        const int slice_end = ff_slice_pos(s->heightx[p], jobnr + 1, nb_jobs);   \
         const uint16_t *lut = s->lut[p];                                         \
         const xtype *srcxx;                                                      \
         const ytype *srcyy;                                                      \
@@ -315,7 +319,8 @@ static int process_frame(FFFrameSync *fs)
         td.out  = out;
         td.srcx = srcx;
         td.srcy = srcy;
-        ctx->internal->execute(ctx, s->lut2, &td, NULL, FFMIN(s->heightx[1], ff_filter_get_nb_threads(ctx)));
+        ff_filter_execute(ctx, s->lut2, &td, NULL,
+                          FFMIN(s->heightx[1], ff_filter_get_nb_threads(ctx)));
     }
 
     out->pts = av_rescale_q(s->fs.pts, s->fs.time_base, outlink->time_base);
@@ -353,7 +358,8 @@ static int config_output(AVFilterLink *outlink)
     }
 
     for (p = 0; p < s->nb_planes; p++) {
-        s->lut[p] = av_malloc_array(1 << s->depth, sizeof(uint16_t));
+        if (!s->lut[p])
+            s->lut[p] = av_malloc_array(1 << s->depth, sizeof(uint16_t));
         if (!s->lut[p])
             return AVERROR(ENOMEM);
     }
@@ -401,6 +407,8 @@ static int lut2_config_output(AVFilterLink *outlink)
     LUT2Context *s = ctx->priv;
     AVFilterLink *srcx = ctx->inputs[0];
     AVFilterLink *srcy = ctx->inputs[1];
+    FilterLink *il = ff_filter_link(srcx);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(outlink->format);
     int hsub = desc->log2_chroma_w;
@@ -411,7 +419,7 @@ static int lut2_config_output(AVFilterLink *outlink)
     outlink->h = srcx->h;
     outlink->time_base = srcx->time_base;
     outlink->sample_aspect_ratio = srcx->sample_aspect_ratio;
-    outlink->frame_rate = srcx->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     s->nb_planes = av_pix_fmt_count_planes(outlink->format);
     s->height[1] = s->height[2] = AV_CEIL_RSHIFT(outlink->h, vsub);
@@ -531,7 +539,6 @@ static const AVFilterPad inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_inputy,
     },
-    { NULL }
 };
 
 static const AVFilterPad outputs[] = {
@@ -540,26 +547,37 @@ static const AVFilterPad outputs[] = {
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = lut2_config_output,
     },
-    { NULL }
 };
+
+static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
+                           char *res, int res_len, int flags)
+{
+    int ret = ff_filter_process_command(ctx, cmd, args, res, res_len, flags);
+
+    if (ret < 0)
+        return ret;
+
+    return config_output(ctx->outputs[0]);
+}
 
 #define lut2_options options
 
 FRAMESYNC_DEFINE_CLASS(lut2, LUT2Context, fs);
 
-AVFilter ff_vf_lut2 = {
-    .name          = "lut2",
-    .description   = NULL_IF_CONFIG_SMALL("Compute and apply a lookup table from two video inputs."),
+const FFFilter ff_vf_lut2 = {
+    .p.name        = "lut2",
+    .p.description = NULL_IF_CONFIG_SMALL("Compute and apply a lookup table from two video inputs."),
+    .p.priv_class  = &lut2_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .preinit       = lut2_framesync_preinit,
     .priv_size     = sizeof(LUT2Context),
-    .priv_class    = &lut2_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
     .activate      = activate,
-    .inputs        = inputs,
-    .outputs       = outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(outputs),
+    FILTER_QUERY_FUNC2(query_formats),
+    .process_command = process_command,
 };
 
 #if CONFIG_TLUT2_FILTER
@@ -569,6 +587,12 @@ static av_cold int init(AVFilterContext *ctx)
     LUT2Context *s = ctx->priv;
 
     s->tlut2 = !strcmp(ctx->filter->name, "tlut2");
+
+    if (!(s->odepth == 0 || s->odepth == 8 || s->odepth == 9 || s->odepth == 10 ||
+          s->odepth == 12 || s->odepth == 14 || s->odepth == 16)) {
+        av_log(ctx, AV_LOG_ERROR, "Unsupported output bit depth %d.\n", s->odepth);
+        return AVERROR(EINVAL);
+    }
 
     return 0;
 }
@@ -595,11 +619,14 @@ static int tlut2_filter_frame(AVFilterLink *inlink, AVFrame *frame)
             }
 
             av_frame_copy_props(out, frame);
+            av_frame_side_data_remove_by_props(&out->side_data, &out->nb_side_data,
+                                               AV_SIDE_DATA_PROP_COLOR_DEPENDENT);
 
             td.out  = out;
             td.srcx = frame;
             td.srcy = s->prev_frame;
-            ctx->internal->execute(ctx, s->lut2, &td, NULL, FFMIN(s->heightx[1], ff_filter_get_nb_threads(ctx)));
+            ff_filter_execute(ctx, s->lut2, &td, NULL,
+                              FFMIN(s->heightx[1], ff_filter_get_nb_threads(ctx)));
         }
         av_frame_free(&s->prev_frame);
         s->prev_frame = frame;
@@ -610,10 +637,10 @@ static int tlut2_filter_frame(AVFilterLink *inlink, AVFrame *frame)
 }
 
 static const AVOption tlut2_options[] = {
-    { "c0", "set component #0 expression", OFFSET(comp_expr_str[0]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
-    { "c1", "set component #1 expression", OFFSET(comp_expr_str[1]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
-    { "c2", "set component #2 expression", OFFSET(comp_expr_str[2]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
-    { "c3", "set component #3 expression", OFFSET(comp_expr_str[3]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = FLAGS },
+    { "c0", "set component #0 expression", OFFSET(comp_expr_str[0]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
+    { "c1", "set component #1 expression", OFFSET(comp_expr_str[1]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
+    { "c2", "set component #2 expression", OFFSET(comp_expr_str[2]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
+    { "c3", "set component #3 expression", OFFSET(comp_expr_str[3]),  AV_OPT_TYPE_STRING, { .str = "x" }, .flags = TFLAGS },
     { NULL }
 };
 
@@ -626,7 +653,6 @@ static const AVFilterPad tlut2_inputs[] = {
         .filter_frame  = tlut2_filter_frame,
         .config_props  = config_inputx,
     },
-    { NULL }
 };
 
 static const AVFilterPad tlut2_outputs[] = {
@@ -635,21 +661,21 @@ static const AVFilterPad tlut2_outputs[] = {
         .type          = AVMEDIA_TYPE_VIDEO,
         .config_props  = config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_tlut2 = {
-    .name          = "tlut2",
-    .description   = NULL_IF_CONFIG_SMALL("Compute and apply a lookup table from two successive frames."),
+const FFFilter ff_vf_tlut2 = {
+    .p.name        = "tlut2",
+    .p.description = NULL_IF_CONFIG_SMALL("Compute and apply a lookup table from two successive frames."),
+    .p.priv_class  = &tlut2_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(LUT2Context),
-    .priv_class    = &tlut2_class,
-    .query_formats = query_formats,
     .init          = init,
     .uninit        = uninit,
-    .inputs        = tlut2_inputs,
-    .outputs       = tlut2_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_INPUTS(tlut2_inputs),
+    FILTER_OUTPUTS(tlut2_outputs),
+    FILTER_QUERY_FUNC2(query_formats),
+    .process_command = process_command,
 };
 
 #endif

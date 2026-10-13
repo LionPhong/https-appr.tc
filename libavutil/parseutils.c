@@ -102,6 +102,7 @@ static const VideoSizeAbbr video_size_abbrs[] = {
     { "wsxga",    1600,1024 },
     { "wuxga",    1920,1200 },
     { "woxga",    2560,1600 },
+    { "wqhd",     2560,1440 },
     { "wqsxga",   3200,2048 },
     { "wquxga",   3840,2400 },
     { "whsxga",   6400,4096 },
@@ -111,6 +112,7 @@ static const VideoSizeAbbr video_size_abbrs[] = {
     { "hd480",     852, 480 },
     { "hd720",    1280, 720 },
     { "hd1080",   1920,1080 },
+    { "quadhd",   2560,1440 },
     { "2k",       2048,1080 }, /* Digital Cinema System Specification */
     { "2kdci",    2048,1080 },
     { "2kflat",   1998,1080 },
@@ -191,6 +193,9 @@ int av_parse_video_rate(AVRational *rate, const char *arg)
     /* Then, we try to parse it as fraction */
     if ((ret = av_parse_ratio_quiet(rate, arg, 1001000)) < 0)
         return ret;
+    if (!rate->num || !rate->den)
+        if ((ret = av_parse_ratio_quiet(rate, arg, INT_MAX)) < 0)
+            return ret;
     if (rate->num <= 0 || rate->den <= 0)
         return AVERROR(EINVAL);
     return 0;
@@ -736,12 +741,14 @@ int av_parse_time(int64_t *timeval, const char *timestr, int duration)
     if (*q)
         return AVERROR(EINVAL);
 
-    if (INT64_MAX / suffix < t)
+    if (INT64_MAX / suffix < t || t < INT64_MIN / suffix)
         return AVERROR(ERANGE);
     t *= suffix;
     if (INT64_MAX - microseconds < t)
         return AVERROR(ERANGE);
     t += microseconds;
+    if (t == INT64_MIN && negative)
+        return AVERROR(ERANGE);
     *timeval = negative ? -t : t;
     return 0;
 }

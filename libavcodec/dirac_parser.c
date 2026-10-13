@@ -29,10 +29,12 @@
 
 #include <string.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 
-#include "parser.h"
+#include "avcodec.h"
+#include "parser_internal.h"
 
 #define DIRAC_PARSE_INFO_PREFIX 0x42424344
 
@@ -215,7 +217,7 @@ static int dirac_combine_frame(AVCodecParserContext *s, AVCodecContext *avctx,
             int64_t pts = AV_RB32(cur_pu + 13);
             if (s->last_pts == 0 && s->last_dts == 0)
                 s->dts = pts - 1;
-            else
+            else if (s->last_dts != AV_NOPTS_VALUE)
                 s->dts = s->last_dts + 1;
             s->pts = pts;
             if (!avctx->has_b_frames && (cur_pu[4] & 0x03))
@@ -265,7 +267,7 @@ static int dirac_parse(AVCodecParserContext *s, AVCodecContext *avctx,
     return next;
 }
 
-static void dirac_parse_close(AVCodecParserContext *s)
+static av_cold void dirac_parse_close(AVCodecParserContext *s)
 {
     DiracParseContext *pc = s->priv_data;
 
@@ -273,9 +275,9 @@ static void dirac_parse_close(AVCodecParserContext *s)
         av_freep(&pc->buffer);
 }
 
-AVCodecParser ff_dirac_parser = {
-    .codec_ids      = { AV_CODEC_ID_DIRAC },
+const FFCodecParser ff_dirac_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_DIRAC),
     .priv_data_size = sizeof(DiracParseContext),
-    .parser_parse   = dirac_parse,
-    .parser_close   = dirac_parse_close,
+    .parse          = dirac_parse,
+    .close          = dirac_parse_close,
 };

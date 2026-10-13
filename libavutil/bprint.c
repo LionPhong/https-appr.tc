@@ -18,16 +18,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include "avassert.h"
 #include "avstring.h"
 #include "bprint.h"
-#include "common.h"
-#include "compat/va_copy.h"
 #include "error.h"
+#include "macros.h"
 #include "mem.h"
 
 #define av_bprint_room(buf) ((buf)->size - FFMIN((buf)->len, (buf)->size))
@@ -71,7 +70,7 @@ void av_bprint_init(AVBPrint *buf, unsigned size_init, unsigned size_max)
     unsigned size_auto = (char *)buf + sizeof(*buf) -
                          buf->reserved_internal_buffer;
 
-    if (size_max == 1)
+    if (size_max == AV_BPRINT_SIZE_AUTOMATIC)
         size_max = size_auto;
     buf->str      = buf->reserved_internal_buffer;
     buf->len      = 0;
@@ -84,34 +83,16 @@ void av_bprint_init(AVBPrint *buf, unsigned size_init, unsigned size_max)
 
 void av_bprint_init_for_buffer(AVBPrint *buf, char *buffer, unsigned size)
 {
+    if (size == 0) {
+        av_bprint_init(buf, 0, AV_BPRINT_SIZE_COUNT_ONLY);
+        return;
+    }
+
     buf->str      = buffer;
     buf->len      = 0;
     buf->size     = size;
     buf->size_max = size;
     *buf->str = 0;
-}
-
-void av_bprintf(AVBPrint *buf, const char *fmt, ...)
-{
-    unsigned room;
-    char *dst;
-    va_list vl;
-    int extra_len;
-
-    while (1) {
-        room = av_bprint_room(buf);
-        dst = room ? buf->str + buf->len : NULL;
-        va_start(vl, fmt);
-        extra_len = vsnprintf(dst, room, fmt, vl);
-        va_end(vl);
-        if (extra_len <= 0)
-            return;
-        if (extra_len < room)
-            break;
-        if (av_bprint_alloc(buf, extra_len))
-            break;
-    }
-    av_bprint_grow(buf, extra_len);
 }
 
 void av_vbprintf(AVBPrint *buf, const char *fmt, va_list vl_arg)
@@ -135,6 +116,14 @@ void av_vbprintf(AVBPrint *buf, const char *fmt, va_list vl_arg)
             break;
     }
     av_bprint_grow(buf, extra_len);
+}
+
+void av_bprintf(AVBPrint *buf, const char *fmt, ...)
+{
+    va_list vl;
+    va_start(vl, fmt);
+    av_vbprintf(buf, fmt, vl);
+    va_end(vl);
 }
 
 void av_bprint_chars(AVBPrint *buf, char c, unsigned n)
@@ -177,6 +166,7 @@ void av_bprint_strftime(AVBPrint *buf, const char *fmt, const struct tm *tm)
 {
     unsigned room;
     size_t l;
+    size_t fmt_len = strlen(fmt);
 
     if (!*fmt)
         return;
@@ -184,9 +174,18 @@ void av_bprint_strftime(AVBPrint *buf, const char *fmt, const struct tm *tm)
         room = av_bprint_room(buf);
         if (room && (l = strftime(buf->str + buf->len, room, fmt, tm)))
             break;
+
+        /* Due to the limitations of strftime() it is not possible to know if
+         * the output buffer is too small or the output is empty.
+         * However, a 256x output space requirement compared to the format
+         * string length is so unlikely we can safely assume empty output. This
+         * allows supporting possibly empty format strings like "%p". */
+        if (room >> 8 > fmt_len)
+            break;
+
         /* strftime does not tell us how much room it would need: let us
            retry with twice as much until the buffer is large enough */
-        room = !room ? strlen(fmt) + 1 :
+        room = !room ? fmt_len + 1 :
                room <= INT_MAX / 2 ? room * 2 : INT_MAX;
         if (av_bprint_alloc(buf, room)) {
             /* impossible to grow, try to manage something useful anyway */
@@ -221,7 +220,7 @@ void av_bprint_get_buffer(AVBPrint *buf, unsigned size,
     if (size > av_bprint_room(buf))
         av_bprint_alloc(buf, size);
     *actual_size = av_bprint_room(buf);
-    *mem = *actual_size ? buf->str + buf->len : NULL;
+    *mem = *actual_size ? (unsigned char *) (buf->str + buf->len) : NULL;
 }
 
 void av_bprint_clear(AVBPrint *buf)
@@ -245,10 +244,8 @@ int av_bprint_finalize(AVBPrint *buf, char **ret_str)
                 str = buf->str;
             buf->str = NULL;
         } else {
-            str = av_malloc(real_size);
-            if (str)
-                memcpy(str, buf->str, real_size);
-            else
+            str = av_memdup(buf->str, real_size);
+            if (!str)
                 ret = AVERROR(ENOMEM);
         }
         *ret_str = str;
@@ -281,6 +278,35 @@ void av_bprint_escape(AVBPrint *dstbuf, const char *src, const char *special_cha
                 av_bprint_chars(dstbuf, *src, 1);
         }
         av_bprint_chars(dstbuf, '\'', 1);
+        break;
+
+    case AV_ESCAPE_MODE_XML:
+        /* escape XML non-markup character data as per 2.4 by default: */
+        /*  [^<&]* - ([^<&]* ']]>' [^<&]*) */
+
+        /* additionally, given one of the AV_ESCAPE_FLAG_XML_* flags, */
+        /* escape those specific characters as required. */
+        for (; *src; src++) {
+            switch (*src) {
+            case '&' : av_bprintf(dstbuf, "%s", "&amp;");  break;
+            case '<' : av_bprintf(dstbuf, "%s", "&lt;");   break;
+            case '>' : av_bprintf(dstbuf, "%s", "&gt;");   break;
+            case '\'':
+                if (!(flags & AV_ESCAPE_FLAG_XML_SINGLE_QUOTES))
+                    goto XML_DEFAULT_HANDLING;
+
+                av_bprintf(dstbuf, "%s", "&apos;");
+                break;
+            case '"' :
+                if (!(flags & AV_ESCAPE_FLAG_XML_DOUBLE_QUOTES))
+                    goto XML_DEFAULT_HANDLING;
+
+                av_bprintf(dstbuf, "%s", "&quot;");
+                break;
+XML_DEFAULT_HANDLING:
+            default: av_bprint_chars(dstbuf, *src, 1);
+            }
+        }
         break;
 
     /* case AV_ESCAPE_MODE_BACKSLASH or unknown mode */

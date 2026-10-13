@@ -20,11 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
+#include "libavutil/avassert.h"
+
 #include "av1_parse.h"
+#include "avcodec.h"
 #include "cbs.h"
 #include "cbs_av1.h"
-#include "internal.h"
-#include "parser.h"
+#include "parser_internal.h"
 
 typedef struct AV1ParseContext {
     CodedBitstreamContext *cbc;
@@ -56,9 +59,9 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
 {
     AV1ParseContext *s = ctx->priv_data;
     CodedBitstreamFragment *td = &s->temporal_unit;
-    CodedBitstreamAV1Context *av1 = s->cbc->priv_data;
-    AV1RawSequenceHeader *seq;
-    AV1RawColorConfig *color;
+    const CodedBitstreamAV1Context *av1 = s->cbc->priv_data;
+    const AV1RawSequenceHeader *seq;
+    const AV1RawColorConfig *color;
     int ret;
 
     *out_data = data;
@@ -73,15 +76,15 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
     if (avctx->extradata_size && !s->parsed_extradata) {
         s->parsed_extradata = 1;
 
-        ret = ff_cbs_read(s->cbc, td, avctx->extradata, avctx->extradata_size);
+        ret = ff_cbs_read_extradata_from_codec(s->cbc, td, avctx);
         if (ret < 0) {
             av_log(avctx, AV_LOG_WARNING, "Failed to parse extradata.\n");
         }
 
-        ff_cbs_fragment_reset(s->cbc, td);
+        ff_cbs_fragment_reset(td);
     }
 
-    ret = ff_cbs_read(s->cbc, td, data, size);
+    ret = ff_cbs_read(s->cbc, td, NULL, data, size);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to parse temporal unit.\n");
         goto end;
@@ -96,10 +99,9 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
     color = &seq->color_config;
 
     for (int i = 0; i < td->nb_units; i++) {
-        CodedBitstreamUnit *unit = &td->units[i];
-        AV1RawOBU *obu = unit->content;
-        AV1RawFrameHeader *frame;
-        int frame_type;
+        const CodedBitstreamUnit *unit = &td->units[i];
+        const AV1RawOBU *obu = unit->content;
+        const AV1RawFrameHeader *frame;
 
         if (unit->type == AV1_OBU_FRAME)
             frame = &obu->obu.frame.header;
@@ -111,30 +113,15 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
         if (obu->header.spatial_id > 0)
             continue;
 
-        if (frame->show_existing_frame) {
-            AV1ReferenceFrameState *ref = &av1->ref[frame->frame_to_show_map_idx];
-
-            if (!ref->valid) {
-                av_log(avctx, AV_LOG_ERROR, "Invalid reference frame\n");
-                goto end;
-            }
-
-            ctx->width  = ref->frame_width;
-            ctx->height = ref->frame_height;
-            frame_type  = ref->frame_type;
-
-            ctx->key_frame = 0;
-        } else if (!frame->show_frame) {
+        if (!frame->show_frame && !frame->show_existing_frame)
             continue;
-        } else {
-            ctx->width  = av1->frame_width;
-            ctx->height = av1->frame_height;
-            frame_type  = frame->frame_type;
 
-            ctx->key_frame = frame_type == AV1_FRAME_KEY;
-        }
+        ctx->width  = frame->frame_width_minus_1 + 1;
+        ctx->height = frame->frame_height_minus_1 + 1;
 
-        switch (frame_type) {
+        ctx->key_frame = frame->frame_type == AV1_FRAME_KEY && !frame->show_existing_frame;
+
+        switch (frame->frame_type) {
         case AV1_FRAME_KEY:
         case AV1_FRAME_INTRA_ONLY:
             ctx->pict_type = AV_PICTURE_TYPE_I;
@@ -147,6 +134,13 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
             break;
         }
         ctx->picture_structure = AV_PICTURE_STRUCTURE_FRAME;
+
+        /* Extract SAR from render_height_minus_1 & render_width_minus_1 */
+        av_reduce(&avctx->sample_aspect_ratio.num,
+                  &avctx->sample_aspect_ratio.den,
+                  (int64_t)ctx->height * (frame->render_width_minus_1  + 1),
+                  (int64_t)ctx->width  * (frame->render_height_minus_1 + 1),
+                  INT_MAX);
     }
 
     switch (av1->bit_depth) {
@@ -171,8 +165,6 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
         color->transfer_characteristics  == AVCOL_TRC_IEC61966_2_1)
         ctx->format = pix_fmts_rgb[color->high_bitdepth + color->twelve_bit];
 
-    avctx->pix_fmt = ctx->format;
-
     avctx->profile = seq->seq_profile;
     avctx->level   = seq->seq_level_idx[0];
 
@@ -181,17 +173,13 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
     avctx->color_trc = (enum AVColorTransferCharacteristic) color->transfer_characteristics;
     avctx->color_range = color->color_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
 
-    if (ctx->width != avctx->width || ctx->height != avctx->height) {
-        ret = ff_set_dimensions(avctx, ctx->width, ctx->height);
-        if (ret < 0)
-            goto end;
-    }
-
-    if (avctx->framerate.num)
-        avctx->time_base = av_inv_q(av_mul_q(avctx->framerate, (AVRational){avctx->ticks_per_frame, 1}));
+    if (seq->timing_info_present_flag)
+        avctx->framerate = ff_av1_framerate(1LL + seq->timing_info.num_ticks_per_picture_minus_1,
+                                            seq->timing_info.num_units_in_display_tick,
+                                            seq->timing_info.time_scale);
 
 end:
-    ff_cbs_fragment_reset(s->cbc, td);
+    ff_cbs_fragment_reset(td);
 
     s->cbc->log_ctx = NULL;
 
@@ -204,6 +192,7 @@ static const CodedBitstreamUnitType decompose_unit_types[] = {
     AV1_OBU_FRAME_HEADER,
     AV1_OBU_TILE_GROUP,
     AV1_OBU_FRAME,
+    AV1_OBU_REDUNDANT_FRAME_HEADER,
 };
 
 static av_cold int av1_parser_init(AVCodecParserContext *ctx)
@@ -215,47 +204,24 @@ static av_cold int av1_parser_init(AVCodecParserContext *ctx)
     if (ret < 0)
         return ret;
 
-    s->cbc->decompose_unit_types    = (CodedBitstreamUnitType *)decompose_unit_types;
+    s->cbc->decompose_unit_types    = decompose_unit_types;
     s->cbc->nb_decompose_unit_types = FF_ARRAY_ELEMS(decompose_unit_types);
 
     return 0;
 }
 
-static void av1_parser_close(AVCodecParserContext *ctx)
+static av_cold void av1_parser_close(AVCodecParserContext *ctx)
 {
     AV1ParseContext *s = ctx->priv_data;
 
-    ff_cbs_fragment_free(s->cbc, &s->temporal_unit);
+    ff_cbs_fragment_free(&s->temporal_unit);
     ff_cbs_close(&s->cbc);
 }
 
-static int av1_parser_split(AVCodecContext *avctx,
-                            const uint8_t *buf, int buf_size)
-{
-    AV1OBU obu;
-    const uint8_t *ptr = buf, *end = buf + buf_size;
-
-    while (ptr < end) {
-        int len = ff_av1_extract_obu(&obu, ptr, buf_size, avctx);
-        if (len < 0)
-            break;
-
-        if (obu.type == AV1_OBU_FRAME_HEADER ||
-            obu.type == AV1_OBU_FRAME) {
-            return ptr - buf;
-        }
-        ptr      += len;
-        buf_size -= len;
-    }
-
-    return 0;
-}
-
-AVCodecParser ff_av1_parser = {
-    .codec_ids      = { AV_CODEC_ID_AV1 },
+const FFCodecParser ff_av1_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_AV1),
     .priv_data_size = sizeof(AV1ParseContext),
-    .parser_init    = av1_parser_init,
-    .parser_close   = av1_parser_close,
-    .parser_parse   = av1_parser_parse,
-    .split          = av1_parser_split,
+    .init           = av1_parser_init,
+    .close          = av1_parser_close,
+    .parse          = av1_parser_parse,
 };

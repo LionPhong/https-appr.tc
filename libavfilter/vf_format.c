@@ -23,6 +23,8 @@
  * format and noformat video filters
  */
 
+#include "config_components.h"
+
 #include <string.h>
 
 #include "libavutil/internal.h"
@@ -31,193 +33,211 @@
 #include "libavutil/opt.h"
 
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 typedef struct FormatContext {
     const AVClass *class;
     char *pix_fmts;
+    char *csps;
+    char *ranges;
+    char *alphamodes;
+    char *chromalocations;
 
-    /**
-     * pix_fmts parsed into AVPixelFormats and terminated with
-     * AV_PIX_FMT_NONE
-     */
-    enum AVPixelFormat *formats;
+    AVFilterFormats *formats; ///< parsed from `pix_fmts`
+    AVFilterFormats *color_spaces; ///< parsed from `csps`
+    AVFilterFormats *color_ranges; ///< parsed from `ranges`
+    AVFilterFormats *alpha_modes; ///< parsed from `alphamodes`
+    AVFilterFormats *chroma_locations; ///< parsed from `chromalocations`
 } FormatContext;
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
     FormatContext *s = ctx->priv;
-    av_freep(&s->formats);
+    ff_formats_unref(&s->formats);
+    ff_formats_unref(&s->color_spaces);
+    ff_formats_unref(&s->color_ranges);
+    ff_formats_unref(&s->alpha_modes);
+    ff_formats_unref(&s->chroma_locations);
 }
+
+static av_cold int invert_formats(AVFilterFormats **fmts,
+                                  AVFilterFormats *allfmts)
+{
+    if (!allfmts)
+        return AVERROR(ENOMEM);
+    if (!*fmts) {
+        /* empty fmt list means no restriction, regardless of filter type */
+        ff_formats_unref(&allfmts);
+        return 0;
+    }
+
+    for (int i = 0; i < allfmts->nb_formats; i++) {
+        for (int j = 0; j < (*fmts)->nb_formats; j++) {
+            if (allfmts->formats[i] == (*fmts)->formats[j]) {
+                /* format is forbidden, remove it from allfmts list */
+                memmove(&allfmts->formats[i], &allfmts->formats[i+1],
+                        (allfmts->nb_formats - (i+1)) * sizeof(*allfmts->formats));
+                allfmts->nb_formats--;
+                i--; /* repeat loop with same idx */
+                break;
+            }
+        }
+    }
+
+    ff_formats_unref(fmts);
+    *fmts = allfmts;
+    return 0;
+}
+
+#define DEFINE_PARSE(name, Type, get, descr, extra_test) \
+static int parse_##name(enum Type *ret, const char *arg, void *log_ctx) \
+{ \
+    char *tail; \
+    int val = get(arg); \
+    if (val < 0) { \
+        val = strtol(arg, &tail, 0); \
+        if (*tail || extra_test) { \
+            av_log(log_ctx, AV_LOG_ERROR, "Invalid " descr " '%s'\n", arg); \
+            return AVERROR(EINVAL); \
+        } \
+    } \
+    *ret = val; \
+    return 0; \
+}
+
+DEFINE_PARSE(pixel_format, AVPixelFormat, av_get_pix_fmt, "pixel format", !av_pix_fmt_desc_get(val))
+DEFINE_PARSE(color_space, AVColorSpace, av_color_space_from_name, "color space", 0)
+DEFINE_PARSE(color_range, AVColorRange, av_color_range_from_name, "color range", 0)
+DEFINE_PARSE(alpha_mode, AVAlphaMode, av_alpha_mode_from_name, "alpha mode", 0)
+DEFINE_PARSE(chroma_location, AVChromaLocation, av_chroma_location_from_name, "chroma location", 0)
 
 static av_cold int init(AVFilterContext *ctx)
 {
     FormatContext *s = ctx->priv;
-    char *cur, *sep;
-    int nb_formats = 1;
-    int i;
+    enum AVPixelFormat pix_fmt;
+    enum AVColorSpace csp;
+    enum AVColorRange crg;
+    enum AVAlphaMode alm;
+    enum AVChromaLocation cloc;
     int ret;
 
-    if (!s->pix_fmts) {
-        av_log(ctx, AV_LOG_ERROR, "Empty output format string.\n");
-        return AVERROR(EINVAL);
+    #define PARSE_LIST(strfield, fmtfield, tvar, parse) \
+    for (char *sep, *cur = s->strfield; cur; cur = sep) { \
+        sep = strchr(cur, '|'); \
+        if (sep && *sep) \
+            *sep++ = 0; \
+        if ((ret = parse(&tvar, cur, ctx)) < 0 || \
+            (ret = ff_add_format(&s->fmtfield, tvar)) < 0) \
+            return ret; \
     }
 
-    /* count the formats */
-    cur = s->pix_fmts;
-    while ((cur = strchr(cur, '|'))) {
-        nb_formats++;
-        if (*cur)
-            cur++;
-    }
-
-    s->formats = av_malloc_array(nb_formats + 1, sizeof(*s->formats));
-    if (!s->formats)
-        return AVERROR(ENOMEM);
-
-    /* parse the list of formats */
-    cur = s->pix_fmts;
-    for (i = 0; i < nb_formats; i++) {
-        sep = strchr(cur, '|');
-        if (sep)
-            *sep++ = 0;
-
-        if ((ret = ff_parse_pixel_format(&s->formats[i], cur, ctx)) < 0)
-            return ret;
-
-        cur = sep;
-    }
-    s->formats[nb_formats] = AV_PIX_FMT_NONE;
+    PARSE_LIST(pix_fmts, formats, pix_fmt, parse_pixel_format)
+    PARSE_LIST(csps, color_spaces, csp, parse_color_space)
+    PARSE_LIST(ranges, color_ranges, crg, parse_color_range)
+    PARSE_LIST(alphamodes, alpha_modes, alm, parse_alpha_mode)
+    PARSE_LIST(chromalocations, chroma_locations, cloc, parse_chroma_location)
 
     if (!strcmp(ctx->filter->name, "noformat")) {
-        const AVPixFmtDescriptor *desc = NULL;
-        enum AVPixelFormat *formats_allowed;
-        int nb_formats_lavu = 0, nb_formats_allowed = 0;
-
-        /* count the formats known to lavu */
-        while ((desc = av_pix_fmt_desc_next(desc)))
-            nb_formats_lavu++;
-
-        formats_allowed = av_malloc_array(nb_formats_lavu + 1, sizeof(*formats_allowed));
-        if (!formats_allowed)
-            return AVERROR(ENOMEM);
-
-        /* for each format known to lavu, check if it's in the list of
-         * forbidden formats */
-        while ((desc = av_pix_fmt_desc_next(desc))) {
-            enum AVPixelFormat pix_fmt = av_pix_fmt_desc_get_id(desc);
-
-            for (i = 0; i < nb_formats; i++) {
-                if (s->formats[i] == pix_fmt)
-                    break;
-            }
-            if (i < nb_formats)
-                continue;
-
-            formats_allowed[nb_formats_allowed++] = pix_fmt;
-        }
-        formats_allowed[nb_formats_allowed] = AV_PIX_FMT_NONE;
-        av_freep(&s->formats);
-        s->formats = formats_allowed;
+        if (s->chroma_locations &&
+            (ret = ff_add_format(&s->chroma_locations, AVCHROMA_LOC_UNSPECIFIED)) < 0)
+            return ret;
+        if ((ret = invert_formats(&s->formats,      ff_all_formats(AVMEDIA_TYPE_VIDEO))) < 0 ||
+            (ret = invert_formats(&s->color_spaces, ff_all_color_spaces())) < 0 ||
+            (ret = invert_formats(&s->color_ranges, ff_all_color_ranges())) < 0 ||
+            (ret = invert_formats(&s->alpha_modes,  ff_all_alpha_modes())) < 0 ||
+            (ret = invert_formats(&s->chroma_locations, ff_all_chroma_locations())) < 0)
+            return ret;
     }
+
+    /* hold on to a ref for the lifetime of the filter */
+    if (s->formats      && (ret = ff_formats_ref(s->formats,      &s->formats)) < 0 ||
+        s->color_spaces && (ret = ff_formats_ref(s->color_spaces, &s->color_spaces)) < 0 ||
+        s->color_ranges && (ret = ff_formats_ref(s->color_ranges, &s->color_ranges)) < 0 ||
+        s->alpha_modes  && (ret = ff_formats_ref(s->alpha_modes,  &s->alpha_modes)) < 0 ||
+        s->chroma_locations && (ret = ff_formats_ref(s->chroma_locations, &s->chroma_locations)) < 0)
+        return ret;
 
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     FormatContext *s = ctx->priv;
-    AVFilterFormats *formats = ff_make_format_list(s->formats);
+    int ret;
 
-    if (!formats)
-        return AVERROR(ENOMEM);
+    if (s->formats      && (ret = ff_set_common_formats2     (ctx, cfg_in, cfg_out, s->formats)) < 0 ||
+        s->color_spaces && (ret = ff_set_common_color_spaces2(ctx, cfg_in, cfg_out, s->color_spaces)) < 0 ||
+        s->color_ranges && (ret = ff_set_common_color_ranges2(ctx, cfg_in, cfg_out, s->color_ranges)) < 0 ||
+        s->alpha_modes  && (ret = ff_set_common_alpha_modes2(ctx, cfg_in, cfg_out, s->alpha_modes)) < 0 ||
+        s->chroma_locations && (ret = ff_set_common_chroma_locations2(ctx, cfg_in, cfg_out, s->chroma_locations)) < 0)
+        return ret;
 
-    return ff_set_common_formats(ctx, formats);
+    return 0;
 }
 
 
 #define OFFSET(x) offsetof(FormatContext, x)
 static const AVOption options[] = {
     { "pix_fmts", "A '|'-separated list of pixel formats", OFFSET(pix_fmts), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
+    { "color_spaces", "A '|'-separated list of color spaces", OFFSET(csps), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
+    { "color_ranges", "A '|'-separated list of color ranges", OFFSET(ranges), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
+    { "alpha_modes", "A '|'-separated list of alpha modes", OFFSET(alphamodes), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
+    { "chroma_locations", "A '|'-separated list of chroma sample locations", OFFSET(chromalocations), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
     { NULL }
 };
 
-#if CONFIG_FORMAT_FILTER
+AVFILTER_DEFINE_CLASS_EXT(format, "(no)format", options);
 
-#define format_options options
-AVFILTER_DEFINE_CLASS(format);
-
-static const AVFilterPad avfilter_vf_format_inputs[] = {
+static const AVFilterPad inputs[] = {
     {
         .name             = "default",
         .type             = AVMEDIA_TYPE_VIDEO,
-        .get_video_buffer = ff_null_get_video_buffer,
+        .get_buffer.video = ff_null_get_video_buffer,
     },
-    { NULL }
 };
 
-static const AVFilterPad avfilter_vf_format_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO
-    },
-    { NULL }
-};
+#if CONFIG_FORMAT_FILTER
+const FFFilter ff_vf_format = {
+    .p.name        = "format",
+    .p.description = NULL_IF_CONFIG_SMALL("Convert the input video to one of the specified pixel formats."),
+    .p.priv_class  = &format_class,
 
-AVFilter ff_vf_format = {
-    .name          = "format",
-    .description   = NULL_IF_CONFIG_SMALL("Convert the input video to one of the specified pixel formats."),
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
 
     .init          = init,
     .uninit        = uninit,
 
-    .query_formats = query_formats,
-
     .priv_size     = sizeof(FormatContext),
-    .priv_class    = &format_class,
 
-    .inputs        = avfilter_vf_format_inputs,
-    .outputs       = avfilter_vf_format_outputs,
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+
+    FILTER_QUERY_FUNC2(query_formats),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_PARAMS,
 };
 #endif /* CONFIG_FORMAT_FILTER */
 
 #if CONFIG_NOFORMAT_FILTER
+const FFFilter ff_vf_noformat = {
+    .p.name        = "noformat",
+    .p.description = NULL_IF_CONFIG_SMALL("Force libavfilter not to use any of the specified pixel formats for the input to the next filter."),
+    .p.priv_class  = &format_class,
 
-#define noformat_options options
-AVFILTER_DEFINE_CLASS(noformat);
-
-static const AVFilterPad avfilter_vf_noformat_inputs[] = {
-    {
-        .name             = "default",
-        .type             = AVMEDIA_TYPE_VIDEO,
-        .get_video_buffer = ff_null_get_video_buffer,
-    },
-    { NULL }
-};
-
-static const AVFilterPad avfilter_vf_noformat_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_noformat = {
-    .name          = "noformat",
-    .description   = NULL_IF_CONFIG_SMALL("Force libavfilter not to use any of the specified pixel formats for the input to the next filter."),
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
 
     .init          = init,
     .uninit        = uninit,
 
-    .query_formats = query_formats,
-
     .priv_size     = sizeof(FormatContext),
-    .priv_class    = &noformat_class,
 
-    .inputs        = avfilter_vf_noformat_inputs,
-    .outputs       = avfilter_vf_noformat_outputs,
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+
+    FILTER_QUERY_FUNC2(query_formats),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_PARAMS,
 };
 #endif /* CONFIG_NOFORMAT_FILTER */

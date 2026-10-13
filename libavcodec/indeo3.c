@@ -29,14 +29,18 @@
  * @see http://wiki.multimedia.cx/index.php?title=Indeo_3
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
+#include "libavutil/thread.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "copy_block.h"
 #include "bytestream.h"
 #include "get_bits.h"
 #include "hpeldsp.h"
-#include "internal.h"
 
 #include "indeo3data.h"
 
@@ -169,9 +173,12 @@ static av_cold int allocate_frame_buffers(Indeo3DecodeContext *ctx,
     int luma_size, chroma_size;
     ptrdiff_t luma_pitch, chroma_pitch;
 
+    luma_width  = FFALIGN(luma_width , 2);
+    luma_height = FFALIGN(luma_height, 2);
+
     if (luma_width  < 16 || luma_width  > 640 ||
         luma_height < 16 || luma_height > 480 ||
-        luma_width  &  3 || luma_height &   3) {
+        luma_width  &  1 || luma_height &   1) {
         av_log(avctx, AV_LOG_ERROR, "Invalid picture dimensions: %d x %d!\n",
                luma_width, luma_height);
         return AVERROR_INVALIDDATA;
@@ -203,10 +210,8 @@ static av_cold int allocate_frame_buffers(Indeo3DecodeContext *ctx,
         ctx->planes[p].buffers[0] = av_malloc(!p ? luma_size : chroma_size);
         ctx->planes[p].buffers[1] = av_malloc(!p ? luma_size : chroma_size);
 
-        if (!ctx->planes[p].buffers[0] || !ctx->planes[p].buffers[1]) {
-            free_frame_buffers(ctx);
+        if (!ctx->planes[p].buffers[0] || !ctx->planes[p].buffers[1])
             return AVERROR(ENOMEM);
-        }
 
         /* fill the INTRA prediction lines with the middle pixel value = 64 */
         memset(ctx->planes[p].buffers[0], 0x40, ctx->planes[p].pitch);
@@ -320,7 +325,7 @@ static inline uint32_t replicate32(uint32_t a) {
 
 /* Fill n lines with 64-bit pixel value pix */
 static inline void fill_64(uint8_t *dst, const uint64_t pix, int32_t n,
-                           int32_t row_offset)
+                           ptrdiff_t row_offset)
 {
     for (; n > 0; dst += row_offset, n--)
         AV_WN64A(dst, pix);
@@ -425,30 +430,28 @@ if (*data_ptr >= last_ptr) \
 
 
 static int decode_cell_data(Indeo3DecodeContext *ctx, Cell *cell,
-                            uint8_t *block, uint8_t *ref_block,
+                            uint8_t *block, const uint8_t *ref_block,
                             ptrdiff_t row_offset, int h_zoom, int v_zoom, int mode,
                             const vqEntry *delta[2], int swap_quads[2],
                             const uint8_t **data_ptr, const uint8_t *last_ptr)
 {
     int           x, y, line, num_lines;
     int           rle_blocks = 0;
-    uint8_t       code, *dst, *ref;
     const vqEntry *delta_tab;
     unsigned int  dyad1, dyad2;
     uint64_t      pix64;
     int           skip_flag = 0, is_top_of_cell, is_first_row = 1;
-    int           blk_row_offset, line_offset;
 
-    blk_row_offset = (row_offset << (2 + v_zoom)) - (cell->width << 2);
-    line_offset    = v_zoom ? row_offset : 0;
+    const ptrdiff_t blk_row_offset = (row_offset << (2 + v_zoom)) - (cell->width << 2);
+    const ptrdiff_t line_offset    = v_zoom ? row_offset : 0;
 
     if (cell->height & v_zoom || cell->width & h_zoom)
         return IV3_BAD_DATA;
 
     for (y = 0; y < cell->height; is_first_row = 0, y += 1 + v_zoom) {
         for (x = 0; x < cell->width; x += 1 + h_zoom) {
-            ref = ref_block;
-            dst = block;
+            const uint8_t *ref = ref_block;
+            uint8_t *dst = block;
 
             if (rle_blocks > 0) {
                 if (mode <= 4) {
@@ -468,7 +471,7 @@ static int decode_cell_data(Indeo3DecodeContext *ctx, Cell *cell,
                     else
                         delta_tab = delta[1];
                     BUFFER_PRECHECK;
-                    code = bytestream_get_byte(data_ptr);
+                    uint8_t code = bytestream_get_byte(data_ptr);
                     if (code < 248) {
                         if (code < delta_tab->num_dyads) {
                             BUFFER_PRECHECK;
@@ -498,7 +501,7 @@ static int decode_cell_data(Indeo3DecodeContext *ctx, Cell *cell,
                             skip_flag  = 0;
                             rle_blocks = 1;
                             code       = 253;
-                            /* FALLTHROUGH */
+                            av_fallthrough;
                         case RLE_ESC_FF:
                         case RLE_ESC_FE:
                         case RLE_ESC_FD:
@@ -530,7 +533,7 @@ static int decode_cell_data(Indeo3DecodeContext *ctx, Cell *cell,
                         case RLE_ESC_F9:
                             skip_flag  = 1;
                             rle_blocks = 1;
-                            /* FALLTHROUGH */
+                            av_fallthrough;
                         case RLE_ESC_FA:
                             if (line)
                                 return IV3_BAD_RLE;
@@ -590,6 +593,11 @@ static int decode_cell(Indeo3DecodeContext *ctx, AVCodecContext *avctx,
     uint8_t       code, *block, *ref_block = 0;
     const vqEntry *delta[2];
     const uint8_t *data_start = data_ptr;
+
+    if (data_ptr >= last_ptr) {
+        av_log(avctx, AV_LOG_ERROR, "attempt to read past end of buffer\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     /* get coding mode and VQ table index from the VQ descriptor byte */
     code     = *data_ptr++;
@@ -687,9 +695,11 @@ static int decode_cell(Indeo3DecodeContext *ctx, AVCodecContext *avctx,
             }
 
             zoom_fac = mode == 10;
-            error = decode_cell_data(ctx, cell, block, ref_block, plane->pitch,
-                                     zoom_fac, 1, mode, delta, swap_quads,
-                                     &data_ptr, last_ptr);
+            av_assert2(!ref_block);
+            error = decode_cell_data(ctx, cell, block,
+                                     block /* dummy to avoid UB pointer arithmetic */,
+                                     plane->pitch, zoom_fac, 1, mode, delta,
+                                     swap_quads, &data_ptr, last_ptr);
         }
         break;
     default:
@@ -1051,12 +1061,13 @@ static void output_plane(const Plane *plane, int buf_sel, uint8_t *dst,
 
 static av_cold int decode_init(AVCodecContext *avctx)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     Indeo3DecodeContext *ctx = avctx->priv_data;
 
     ctx->avctx     = avctx;
     avctx->pix_fmt = AV_PIX_FMT_YUV410P;
 
-    build_requant_tab();
+    ff_thread_once(&init_static_once, build_requant_tab);
 
     ff_hpeldsp_init(&ctx->hdsp, avctx->flags);
 
@@ -1064,13 +1075,12 @@ static av_cold int decode_init(AVCodecContext *avctx)
 }
 
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame, AVPacket *avpkt)
 {
     Indeo3DecodeContext *ctx = avctx->priv_data;
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
-    AVFrame *frame     = data;
     int res;
 
     res = decode_frame_headers(ctx, avctx, buf, buf_size);
@@ -1133,14 +1143,15 @@ static av_cold int decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_indeo3_decoder = {
-    .name           = "indeo3",
-    .long_name      = NULL_IF_CONFIG_SMALL("Intel Indeo 3"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_INDEO3,
+const FFCodec ff_indeo3_decoder = {
+    .p.name         = "indeo3",
+    CODEC_LONG_NAME("Intel Indeo 3"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_INDEO3,
     .priv_data_size = sizeof(Indeo3DecodeContext),
     .init           = decode_init,
     .close          = decode_close,
-    .decode         = decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

@@ -2,8 +2,445 @@ Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
 version <next>:
+- ASTC image encoding and decoding via libastcenc, with .astc and KTX 1.0 muxers and demuxers
+- extensively improved AAC encoder
+- APV Vulkan encoder
+- iTerm2 inline image protocol muxer
+- LCEVC payload merging bitstream filter
+- MVR demuxer
+- latticepal filter
+- DVD-Audio LPCM decoder and demuxing support
+- AVFoundation input device selection by unique ID and USB serial number
+- NVIDIA optical flow accelerated interpolation filter (vf_fruc_vulkan)
+- H.264 data partitioning support
+- DSD (dsd_msbf) encoder
+- Rhetorex ADPCM decoder
+- ADPCM IMA Citrix decoder
+- Panasonic RW2 decoder
+- xHE-AAC encoding via libfdk-xhe-aac
+
+
+version 9.0:
+- Extend AMF Color Converter (vf_vpp_amf) HDR capabilities
+- LCEVC track muxing support in MP4 muxer
+- Playdate video encoder and muxer
+- Add v360_vulkan filter
+- HE-AAC 960 decoding (DAB+)
+- transpose_cuda filter
+- Add AMF Frame Rate Converter (vf_frc_amf) filter
+- SMPTE 2094-50 metadata support and passthrough
+- ProRes RAW VideoToolbox hwaccel
+- APV Vulkan hwaccel
+- Animated WebP decoder
+- Animated WebP demuxer
+- Remove CELT decoding support (doesn't affect Opus CELT)
+- Remove ogg/celt parsing
+- Bitstream filter to split Dolby Vision multi-layer HEVC
+- Add AMF hardware memory mapping support.
+- ONNX Runtime DNN backend with GPU execution provider support
+- Remove deprecated NVENC options and support for pre-11.1 SDK versions
+- Add AMF Video Quality Enhancer (vf_vqe_amf) filter
+
+
+version 8.1:
+- ffprobe -codec option
+- EXIF Metadata Parsing
+- gfxcapture: Windows.Graphics.Capture based window/monitor capture
+- hxvs demuxer for HXVS/HXVT IP camera format
+- MPEG-H 3D Audio decoding via mpeghdec
+- D3D12 H.264 encoder
+- drawvg filter via libcairo
+- ffmpeg CLI tiled HEIF support
+- D3D12 AV1 encoder
+- ProRes Vulkan hwaccel
+- DPX Vulkan hwaccel
+- Rockchip H.264/HEVC hardware encoder
+- Add vf_scale_d3d12 filter
+- JPEG-XS parser
+- JPEG-XS decoder and encoder through libsvtjpegxs
+- JPEG-XS raw bitstream muxer and demuxer
+- IAMF Projection mode Ambisonic Audio Elements muxing and demuxing
+- Add vf_mestimate_d3d12 filter
+- xHE-AAC Mps212 decoding support (experimental)
+- Remove the old HLS protocol handler
+- Vulkan compute codec optimizations
+- swscale Vulkan support
+- LCEVC metadata bitstream filter
+- Add vf_deinterlace_d3d12 filter
+- ffprobe: only show refs field in stream section when reading frames
+- ProRes Vulkan encoder
+- LCEVC parser
+- LCEVC enhancement layer exporting in MPEG-TS
+
+
+version 8.0:
+- Whisper filter
+- Drop support for OpenSSL < 1.1.0
+- Enable TLS peer certificate verification by default (on next major version bump)
+- Drop support for OpenSSL < 1.1.1
+- yasm support dropped, users need to use nasm
+- VVC VAAPI decoder
+- RealVideo 6.0 decoder
+- OpenMAX encoders deprecated
+- libx265 alpha layer encoding
+- ADPCM IMA Xbox decoder
+- Enhanced FLV v2: Multitrack audio/video, modern codec support
+- Animated JPEG XL encoding (via libjxl)
+- VVC in Matroska
+- CENC AV1 support in MP4 muxer
+- pngenc: set default prediction method to PAETH
+- APV decoder and APV raw bitstream muxing and demuxing
+- APV parser
+- APV encoding support through a libopenapv wrapper
+- VVC decoder supports all content of SCC (Screen Content Coding):
+  IBC (Inter Block Copy), Palette Mode and ACT (Adaptive Color Transform
+- G.728 decoder
+- pad_cuda filter
+- Sanyo LD-ADPCM decoder
+- APV in MP4/ISOBMFF muxing and demuxing
+- OpenHarmony hardware decoder/encoder
+- Colordetect filter
+- Add vf_scale_d3d11 filter
+- No longer disabling GCC autovectorization, on X86, ARM and AArch64
+- VP9 Vulkan hwaccel
+- AV1 Vulkan encoder
+- ProRes RAW decoder
+- ProRes RAW Vulkan hwaccel
+- ffprobe -codec option
+- HDR10+ metadata passthrough when decoding/encoding with libaom-av1
+
+
+version 7.1:
+- Raw Captions with Time (RCWT) closed caption demuxer
+- LC3/LC3plus decoding/encoding using external library liblc3
+- ffmpeg CLI filtergraph chaining
+- LC3/LC3plus demuxer and muxer
+- pad_vaapi, drawbox_vaapi filters
+- vf_scale supports secondary ref input and framesync options
+- vf_scale2ref deprecated
+- qsv_params option added for QSV encoders
+- VVC decoder compatible with DVB test content
+- xHE-AAC decoder
+- removed DEC Alpha DSP and support code
+- VVC encoding support via libvvenc
+- perlin video source
+- D3D12VA HEVC encoder
+- Cropping metadata parsing and writing in Matroska and MP4/MOV de/muxers
+- Intel QSV-accelerated VVC decoding
+- MediaCodec AAC/AMR-NB/AMR-WB/MP3 decoding
+- YUV colorspace negotiation for codecs and filters, obsoleting the
+  YUVJ pixel format
+- Vulkan H.264 encoder
+- Vulkan H.265 encoder
+- stream specifiers in fftools can now match by stream disposition
+- LCEVC enhancement data exporting in H.26x and MP4/ISOBMFF
+- LCEVC filter
+- MV-HEVC decoding
+- minor stream specifier syntax changes:
+    - when matching by metadata (:m:<key>:<val>), the colon character
+      in keys or values now has to be backslash-escaped
+    - in optional maps (-map ....?) with a metadata-matching stream specifier,
+      the value has to be separated from the question mark by a colon, i.e.
+      -map ....:m:<key>:<val>:? (otherwise it would be ambiguous whether the
+      question mark is a part of <val> or not)
+    - multiple stream types in a single specifier (e.g. :s:s:0) now cause an
+      error, as such a specifier makes no sense
+- Mastering Display and Content Light Level metadata support in hevc_nvenc
+  and av1_nvenc encoders
+- libswresample now accepts custom order channel layouts as input, with some
+  constrains
+- FFV1 parser
+
+
+version 7.0:
+- DXV DXT1 encoder
+- LEAD MCMP decoder
+- EVC decoding using external library libxevd
+- EVC encoding using external library libxeve
+- QOA decoder and demuxer
+- aap filter
+- demuxing, decoding, filtering, encoding, and muxing in the
+  ffmpeg CLI now all run in parallel
+- enable gdigrab device to grab a window using the hwnd=HANDLER syntax
+- IAMF raw demuxer and muxer
+- D3D12VA hardware accelerated H264, HEVC, VP9, AV1, MPEG-2 and VC1 decoding
+- tiltandshift filter
+- qrencode filter and qrencodesrc source
+- quirc filter
+- lavu/eval: introduce randomi() function in expressions
+- VVC decoder (experimental)
+- fsync filter
+- Raw Captions with Time (RCWT) closed caption muxer
+- ffmpeg CLI -bsf option may now be used for input as well as output
+- ffmpeg CLI options may now be used as -/opt <path>, which is equivalent
+  to -opt <contents of file <path>>
+- showinfo bitstream filter
+- a C11-compliant compiler is now required; note that this requirement
+  will be bumped to C17 in the near future, so consider updating your
+  build environment if it lacks C17 support
+- Change the default bitrate control method from VBR to CQP for QSV encoders.
+- removed deprecated ffmpeg CLI options -psnr and -map_channel
+- DVD-Video demuxer, powered by libdvdnav and libdvdread
+- ffprobe -show_stream_groups option
+- ffprobe (with -export_side_data film_grain) now prints film grain metadata
+- AEA muxer
+- ffmpeg CLI loopback decoders
+- Support PacketTypeMetadata of PacketType in enhanced flv format
+- ffplay with hwaccel decoding support (depends on vulkan renderer via libplacebo)
+- dnn filter libtorch backend
+- Android content URIs protocol
+- AOMedia Film Grain Synthesis 1 (AFGS1)
+- RISC-V optimizations for AAC, FLAC, JPEG-2000, LPC, RV4.0, SVQ, VC1, VP8, and more
+- Loongarch optimizations for HEVC decoding
+- Important AArch64 optimizations for HEVC
+- IAMF support inside MP4/ISOBMFF
+- Support for HEIF/AVIF still images and tiled still images
+- Dolby Vision profile 10 support in AV1
+- Support for Ambient Viewing Environment metadata in MP4/ISOBMFF
+- HDR10 metadata passthrough when encoding with libx264, libx265, and libsvtav1
+
+
+version 6.1:
+- libaribcaption decoder
+- Playdate video decoder and demuxer
+- Extend VAAPI support for libva-win32 on Windows
+- afireqsrc audio source filter
+- arls filter
+- ffmpeg CLI new option: -readrate_initial_burst
+- zoneplate video source filter
+- command support in the setpts and asetpts filters
+- Vulkan decode hwaccel, supporting H264, HEVC and AV1
+- color_vulkan filter
+- bwdif_vulkan filter
+- nlmeans_vulkan filter
+- RivaTuner video decoder
+- xfade_vulkan filter
+- vMix video decoder
+- Essential Video Coding parser, muxer and demuxer
+- Essential Video Coding frame merge bsf
+- bwdif_cuda filter
+- Microsoft RLE video encoder
+- Raw AC-4 muxer and demuxer
+- Raw VVC bitstream parser, muxer and demuxer
+- Bitstream filter for editing metadata in VVC streams
+- Bitstream filter for converting VVC from MP4 to Annex B
+- scale_vt filter for videotoolbox
+- transpose_vt filter for videotoolbox
+- support for the P_SKIP hinting to speed up libx264 encoding
+- Support HEVC,VP9,AV1 codec in enhanced flv format
+- apsnr and asisdr audio filters
+- OSQ demuxer and decoder
+- Support HEVC,VP9,AV1 codec fourcclist in enhanced rtmp protocol
+- CRI USM demuxer
+- ffmpeg CLI '-top' option deprecated in favor of the setfield filter
+- VAAPI AV1 encoder
+- ffprobe XML output schema changed to account for multiple
+  variable-fields elements within the same parent element
+- ffprobe -output_format option added as an alias of -of
+
+# codespell:off
+
+version 6.0:
+- Radiance HDR image support
+- ddagrab (Desktop Duplication) video capture filter
+- ffmpeg -shortest_buf_duration option
+- ffmpeg now requires threading to be built
+- ffmpeg now runs every muxer in a separate thread
+- Add new mode to cropdetect filter to detect crop-area based on motion vectors and edges
+- VAAPI decoding and encoding for 10/12bit 422, 10/12bit 444 HEVC and VP9
+- WBMP (Wireless Application Protocol Bitmap) image format
+- a3dscope filter
+- bonk decoder and demuxer
+- Micronas SC-4 audio decoder
+- LAF demuxer
+- APAC decoder and demuxer
+- Media 100i decoders
+- DTS to PTS reorder bsf
+- ViewQuest VQC decoder
+- backgroundkey filter
+- nvenc AV1 encoding support
+- MediaCodec decoder via NDKMediaCodec
+- MediaCodec encoder
+- oneVPL support for QSV
+- QSV AV1 encoder
+- QSV decoding and encoding for 10/12bit 422, 10/12bit 444 HEVC and VP9
+- showcwt multimedia filter
+- corr video filter
+- adrc audio filter
+- afdelaysrc audio filter
+- WADY DPCM decoder and demuxer
+- CBD2 DPCM decoder
+- ssim360 video filter
+- ffmpeg CLI new options: -stats_enc_pre[_fmt], -stats_enc_post[_fmt],
+  -stats_mux_pre[_fmt]
+- hstack_vaapi, vstack_vaapi and xstack_vaapi filters
+- XMD ADPCM decoder and demuxer
+- media100 to mjpegb bsf
+- ffmpeg CLI new option: -fix_sub_duration_heartbeat
+- WavArc decoder and demuxer
+- CrystalHD decoders deprecated
+- SDNS demuxer
+- RKA decoder and demuxer
+- filtergraph syntax in ffmpeg CLI now supports passing file contents
+  as option values, by prefixing option name with '/'
+- hstack_qsv, vstack_qsv and xstack_qsv filters
+
+
+version 5.1:
+- add ipfs/ipns gateway support
+- dialogue enhance audio filter
+- dropped obsolete XvMC hwaccel
+- pcm-bluray encoder
+- DFPWM audio encoder/decoder and raw muxer/demuxer
+- SITI filter
+- Vizrt Binary Image encoder/decoder
+- avsynctest source filter
+- feedback video filter
+- pixelize video filter
+- colormap video filter
+- colorchart video source filter
+- multiply video filter
+- PGS subtitle frame merge bitstream filter
+- blurdetect filter
+- tiltshelf audio filter
+- QOI image format support
+- ffprobe -o option
+- virtualbass audio filter
+- VDPAU AV1 hwaccel
+- PHM image format support
+- remap_opencl filter
+- added chromakey_cuda filter
+- added bilateral_cuda filter
+
+
+version 5.0:
+- ADPCM IMA Westwood encoder
+- Westwood AUD muxer
+- ADPCM IMA Acorn Replay decoder
+- Argonaut Games CVG demuxer
+- Argonaut Games CVG muxer
+- Concatf protocol
+- afwtdn audio filter
+- audio and video segment filters
+- Apple Graphics (SMC) encoder
+- hsvkey and hsvhold video filters
+- adecorrelate audio filter
+- atilt audio filter
+- grayworld video filter
+- AV1 Low overhead bitstream format muxer
+- swscale slice threading
+- MSN Siren decoder
+- scharr video filter
+- apsyclip audio filter
+- morpho video filter
+- amr parser
+- (a)latency filters
+- GEM Raster image decoder
+- asdr audio filter
+- speex decoder
+- limitdiff video filter
+- xcorrelate video filter
+- varblur video filter
+- huesaturation video filter
+- colorspectrum source video filter
+- RTP packetizer for uncompressed video (RFC 4175)
+- bitpacked encoder
+- VideoToolbox VP9 hwaccel
+- VideoToolbox ProRes hwaccel
+- support loongarch.
+- aspectralstats audio filter
+- adynamicsmooth audio filter
+- libplacebo filter
+- vflip_vulkan, hflip_vulkan and flip_vulkan filters
+- adynamicequalizer audio filter
+- yadif_videotoolbox filter
+- VideoToolbox ProRes encoder
+- anlmf audio filter
+- IMF demuxer (experimental)
+
+
+version 4.4:
 - AudioToolbox output device
 - MacCaption demuxer
+- PGX decoder
+- chromanr video filter
+- VDPAU accelerated HEVC 10/12bit decoding
+- ADPCM IMA Ubisoft APM encoder
+- Rayman 2 APM muxer
+- AV1 encoding support SVT-AV1
+- Cineform HD encoder
+- ADPCM Argonaut Games encoder
+- Argonaut Games ASF muxer
+- AV1 Low overhead bitstream format demuxer
+- RPZA video encoder
+- ADPCM IMA MOFLEX decoder
+- MobiClip FastAudio decoder
+- MobiClip video decoder
+- MOFLEX demuxer
+- MODS demuxer
+- PhotoCD decoder
+- MCA demuxer
+- AV1 decoder (Hardware acceleration used only)
+- SVS demuxer
+- Argonaut Games BRP demuxer
+- DAT demuxer
+- aax demuxer
+- IPU decoder, parser and demuxer
+- Intel QSV-accelerated AV1 decoding
+- Argonaut Games Video decoder
+- libwavpack encoder removed
+- ACE demuxer
+- AVS3 demuxer
+- AVS3 video decoder via libuavs3d
+- Cintel RAW decoder
+- VDPAU accelerated VP9 10/12bit decoding
+- afreqshift and aphaseshift filters
+- High Voltage Software ADPCM encoder
+- LEGO Racers ALP (.tun & .pcm) muxer
+- AV1 VAAPI decoder
+- adenorm filter
+- ADPCM IMA AMV encoder
+- AMV muxer
+- NVDEC AV1 hwaccel
+- DXVA2/D3D11VA hardware accelerated AV1 decoding
+- speechnorm filter
+- SpeedHQ encoder
+- asupercut filter
+- asubcut filter
+- Microsoft Paint (MSP) version 2 decoder
+- Microsoft Paint (MSP) demuxer
+- AV1 monochrome encoding support via libaom >= 2.0.1
+- asuperpass and asuperstop filter
+- shufflepixels filter
+- tmidequalizer filter
+- estdif filter
+- epx filter
+- Dolby E parser
+- shear filter
+- kirsch filter
+- colortemperature filter
+- colorcontrast filter
+- PFM encoder
+- colorcorrect filter
+- binka demuxer
+- XBM parser
+- xbm_pipe demuxer
+- colorize filter
+- CRI parser
+- aexciter audio filter
+- exposure video filter
+- monochrome video filter
+- setts bitstream filter
+- vif video filter
+- OpenEXR image encoder
+- Simbiosis IMX decoder
+- Simbiosis IMX demuxer
+- Digital Pictures SGA demuxer and decoders
+- TTML subtitle encoder and muxer
+- identity video filter
+- msad video filter
+- gophers protocol
+- RIST protocol via librist
 
 
 version 4.3:
